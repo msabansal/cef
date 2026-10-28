@@ -815,6 +815,100 @@ void CefFrameImpl::FrameAttachedAck(bool allow) {
 
 void CefFrameImpl::SendMessage(const std::string& name,
                                base::ListValue arguments) {
+  if (name == "Reach.CaptureDrawingCommands.v1") {
+    CefRefPtr<CefFrameImpl> retain(this);
+    auto response = CefProcessMessage::Create("Reach.DrawingCommands.v1");
+    auto values = response->GetArgumentList();
+    bool valid_request = (arguments.size() == 1 || arguments.size() == 6 || arguments.size() == 7 ||
+                          arguments.size() == 8) &&
+                         arguments[0].is_int() && arguments[0].GetInt() > 0;
+    if (valid_request && arguments.size() == 6) {
+      for (size_t i = 1; i < arguments.size(); ++i) {
+        valid_request = valid_request && arguments[i].is_int();
+      }
+      if (valid_request && arguments.size() == 8) {
+        for (size_t i = 1; i < arguments.size(); ++i)
+          valid_request = valid_request && arguments[i].is_int();
+        if (valid_request) {
+          valid_request = arguments[1].GetInt() >= 0 &&
+                          arguments[1].GetInt() <= 2 &&
+                          arguments[2].GetInt() >= 0 &&
+                          arguments[2].GetInt() < 4096 &&
+                          arguments[3].GetInt() >= 0 &&
+                          arguments[3].GetInt() < 4096 &&
+                          arguments[4].GetInt() >= 0 &&
+                          arguments[4].GetInt() <= 8191 &&
+                          arguments[5].GetInt() >= 0 &&
+                          arguments[5].GetInt() <= 2 &&
+                          arguments[6].GetInt() >= 0 &&
+                          arguments[6].GetInt() <= 1 &&
+                          arguments[7].GetInt() >= 0 &&
+                          arguments[7].GetInt() <= 3;
+        }
+        if (valid_request && arguments.size() == 7) {
+          for (size_t i = 1; i < arguments.size(); ++i)
+            valid_request = valid_request && arguments[i].is_int();
+          if (valid_request) {
+            valid_request = arguments[1].GetInt() >= 0 && arguments[1].GetInt() <= 2 &&
+                            arguments[2].GetInt() >= 0 && arguments[2].GetInt() <= 255 &&
+                            arguments[3].GetInt() >= 0 && arguments[3].GetInt() <= 255 &&
+                            arguments[4].GetInt() >= 0 && arguments[4].GetInt() <= 8191 &&
+                            arguments[5].GetInt() >= 0 && arguments[5].GetInt() <= 65535 &&
+                            arguments[6].GetInt() >= 0 && arguments[6].GetInt() <= 65535;
+          }
+        }
+      }
+      if (valid_request) {
+        valid_request = arguments[1].GetInt() >= 0 &&
+                        arguments[1].GetInt() < 4096 &&
+                        arguments[2].GetInt() >= 0 &&
+                        arguments[2].GetInt() < 4096 &&
+                        arguments[3].GetInt() >= 0 &&
+                        arguments[3].GetInt() <= 8191 &&
+                        arguments[4].GetInt() >= -4096 &&
+                        arguments[4].GetInt() <= 4096 &&
+                        arguments[5].GetInt() >= -4096 &&
+                        arguments[5].GetInt() <= 4096;
+      }
+    }
+    values->SetInt(0, valid_request ? arguments[0].GetInt() : 0);
+    blink_glue::CefDrawingCommands capture;
+    if (!valid_request) {
+      capture.error = "Invalid drawing-command request";
+    } else if (!frame_ || frame_->Parent() != nullptr) {
+      capture.error = "Drawing-command capture requires an attached main frame";
+    } else {
+      if (arguments.size() == 6) {
+        capture.error = blink_glue::ApplyDrawingWheel(
+            frame_, arguments[1].GetInt(), arguments[2].GetInt(),
+            arguments[3].GetInt(), arguments[4].GetInt(),
+            arguments[5].GetInt());
+      } else if (arguments.size() == 7) {
+        capture.error = blink_glue::ApplyDrawingKey(
+            frame_, arguments[1].GetInt(), arguments[2].GetInt(),
+            arguments[3].GetInt(), arguments[4].GetInt(),
+            arguments[5].GetInt(), arguments[6].GetInt());
+      } else if (arguments.size() == 8) {
+        capture.error = blink_glue::ApplyDrawingMouse(
+            frame_, arguments[1].GetInt(), arguments[2].GetInt(),
+            arguments[3].GetInt(), arguments[4].GetInt(),
+            arguments[5].GetInt(), arguments[6].GetInt(),
+            arguments[7].GetInt());
+      }
+      if (capture.error.empty() && arguments.size() == 1) {
+        capture = blink_glue::CaptureDrawingCommands(frame_);
+      }
+    }
+    values->SetString(1, capture.error);
+    values->SetInt(2, capture.width);
+    values->SetInt(3, capture.height);
+    if (capture.error.empty() && arguments.size() == 1) {
+      values->SetBinary(4, CefBinaryValue::Create(capture.picture.data(),
+                                                  capture.picture.size()));
+    }
+    SendProcessMessage(PID_BROWSER, response);
+    return;
+  }
   if (auto app = CefAppManager::Get()->GetApplication()) {
     if (auto handler = app->GetRenderProcessHandler()) {
       CefRefPtr<CefProcessMessageImpl> message(

@@ -1,0 +1,150 @@
+diff --git a/modules/canvaskit/canvaskit_bindings.cpp b/modules/canvaskit/canvaskit_bindings.cpp
+index cabeb4d..2ab719e 100644
+--- a/modules/canvaskit/canvaskit_bindings.cpp
++++ b/modules/canvaskit/canvaskit_bindings.cpp
+@@ -61,6 +61,7 @@
+ #include "include/encode/SkWebpEncoder.h"
+ #include "include/private/base/SkOnce.h"
+ #include "include/utils/SkParsePath.h"
++#include "include/utils/SkNWayCanvas.h"
+ #include "include/utils/SkShadowUtils.h"
+ #include "src/base/SkFloatBits.h"
+ #include "src/core/SkPathPriv.h"
+@@ -1209,7 +1210,9 @@ EMSCRIPTEN_BINDINGS(Skia) {
+ 
+ #ifdef CK_SERIALIZE_SKP
+     function("_MakePicture",
+-             optional_override([](WASMPointerU8 dPtr, size_t bytes) -> sk_sp<SkPicture> {
++             optional_override([](WASMPointerU8 dPtr, size_t bytes,
++                                  emscripten::val imageDecoder,
++                                  emscripten::val mediaDecoder) -> sk_sp<SkPicture> {
+                  uint8_t* d = reinterpret_cast<uint8_t*>(dPtr);
+                  sk_sp<SkData> data = SkData::MakeFromMalloc(d, bytes);
+ 
+@@ -1222,16 +1225,35 @@ EMSCRIPTEN_BINDINGS(Skia) {
+                  });
+ #endif
+ 
++                 struct ImageContext {
++                     emscripten::val decoder;
++                     bool failed = false;
++                 } images{imageDecoder};
+                  SkDeserialProcs dProcs;
++                 dProcs.fImageCtx = &images;
+                  dProcs.fImageDataProc = [](sk_sp<SkData> bytes,
+                                             std::optional<SkAlphaType> at,
+-                                            void*) -> sk_sp<SkImage> {
++                                            void* context) -> sk_sp<SkImage> {
++                     auto* images = static_cast<ImageContext*>(context);
++                     if (!images->decoder.isUndefined()) {
++                         auto decoded = images->decoder(emscripten::val(
++                             emscripten::typed_memory_view(
++                                 bytes->size(), static_cast<const uint8_t*>(bytes->data()))));
++                         if (decoded.isNull() || decoded.isUndefined()) {
++                             images->failed = true;
++                             return nullptr;
++                         }
++                         return decoded.as<sk_sp<SkImage>>();
++                     }
+                      auto codec = DecodeImageData(bytes);
+                      if (codec == nullptr) {
++                         images->failed = true;
+                          return nullptr;
+                      }
+                      // Force the decode to happen instead of returning a lazy image.
+-                     return SkCodecs::DeferredImage(std::move(codec), at)->makeRasterImage(nullptr);
++                     auto image = SkCodecs::DeferredImage(std::move(codec), at)->makeRasterImage(nullptr);
++                     images->failed |= !image;
++                     return image;
+                  };
+ 
+ #ifndef CK_NO_FONTS
+@@ -1243,7 +1265,57 @@ EMSCRIPTEN_BINDINGS(Skia) {
+                  };
+ #endif
+ 
+-                 return SkPicture::MakeFromData(data.get(), &dProcs);
++                 auto picture = SkPicture::MakeFromData(data.get(), &dProcs);
++                 if (images.failed || !picture || mediaDecoder.isUndefined()) {
++                     return images.failed ? nullptr : picture;
++                 }
++                 class MediaCanvas final : public SkNWayCanvas {
++                 public:
++                     MediaCanvas(SkCanvas* target, emscripten::val decoder,
++                                 int width, int height)
++                         : SkNWayCanvas(width, height), target_(target), decoder_(decoder) {
++                         this->addCanvas(target);
++                     }
++                     bool failed = false;
++                 protected:
++                     void onDrawPicture(const SkPicture* picture, const SkMatrix* matrix,
++                                        const SkPaint* paint) override {
++                         if (!failed) SkCanvas::onDrawPicture(picture, matrix, paint);
++                     }
++                     void onDrawAnnotation(const SkRect& rect, const char key[],
++                                           SkData* data) override {
++                         const std::string kind(key);
++                         if (kind != "Reach.MediaState.v1" && kind != "Reach.Video.v1") {
++                             SkNWayCanvas::onDrawAnnotation(rect, key, data);
++                             return;
++                         }
++                         if (failed || !data || data->size() > 4096 || ++annotations_ > 1024) {
++                             failed = true;
++                             return;
++                         }
++                         auto decoded = decoder_(kind, std::string(
++                             static_cast<const char*>(data->data()), data->size()));
++                         if (kind == "Reach.MediaState.v1") return;
++                         if (decoded.isNull() || decoded.isUndefined() || rect.isEmpty()) {
++                             failed = true;
++                             return;
++                         }
++                         auto image = decoded.as<sk_sp<SkImage>>();
++                         target_->drawImageRect(image, rect, SkSamplingOptions(SkFilterMode::kLinear));
++                     }
++                 private:
++                     SkCanvas* target_;
++                     emscripten::val decoder_;
++                     size_t annotations_ = 0;
++                 };
++                 SkPictureRecorder recorder;
++                 auto* target = recorder.beginRecording(picture->cullRect());
++                 MediaCanvas media(target, mediaDecoder,
++                                  SkScalarCeilToInt(picture->cullRect().width()),
++                                  SkScalarCeilToInt(picture->cullRect().height()));
++                 picture->playback(&media);
++                 if (media.failed) return nullptr;
++                 return recorder.finishRecordingAsPicture();
+              }),
+              allow_raw_pointers());
+ #endif
+diff --git a/modules/canvaskit/skp.js b/modules/canvaskit/skp.js
+index 9248d76..ff91402 100644
+--- a/modules/canvaskit/skp.js
++++ b/modules/canvaskit/skp.js
+@@ -1,17 +1,23 @@
+ CanvasKit._extraInitializations = CanvasKit._extraInitializations || [];
+ CanvasKit._extraInitializations.push(function() {
+   // data is a TypedArray or ArrayBuffer e.g. from fetch().then(resp.arrayBuffer())
+-  CanvasKit.MakePicture = function(data) {
++  CanvasKit.MakePicture = function(data, imageDecoder, mediaDecoder) {
+     data = new Uint8Array(data);
+ 
+     var iptr = CanvasKit._malloc(data.byteLength);
+     CanvasKit.HEAPU8.set(data, iptr);
+     // The skp takes ownership of the malloc'd data.
+-    var pic = CanvasKit._MakePicture(iptr, data.byteLength);
++    var pic = CanvasKit._MakePicture(iptr, data.byteLength, imageDecoder, mediaDecoder);
+     if (!pic) {
+       Debug('Could not decode picture');
+       return null;
+     }
+     return pic;
+   };
++  CanvasKit['MakePictureWithImages'] = function(data, imageDecoder) {
++    return CanvasKit.MakePicture(data, imageDecoder);
++  };
++  CanvasKit['MakePictureWithMedia'] = function(data, imageDecoder, mediaDecoder) {
++    return CanvasKit.MakePicture(data, imageDecoder, mediaDecoder);
++  };
+ });
