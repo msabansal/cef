@@ -54,8 +54,29 @@ not eliminated. Qualified codecs are VP8 WebM and PCM WAV, not every platform's
 proprietary codecs.
 
 Only attached, main-document, finite progressive HTTP(S)/data audio/video is
-currently supported. MediaSource, MediaStream, DRM, canvas, embedded frames,
-unsupported effects/resources and budget violations fail the entire capture.
+currently supported. Empty media elements need no playback transport; original
+poster images retain ordinary image painting, including inside child frames.
+Active child-frame media still requires frame-scoped resource routing.
+
+Command mode retains bounded Canvas2D histories without allocating source raster
+surfaces. Resets clear history; pixel readback, raw pixel writes, GPU and
+OffscreenCanvas contexts reject explicitly. Attached local and isolated remote
+frames compose bottom-up using original embedded fonts and encoded images.
+Flattened command playback avoids duplicate nested resource tables without
+raising the 4 MiB original-resource budget. Document/embedding/viewport checks
+reject inconsistent frame trees; this is not an atomic compositor snapshot.
+Capture bounds include 16 frames, depth 8, 32 MiB aggregate picture input and
+16 Mi pixels across frame viewports. Native focus and hit testing route input
+across isolated frames without changing same-origin or site-isolation policy.
+
+Authored HTTP frame scenarios qualify software/WebGL pixels, original resources,
+mouse/keyboard input, scrolling, navigation and removal. A separate native trace
+qualifies retained Canvas2D and child original resources without matched source
+raster/output events. Opaque `data:` parent navigation into an unsandboxed
+`srcdoc` child still hits a Chromium origin-equality CHECK in the isolated native
+probe; it is unresolved, not worked around by weakening origin enforcement.
+MediaSource, MediaStream, DRM, unsupported effects/resources and budget violations
+fail the entire capture.
 Live/range streaming, detached Audio objects, WebAudio graphs, external
 subtitles, GPU/WebGL capture, production transport and full-browser fidelity
 are not qualified. Do not remove rejection checks to claim compatibility.

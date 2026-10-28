@@ -815,6 +815,130 @@ void CefFrameImpl::FrameAttachedAck(bool allow) {
 
 void CefFrameImpl::SendMessage(const std::string& name,
                                base::ListValue arguments) {
+  if (name == "Reach.DrawingRoute.v1" || name == "Reach.DrawingInput.v1") {
+    CefRefPtr<CefFrameImpl> retain(this);
+    auto response = CefProcessMessage::Create("Reach.DrawingCommands.v1");
+    auto values = response->GetArgumentList();
+    blink_glue::CefDrawingCommands capture;
+    const bool route = name == "Reach.DrawingRoute.v1";
+    bool valid = !arguments.empty() && arguments[0].is_int() &&
+                 arguments[0].GetInt() > 0;
+    if (route) {
+      valid = valid && arguments.size() == 4 && arguments[1].is_bool() &&
+          arguments[2].is_int() && arguments[3].is_int() &&
+          arguments[2].GetInt() >= 0 && arguments[2].GetInt() < 4096 &&
+          arguments[3].GetInt() >= 0 && arguments[3].GetInt() < 4096;
+    } else {
+      valid = valid && arguments.size() == 3 && arguments[1].is_string() &&
+          !arguments[1].GetString().empty() &&
+          arguments[1].GetString().size() <= 128 && arguments[2].is_list();
+      if (valid) {
+        const auto& input = arguments[2].GetList();
+        valid = input.size() >= 5 && input.size() <= 7;
+        for (const auto& value : input)
+          valid = valid && value.is_int() &&
+              value.GetInt() >= -4096 && value.GetInt() <= 65535;
+        if (valid) {
+          const auto bounded = [&](size_t index, int minimum, int maximum) {
+            return input[index].GetInt() >= minimum &&
+                   input[index].GetInt() <= maximum;
+          };
+          if (input.size() == 5) {
+            valid = bounded(0, 0, 4095) && bounded(1, 0, 4095) &&
+                    bounded(2, 0, 8191) && bounded(3, -4096, 4096) &&
+                    bounded(4, -4096, 4096);
+          } else if (input.size() == 6) {
+            valid = bounded(0, 0, 2) && bounded(1, 0, 255) &&
+                    bounded(2, 0, 255) && bounded(3, 0, 8191) &&
+                    bounded(4, 0, 65535) && bounded(5, 0, 65535);
+          } else {
+            valid = bounded(0, 0, 2) && bounded(1, 0, 4095) &&
+                    bounded(2, 0, 4095) && bounded(3, 0, 8191) &&
+                    bounded(4, 0, 2) && bounded(5, 0, 1) &&
+                    bounded(6, 0, 3);
+          }
+        }
+      }
+    }
+    values->SetInt(0, valid ? arguments[0].GetInt() : 0);
+    if (!valid || !frame_) {
+      capture.error = "Invalid or detached drawing input request";
+    } else if (route) {
+      capture = blink_glue::GetDrawingInputRoute(
+          frame_, arguments[1].GetBool(), arguments[2].GetInt(),
+          arguments[3].GetInt());
+    } else if (!blink_glue::IsDrawingDocument(
+                   frame_, arguments[1].GetString())) {
+      capture.error = "Input frame document changed";
+    } else {
+      const auto& input = arguments[2].GetList();
+      if (input.size() == 5)
+        capture.error = blink_glue::ApplyDrawingWheel(
+            frame_, input[0].GetInt(), input[1].GetInt(), input[2].GetInt(),
+            input[3].GetInt(), input[4].GetInt());
+      else if (input.size() == 6)
+        capture.error = blink_glue::ApplyDrawingKey(
+            frame_, input[0].GetInt(), input[1].GetInt(), input[2].GetInt(),
+            input[3].GetInt(), input[4].GetInt(), input[5].GetInt());
+      else
+        capture.error = blink_glue::ApplyDrawingMouse(
+            frame_, input[0].GetInt(), input[1].GetInt(), input[2].GetInt(),
+            input[3].GetInt(), input[4].GetInt(), input[5].GetInt(),
+            input[6].GetInt());
+    }
+    values->SetString(1, capture.error);
+    values->SetInt(2, 0);
+    values->SetInt(3, 0);
+    if (route && capture.error.empty())
+      values->SetString(4, capture.metadata);
+    SendProcessMessage(PID_BROWSER, response);
+    return;
+  }
+  if (name == "Reach.DrawingFrame.v1") {
+    CefRefPtr<CefFrameImpl> retain(this);
+    auto response = CefProcessMessage::Create("Reach.DrawingCommands.v1");
+    auto values = response->GetArgumentList();
+    blink_glue::CefDrawingCommands capture;
+    const bool valid = arguments.size() == 4 &&
+        arguments[0].is_int() && arguments[0].GetInt() > 0 &&
+        arguments[1].is_bool() && arguments[2].is_string() &&
+        arguments[2].GetString().size() <= 128 &&
+        arguments[3].is_dict() && arguments[3].GetDict().size() <= 16;
+    values->SetInt(0, valid ? arguments[0].GetInt() : 0);
+    if (!valid || !frame_) {
+      capture.error = "Invalid or detached drawing-frame request";
+    } else if (arguments[1].GetBool()) {
+      capture = blink_glue::GetDrawingFrameInfo(frame_);
+    } else {
+      std::map<std::string, std::vector<uint8_t>> children;
+      size_t bytes = 0;
+      for (const auto [key, value] : arguments[3].GetDict()) {
+        if (key.size() > 128 || !value.is_blob() ||
+            value.GetBlob().size() > 8 * 1024 * 1024 ||
+            (bytes += value.GetBlob().size()) > 32 * 1024 * 1024) {
+          capture.error = "Invalid child-frame picture or byte budget exceeded";
+          break;
+        }
+        children.emplace(key, value.GetBlob());
+      }
+      if (capture.error.empty()) {
+        capture = blink_glue::CaptureDrawingCommands(
+            frame_, arguments[2].GetString(), children);
+      }
+    }
+    values->SetString(1, capture.error);
+    values->SetInt(2, capture.width);
+    values->SetInt(3, capture.height);
+    if (capture.error.empty()) {
+      if (arguments[1].GetBool())
+        values->SetString(4, capture.metadata);
+      else
+        values->SetBinary(4, CefBinaryValue::Create(
+            capture.picture.data(), capture.picture.size()));
+    }
+    SendProcessMessage(PID_BROWSER, response);
+    return;
+  }
   if (name == "Reach.CaptureDrawingCommands.v1") {
     CefRefPtr<CefFrameImpl> retain(this);
     auto response = CefProcessMessage::Create("Reach.DrawingCommands.v1");
