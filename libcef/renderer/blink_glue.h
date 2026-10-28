@@ -10,6 +10,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "cef/include/internal/cef_types.h"
 #include "third_party/blink/public/mojom/frame/lifecycle.mojom-blink-forward.h"
@@ -39,6 +40,29 @@ BLINK_EXPORT bool IsInBackForwardCache(blink::WebLocalFrame* frame);
 BLINK_EXPORT blink::WebString DumpDocumentText(blink::WebLocalFrame* frame);
 // Returns the markup of the document element.
 BLINK_EXPORT blink::WebString DumpDocumentMarkup(blink::WebLocalFrame* frame);
+
+struct CefDrawingCommands {
+  std::string error;
+  std::vector<uint8_t> picture;
+  int width = 0;
+  int height = 0;
+};
+
+// Only for externally driven OSR sessions. This does not disable rasterization
+// in an ordinary CEF browser.
+BLINK_EXPORT CefDrawingCommands
+CaptureDrawingCommands(blink::WebLocalFrame* frame);
+
+BLINK_EXPORT std::string ApplyDrawingWheel(blink::WebLocalFrame* frame,
+                                          int x, int y, int modifiers,
+                                          int dx, int dy);
+BLINK_EXPORT std::string ApplyDrawingMouse(blink::WebLocalFrame* frame,
+                                          int kind, int x, int y, int modifiers,
+                                          int button, int up, int count);
+BLINK_EXPORT std::string ApplyDrawingKey(blink::WebLocalFrame* frame,
+                                        int kind, int windows, int native,
+                                        int modifiers, int character,
+                                        int unmodified);
 
 // Expose additional actions on WebNode.
 BLINK_EXPORT cef_dom_node_type_t GetNodeType(const blink::WebNode& node);
