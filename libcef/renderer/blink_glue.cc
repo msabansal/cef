@@ -4,6 +4,9 @@
 // found in the LICENSE file.
 
 #include "cef/libcef/renderer/blink_glue.h"
+#include "skia/ext/font_utils.h"
+#include "third_party/skia/include/core/SkFontMgr.h"
+#include "third_party/skia/src/core/SkFontDescriptor.h"
 
 #include <cmath>
 #include <map>
@@ -54,16 +57,19 @@
 #include "third_party/blink/renderer/core/frame/settings.h"
 #include "third_party/blink/renderer/core/frame/web_local_frame_impl.h"
 #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
+#include "third_party/blink/renderer/core/html/html_frame_owner_element.h"
 #include "third_party/blink/renderer/core/html/media/html_media_element.h"
 #include "third_party/blink/renderer/core/input/event_handler.h"
 #include "third_party/blink/renderer/core/layout/hit_test_location.h"
 #include "third_party/blink/renderer/core/layout/hit_test_result.h"
 #include "third_party/blink/renderer/core/layout/layout_box.h"
+#include "third_party/blink/renderer/core/layout/layout_embedded_content.h"
 #include "third_party/blink/renderer/core/layout/layout_object.h"
 #include "third_party/blink/renderer/core/layout/layout_view.h"
 #include "third_party/blink/renderer/core/loader/frame_load_request.h"
 #include "third_party/blink/renderer/core/page/chrome_client.h"
 #include "third_party/blink/renderer/core/page/page.h"
+#include "third_party/blink/renderer/core/page/focus_controller.h"
 #include "third_party/blink/renderer/core/page/page_animator.h"
 #include "third_party/blink/renderer/core/paint/paint_layer_scrollable_area.h"
 #include "third_party/blink/renderer/core/paint/video_painter.h"
@@ -191,8 +197,13 @@ SkSerialReturnType SerializeOriginalTypeface(SkTypeface* face, void* context) {
   if (state->error.empty()) {
     int collection_index = 0;
     auto original = face->openStream(&collection_index);
-    if (original && original->getLength() > 0 &&
-        original->getLength() <= kMaxResourceBytes - state->bytes) {
+    if (!original || original->getLength() == 0) {
+      state->error = "Original font stream unavailable";
+    } else if (original->getLength() > kMaxResourceBytes - state->bytes) {
+      state->error = "Original font resource byte budget exceeded: font=" +
+          base::NumberToString(original->getLength()) + ", used=" +
+          base::NumberToString(state->bytes);
+    } else {
       BoundedPaintStream stream(kMaxResourceBytes - state->bytes);
       if (face->serialize(&stream,
                           SkTypeface::SerializeBehavior::kDoIncludeData) &&
@@ -204,10 +215,70 @@ SkSerialReturnType SerializeOriginalTypeface(SkTypeface* face, void* context) {
       }
     }
     if (state->error.empty()) {
-      state->error = "Original font unavailable or resource budget exceeded";
+      state->error = "Original font serialization exceeded the resource budget";
     }
   }
   return SkData::MakeEmpty();
+}
+
+struct OriginalTypefaceCache {
+  std::map<std::array<uint8_t, 32>, sk_sp<SkTypeface>> faces;
+  std::map<std::pair<std::array<uint8_t, 32>, std::optional<SkAlphaType>>,
+           sk_sp<SkImage>> images;
+  bool failed = false;
+};
+
+sk_sp<SkImage> DeserializeOriginalImage(sk_sp<SkData> data,
+                                      std::optional<SkAlphaType> alpha,
+                                      void* context) {
+  auto* cache = static_cast<OriginalTypefaceCache*>(context);
+  if (!data || !data->size() || data->size() > kMaxResourceBytes) {
+    cache->failed = true;
+    return nullptr;
+  }
+  const auto key = std::make_pair(
+      crypto::hash::Sha256(std::string_view(
+          static_cast<const char*>(data->data()), data->size())),
+      alpha);
+  if (const auto found = cache->images.find(key); found != cache->images.end())
+    return found->second;
+  auto image = SkImages::DeferredFromEncodedData(std::move(data), alpha);
+  if (!image || cache->images.size() >= kMaxResources) {
+    cache->failed = true;
+    return nullptr;
+  }
+  cache->images.emplace(key, image);
+  return image;
+}
+
+sk_sp<SkTypeface> DeserializeOriginalTypeface(SkStream& stream, void* context) {
+  auto* cache = static_cast<OriginalTypefaceCache*>(context);
+  const size_t start = stream.getPosition();
+  SkFontDescriptor descriptor;
+  if (!SkFontDescriptor::Deserialize(&stream, &descriptor) ||
+      !descriptor.hasStream() || !stream.getMemoryBase() ||
+      stream.getPosition() <= start ||
+      stream.getPosition() - start > kMaxResourceBytes) {
+    cache->failed = true;
+    return nullptr;
+  }
+  const auto key = crypto::hash::Sha256(std::string_view(
+      static_cast<const char*>(stream.getMemoryBase()) + start,
+      stream.getPosition() - start));
+  if (const auto found = cache->faces.find(key); found != cache->faces.end())
+    return found->second;
+  if (cache->faces.size() >= kMaxResources) {
+    cache->failed = true;
+    return nullptr;
+  }
+  auto face = skia::DefaultFontMgr()->makeFromStream(
+      descriptor.detachStream(), descriptor.getFontArguments());
+  if (!face) {
+    cache->failed = true;
+    return nullptr;
+  }
+  cache->faces.emplace(key, face);
+  return face;
 }
 
 bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
@@ -530,6 +601,9 @@ std::string ApplyDrawingMouse(blink::WebLocalFrame* web_frame,
   if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
       !frame->View())
     return "Frame changed during mouse layout";
+  const auto point = frame->View()->ConvertToRootFrame(gfx::Point(x, y));
+  x = point.x();
+  y = point.y();
   const auto type = kind == 0 ? blink::WebInputEvent::Type::kMouseMove :
       kind == 1 ? blink::WebInputEvent::Type::kMouseLeave :
       up ? blink::WebInputEvent::Type::kMouseUp : blink::WebInputEvent::Type::kMouseDown;
@@ -563,6 +637,9 @@ std::string ApplyDrawingWheel(blink::WebLocalFrame* web_frame,
       !frame->View() || !document->GetLayoutView()) {
     return "Frame changed during wheel layout";
   }
+  const auto point = frame->View()->ConvertToRootFrame(gfx::Point(x, y));
+  x = point.x();
+  y = point.y();
   blink::HitTestLocation location(blink::PhysicalOffset(
       frame->View()->ConvertFromRootFrame(gfx::Point(x, y))));
   blink::HitTestResult hit(blink::HitTestRequest::kReadOnly, location);
@@ -640,7 +717,116 @@ std::string ApplyDrawingWheel(blink::WebLocalFrame* web_frame,
   return {};
 }
 
-CefDrawingCommands CaptureDrawingCommands(blink::WebLocalFrame* web_frame) {
+bool IsDrawingDocument(blink::WebLocalFrame* web_frame,
+                       const std::string& document) {
+  auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
+  return frame && frame->IsAttached() && frame->GetDocument() &&
+         frame->GetDocument()->Token().ToString() == document;
+}
+
+CefDrawingCommands GetDrawingInputRoute(blink::WebLocalFrame* web_frame,
+                                        bool keyboard, int x, int y) {
+  CefDrawingCommands result;
+  auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
+  if (!frame || !frame->IsAttached() || !frame->View() ||
+      !frame->GetPage() || !frame->GetDocument()) {
+    result.error = "Input frame is detached or not ready";
+    return result;
+  }
+  frame->View()->UpdateAllLifecyclePhasesExceptPaint(
+      blink::DocumentUpdateReason::kInspector);
+  blink::Frame* child = nullptr;
+  double route_x = x;
+  double route_y = y;
+  if (keyboard) {
+    child = frame->GetPage()->GetFocusController().FocusedFrameIncludingRemote();
+    if (child == frame)
+      child = nullptr;
+  } else {
+    blink::HitTestLocation location(blink::PhysicalOffset(gfx::Point(x, y)));
+    blink::HitTestResult hit(blink::HitTestRequest::kReadOnly, location);
+    if (frame->GetDocument()->GetLayoutView())
+      frame->GetDocument()->GetLayoutView()->HitTest(location, hit);
+    auto* owner =
+        blink::DynamicTo<blink::HTMLFrameOwnerElement>(hit.InnerNode());
+    if (owner && hit.IsOverEmbeddedContentView()) {
+      auto* layout =
+          blink::DynamicTo<blink::LayoutEmbeddedContent>(owner->GetLayoutObject());
+      if (layout && owner->ContentFrame()) {
+        const auto rect = layout->ReplacedContentRect();
+        const auto point = hit.LocalPoint() - rect.offset;
+        if (rect.IsEmpty()) {
+          result.error = "Input frame content bounds are empty";
+          return result;
+        }
+        route_x = point.left.ToFloat() / rect.Width().ToFloat();
+        route_y = point.top.ToFloat() / rect.Height().ToFloat();
+        child = owner->ContentFrame();
+      }
+    }
+  }
+  if (child && !child->GetEmbeddingToken()) {
+    result.error = "Input frame has no embedding identity";
+    return result;
+  }
+  base::DictValue route;
+  route.Set("document", frame->GetDocument()->Token().ToString());
+  route.Set("embedding", child ? child->GetEmbeddingToken()->ToString() : "");
+  route.Set("x", route_x);
+  route.Set("y", route_y);
+  auto json = base::WriteJson(route);
+  if (!json) {
+    result.error = "Input route serialization failed";
+    return result;
+  }
+  result.metadata = std::move(*json);
+  return result;
+}
+
+CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame) {
+  CefDrawingCommands result;
+  auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
+  if (!frame || !frame->IsAttached() || !frame->View() ||
+      !frame->GetDocument()) {
+    result.error = "Frame is detached or not ready";
+    return result;
+  }
+  frame->View()->UpdateAllLifecyclePhasesExceptPaint(
+      blink::DocumentUpdateReason::kInspector);
+  const auto bounds = frame->View()->LayoutViewport()->VisibleContentRect(
+      blink::kIncludeScrollbars);
+  base::DictValue info;
+  info.Set("document", frame->GetDocument()->Token().ToString());
+  info.Set("embedding", frame->GetEmbeddingToken()
+      ? frame->GetEmbeddingToken()->ToString() : "");
+  info.Set("width", bounds.width());
+  info.Set("height", bounds.height());
+  base::ListValue children;
+  for (auto* child = frame->Tree().FirstChild(); child;
+       child = child->Tree().NextSibling()) {
+    const auto* owner = child->OwnerLayoutObject();
+    if (!owner || owner->ReplacedContentRect().IsEmpty() ||
+        owner->StyleRef().Visibility() != blink::EVisibility::kVisible)
+      continue;
+    if (!child->GetEmbeddingToken() || children.size() >= 16) {
+      result.error = "Frame identity or child budget exceeded";
+      return result;
+    }
+    children.Append(child->GetEmbeddingToken()->ToString());
+  }
+  info.Set("children", std::move(children));
+  auto json = base::WriteJson(info);
+  if (!json || json->size() > 8192) {
+    result.error = "Frame metadata budget exceeded";
+    return result;
+  }
+  result.metadata = std::move(*json);
+  return result;
+}
+
+CefDrawingCommands CaptureDrawingCommands(
+    blink::WebLocalFrame* web_frame, const std::string& expected_document,
+    const std::map<std::string, std::vector<uint8_t>>& children) {
   CefDrawingCommands result;
   blink::Persistent<blink::LocalFrame> frame =
       blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
@@ -650,6 +836,11 @@ CefDrawingCommands CaptureDrawingCommands(blink::WebLocalFrame* web_frame) {
     return result;
   }
   blink::Persistent<blink::Document> document = frame->GetDocument();
+  if (!expected_document.empty() &&
+      document->Token().ToString() != expected_document) {
+    result.error = "Frame document changed during command composition";
+    return result;
+  }
   blink::Persistent<blink::Page> page = frame->GetPage();
   page->Animator().ServiceScriptedAnimations(base::TimeTicks::Now());
   if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
@@ -664,24 +855,74 @@ CefDrawingCommands CaptureDrawingCommands(blink::WebLocalFrame* web_frame) {
     result.error = "Frame changed during layout";
     return result;
   }
-  const auto* root = document->GetLayoutView();
+  auto* root = document->GetLayoutView();
   if (!root) {
     result.error = "Document has no layout";
     return result;
   }
   size_t objects = 0;
-  for (const blink::LayoutObject* object = root; object;
+  size_t child_bytes = 0;
+  OriginalTypefaceCache frame_fonts;
+  std::map<uint32_t, sk_sp<SkPicture>> frame_pictures;
+  for (blink::LayoutObject* object = root; object;
        object = object->NextInPreOrder(root)) {
     if (++objects > kMaxLayoutObjects) {
       result.error = "Layout object budget exceeded";
       return result;
     }
-    const auto* node = object->GetNode();
-    if (object->IsLayoutEmbeddedContent() ||
-        (node && blink::IsA<blink::HTMLCanvasElement>(node))) {
-      result.error =
-          "Canvas or embedded content requires command support";
-      return result;
+    auto* node = object->GetNode();
+    if (object->IsLayoutEmbeddedContent()) {
+      const auto* layout = blink::To<blink::LayoutEmbeddedContent>(object);
+      if (layout->ReplacedContentRect().IsEmpty() ||
+          layout->StyleRef().Visibility() != blink::EVisibility::kVisible)
+        continue;
+      auto* owner =
+          blink::DynamicTo<blink::HTMLFrameOwnerElement>(node);
+      auto* child = owner ? owner->ContentFrame() : nullptr;
+      if (!child || !child->GetEmbeddingToken() ||
+          !blink::CanvasResourceProvider::IsReachCommandMode()) {
+        result.error = "Embedded plugin or unready frame requires support";
+        return result;
+      }
+      const auto found = children.find(child->GetEmbeddingToken()->ToString());
+      if (found == children.end() || frame_pictures.size() >= 16 ||
+          (child_bytes += found->second.size()) > kMaxPaintBytes) {
+        result.error = "Missing child frame picture or composition budget exceeded";
+        return result;
+      }
+      SkDeserialProcs procs;
+      procs.fTypefaceStreamProc = DeserializeOriginalTypeface;
+      procs.fTypefaceCtx = &frame_fonts;
+      procs.fImageDataProc = DeserializeOriginalImage;
+      procs.fImageCtx = &frame_fonts;
+      auto picture = SkPicture::MakeFromData(
+          found->second.data(), found->second.size(), &procs);
+      if (frame_fonts.failed || !picture || picture->cullRect().isEmpty() ||
+          picture->cullRect().left() != 0 ||
+          picture->cullRect().top() != 0) {
+        result.error = "Invalid child frame command picture";
+        return result;
+      }
+      frame_pictures.emplace(owner->GetDomNodeId(), std::move(picture));
+    }
+    if (const auto* element = blink::DynamicTo<blink::HTMLCanvasElement>(node)) {
+      auto* context = element->RenderingContext();
+      if (element->IsOffscreenCanvasRegistered() ||
+          (context && !context->IsRenderingContext2D())) {
+        result.error = "GPU, bitmap or offscreen canvas requires command transport";
+        return result;
+      }
+      if (context) {
+        if (!blink::CanvasResourceProvider::IsReachCommandMode()) {
+          result.error = "Canvas2D requires a command-only runtime";
+          return result;
+        }
+        context->FlushCanvas(blink::FlushReason::kPrinting);
+        if (context->IsPaintable() && !context->GetLastRecording()) {
+          result.error = "Canvas2D readback, raw pixels or command budget requires support";
+          return result;
+        }
+      }
     }
   }
   const auto bounds = frame->View()->LayoutViewport()->VisibleContentRect(
@@ -708,6 +949,12 @@ CefDrawingCommands CaptureDrawingCommands(blink::WebLocalFrame* web_frame) {
         (!url.IsEmpty() && !url.ProtocolIs("http") && !url.ProtocolIs("https") &&
          !url.ProtocolIsData())) {
       result.error = "MediaSource, MediaStream or encrypted media requires transport support";
+      return result;
+    }
+    if (url.IsEmpty())
+      continue;
+    if (web_frame->Parent()) {
+      result.error = "Child-frame media requires frame-scoped resource routing";
       return result;
     }
     if (++media_count > 16 || !std::isfinite(media->currentTime()) ||
@@ -759,6 +1006,9 @@ CefDrawingCommands CaptureDrawingCommands(blink::WebLocalFrame* web_frame) {
     return result;
   }
   PaintSerialization state;
+  for (const auto& [id, picture] : frame_pictures) {
+    state.media_ids.insert(id);
+  }
   for (const auto& [id, data] : media_states) {
     state.media_ids.insert(id);
   }
@@ -771,7 +1021,18 @@ CefDrawingCommands CaptureDrawingCommands(blink::WebLocalFrame* web_frame) {
   cc::PlaybackCallbacks callbacks;
   callbacks.custom_callback = base::BindRepeating(
       [](const std::map<uint32_t, sk_sp<SkData>>* states,
+         const std::map<uint32_t, sk_sp<SkPicture>>* frames,
          PaintSerialization* state, SkCanvas* canvas, uint32_t id) {
+        const auto child = frames->find(id);
+        if (child != frames->end()) {
+          SkAutoCanvasRestore restore(canvas, true);
+          const auto bounds = child->second->cullRect();
+          canvas->scale(1 / bounds.width(), 1 / bounds.height());
+          // Flatten child commands so nested pictures do not embed the same
+          // original fonts repeatedly in independent resource tables.
+          child->second->playback(canvas);
+          return;
+        }
         if (!states->contains(id)) {
           state->error = "Unknown media paint identity";
           return;
@@ -780,7 +1041,8 @@ CefDrawingCommands CaptureDrawingCommands(blink::WebLocalFrame* web_frame) {
         auto data = SkData::MakeWithCopy(text.data(), text.size());
         canvas->drawAnnotation(SkRect::MakeWH(1, 1), "Reach.Video.v1",
                                data.get());
-      }, base::Unretained(&media_states), base::Unretained(&state));
+      }, base::Unretained(&media_states), base::Unretained(&frame_pictures),
+      base::Unretained(&state));
   auto picture = recording.ToSkPicture(
       SkRect::MakeWH(bounds.width(), bounds.height()), nullptr, callbacks);
   if (!state.error.empty() || !picture) {
@@ -794,7 +1056,7 @@ CefDrawingCommands CaptureDrawingCommands(blink::WebLocalFrame* web_frame) {
     media_canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.MediaState.v1",
                                  data.get());
   }
-  media_canvas->drawPicture(picture);
+  picture->playback(media_canvas);
   picture = media_recorder.finishRecordingAsPicture();
   SkSerialProcs procs;
   procs.fImageProc = &SerializeOriginalImage;

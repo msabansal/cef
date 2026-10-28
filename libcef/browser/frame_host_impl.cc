@@ -278,6 +278,27 @@ void CefFrameHostImpl::SendProcessMessage(
     return;
   }
 
+  const std::string name = message->GetName();
+  if (name == "Reach.DrawingFrame.v1" || name == "Reach.DrawingRoute.v1" ||
+      name == "Reach.DrawingInput.v1") {
+    if (!CEF_CURRENTLY_ON_UIT()) {
+      CEF_POST_TASK(CEF_UIT,
+          base::BindOnce(&CefFrameHostImpl::SendProcessMessage, this,
+                         target_process, message));
+      return;
+    }
+    if (is_temporary() || !render_frame_host_ || !render_frame_.is_bound()) {
+      auto arguments = message->GetArgumentList();
+      base::ListValue response;
+      response.Append(arguments ? arguments->GetInt(0) : 0);
+      response.Append("Drawing frame unavailable before dispatch");
+      response.Append(0);
+      response.Append(0);
+      SendMessage("Reach.DrawingCommands.v1", std::move(response));
+      return;
+    }
+  }
+
   if (message->GetArgumentList() != nullptr) {
     // Invalidate the message object immediately by taking the argument list.
     auto argument_list =

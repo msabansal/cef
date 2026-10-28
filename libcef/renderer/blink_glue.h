@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,7 @@ BLINK_EXPORT blink::WebString DumpDocumentMarkup(blink::WebLocalFrame* frame);
 
 struct CefDrawingCommands {
   std::string error;
+  std::string metadata;
   std::vector<uint8_t> picture;
   int width = 0;
   int height = 0;
@@ -51,7 +53,18 @@ struct CefDrawingCommands {
 // Only for externally driven OSR sessions. This does not disable rasterization
 // in an ordinary CEF browser.
 BLINK_EXPORT CefDrawingCommands
-CaptureDrawingCommands(blink::WebLocalFrame* frame);
+CaptureDrawingCommands(
+    blink::WebLocalFrame* frame,
+    const std::string& document = {},
+    const std::map<std::string, std::vector<uint8_t>>& children = {});
+
+BLINK_EXPORT CefDrawingCommands
+GetDrawingFrameInfo(blink::WebLocalFrame* frame);
+
+BLINK_EXPORT CefDrawingCommands
+GetDrawingInputRoute(blink::WebLocalFrame* frame, bool keyboard, int x, int y);
+BLINK_EXPORT bool IsDrawingDocument(blink::WebLocalFrame* frame,
+                                    const std::string& document);
 
 BLINK_EXPORT std::string ApplyDrawingWheel(blink::WebLocalFrame* frame,
                                           int x, int y, int modifiers,
