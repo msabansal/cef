@@ -306,10 +306,10 @@ index 00000000..3e386661
 +    std::memset(out, 0, kHeaderBytes);
 +    std::memcpy(out, "REACHRS2", 8);
 +    out[8] = kind;
-+    Write32(out + 12, length);
++    Write32(out + 12, static_cast<uint32_t>(length));
 +    std::memcpy(out + 16, hash.data(), hash.size());
 +    if (kind == kFont) {
-+        Write32(out + kHeaderBytes, descriptor->size());
++        Write32(out + kHeaderBytes, static_cast<uint32_t>(descriptor->size()));
 +        std::memcpy(out + kHeaderBytes + 4, descriptor->data(), descriptor->size());
 +    }
 +    return data;
