@@ -10,6 +10,7 @@
 
 #include <memory>
 #include <map>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -59,10 +60,16 @@ CaptureDrawingCommands(
     blink::WebLocalFrame* frame,
     const std::string& document = {},
     const std::map<std::string, std::vector<uint8_t>>& children = {},
-    const std::map<std::string, std::vector<uint8_t>>& resources = {});
+    const std::map<std::string, std::vector<uint8_t>>& resources = {},
+    const std::function<void(const std::string&, const void*, size_t)>& sink = {});
 
 BLINK_EXPORT CefDrawingCommands
-GetDrawingFrameInfo(blink::WebLocalFrame* frame);
+CaptureRasterFallback(
+    blink::WebLocalFrame* frame, const std::string& document,
+    const std::map<std::string, std::vector<uint8_t>>& children);
+
+BLINK_EXPORT CefDrawingCommands
+GetDrawingFrameInfo(blink::WebLocalFrame* frame, bool raster = false);
 
 BLINK_EXPORT CefDrawingCommands
 GetDrawingInputRoute(blink::WebLocalFrame* frame, bool keyboard, int x, int y);

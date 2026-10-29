@@ -89,6 +89,8 @@
 #include "third_party/skia/include/core/SkSerialProcs.h"
 #include "third_party/skia/include/core/SkStream.h"
 #include "third_party/skia/include/core/SkTypeface.h"
+#include "third_party/skia/include/core/SkSurface.h"
+#include "third_party/skia/include/encode/SkPngRustEncoder.h"
 #include "third_party/skia/src/core/SkReachResource.h"
 #undef LOG
 
@@ -103,7 +105,6 @@ constexpr size_t kMaxResourceBytes = 4 * 1024 * 1024;
 constexpr size_t kMaxPaintBytes = 32 * 1024 * 1024;
 constexpr size_t kMaxPaintOps = 100000;
 constexpr size_t kMaxLayoutObjects = 100000;
-constexpr size_t kMaxResources = 64;
 constexpr size_t kMaxFilterNodes = 1024;
 constexpr size_t kMaxFilterDepth = 32;
 constexpr size_t kMaxRecordDepth = 32;
@@ -139,6 +140,10 @@ class BoundedPaintStream final : public SkWStream {
 
 struct PaintSerialization {
   std::string error;
+  bool raster = false;
+  std::function<void(const std::string&, const void*, size_t)> sink;
+  std::set<std::string> original_ids;
+  size_t identity_bytes = 0;
   size_t resources = 0;
   size_t bytes = 0;
   uint64_t image_pixels = 0;
@@ -160,27 +165,29 @@ struct PaintSerialization {
         static_cast<const char*>(data->data()), data->size()));
     const std::string key = (kind == sk_reach::kImage ? "image:" : "font:") +
                             sk_reach::Hex(*hash);
-    if (originals.contains(key)) return true;
-    if (originals.size() >= kMaxResources) {
-      error = "Original resource count budget exceeded";
-      return false;
-    }
+    if (original_ids.contains(key)) return true;
     if (kind == sk_reach::kImage) {
       if (!AddResource(data->size())) return false;
     } else {
-      if (fonts >= kMaxResources || data->size() > sk_reach::kFontBytes - font_bytes) {
-        error = "Original font resource byte or count budget exceeded";
+      if (data->size() > sk_reach::kFontBytes - font_bytes) {
+        error = "Original font resource byte budget exceeded";
         return false;
       }
       ++fonts;
       font_bytes += data->size();
     }
-    if (bytes + font_bytes > kMaxPaintBytes) {
+    identity_bytes += key.size() + 64;
+    if (bytes + font_bytes + identity_bytes > kMaxPaintBytes) {
       error = "Aggregate original resource budget exceeded";
       return false;
     }
-    const auto* start = static_cast<const uint8_t*>(data->data());
-    originals.emplace(key, std::vector<uint8_t>(start, start + data->size()));
+    original_ids.insert(key);
+    if (sink) {
+      sink(key, data->data(), data->size());
+    } else {
+      const auto* start = static_cast<const uint8_t*>(data->data());
+      originals.emplace(key, std::vector<uint8_t>(start, start + data->size()));
+    }
     return true;
   }
 
@@ -188,8 +195,7 @@ struct PaintSerialization {
     if (!error.empty()) {
       return false;
     }
-    if (size == 0 || size > kMaxResourceBytes - bytes ||
-        resources >= kMaxResources) {
+    if (size == 0 || size > kMaxResourceBytes - bytes) {
       error = "Original resource budget exceeded or resource unavailable";
       return false;
     }
@@ -232,8 +238,6 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
 
 SkSerialReturnType SerializeOriginalTypeface(SkTypeface* face, void* context) {
   auto* state = static_cast<PaintSerialization*>(context);
-  if (++state->typefaces > kMaxResources)
-    state->error = "Original typeface count budget exceeded";
   if (state->error.empty()) {
     int collection_index = 0;
     auto original = face->openStream(&collection_index);
@@ -313,7 +317,7 @@ sk_sp<SkImage> DeserializeOriginalImage(sk_sp<SkData> data,
   if (const auto found = cache->images.find(key); found != cache->images.end())
     return found->second;
   auto image = SkImages::DeferredFromEncodedData(std::move(data), alpha);
-  if (!image || cache->images.size() >= kMaxResources) {
+  if (!image) {
     cache->failed = true;
     return nullptr;
   }
@@ -338,10 +342,6 @@ sk_sp<SkTypeface> DeserializeOriginalTypeface(SkStream& stream, void* context) {
       static_cast<const char*>(identity_data->data()), identity_data->size()));
   if (const auto found = cache->faces.find(key); found != cache->faces.end())
     return found->second;
-  if (cache->faces.size() >= kMaxResources) {
-    cache->failed = true;
-    return nullptr;
-  }
   auto data = cache->Resolve(ref);
   auto face = data ? skia::DefaultFontMgr()->makeFromStream(
       SkMemoryStream::Make(std::move(data)), descriptor.getFontArguments()) : nullptr;
@@ -354,6 +354,21 @@ sk_sp<SkTypeface> DeserializeOriginalTypeface(SkStream& stream, void* context) {
 }
 
 bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
+  if (state->raster) {
+    const uint64_t pixels = uint64_t(std::max(0, image.width())) *
+                            std::max(0, image.height());
+    if (image.IsTextureBacked() || image.IsDeferredPaintRecord()) {
+      state->error = "Raster fallback cannot read texture-backed or deferred paint";
+      return false;
+    }
+    if (!pixels || image.width() > 4096 || image.height() > 4096 ||
+        pixels > kMaxDecodedImagePixels - state->image_pixels) {
+      state->error = "Raster fallback decoded image pixel budget exceeded";
+      return false;
+    }
+    state->image_pixels += pixels;
+    return true;
+  }
   if (image.IsTextureBacked() || image.IsDeferredPaintRecord()) {
     state->error = "Texture-backed or deferred image requires command support";
     return false;
@@ -452,6 +467,27 @@ const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
           state, static_cast<const cc::DrawRecordOp&>(operation).record,
           depth + 1)) {
     return nullptr;
+  }
+  if (state->raster) {
+    if ((operation.GetType() == cc::PaintOpType::kDrawImage &&
+         !CheckPaintImage(
+             state, static_cast<const cc::DrawImageOp&>(operation).image)) ||
+        (operation.GetType() == cc::PaintOpType::kDrawImageRect &&
+         !CheckPaintImage(
+             state, static_cast<const cc::DrawImageRectOp&>(operation).image)))
+      return nullptr;
+    if (operation.IsPaintOpWithFlags()) {
+      const auto* shader =
+          static_cast<const cc::PaintOpWithFlags&>(operation).flags.getShader();
+      if (shader && shader->shader_type() == cc::PaintShader::Type::kImage &&
+          !CheckPaintImage(state, shader->paint_image()))
+        return nullptr;
+      if (shader && shader->shader_type() == cc::PaintShader::Type::kPaintRecord &&
+          (!shader->paint_record() ||
+           !CheckPaintRecord(state, *shader->paint_record(), depth + 1)))
+        return nullptr;
+    }
+    return &operation;
   }
   if (operation.GetType() == cc::PaintOpType::kDrawSkottie ||
       operation.GetType() == cc::PaintOpType::kDrawSlug) {
@@ -561,7 +597,7 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
     }
     const auto* element =
         blink::DynamicTo<blink::HTMLCanvasElement>(object->GetNode());
-    if (!element)
+    if (!element || dependencies->raster)
       continue;
     auto* context = element->RenderingContext();
     if (element->IsOffscreenCanvasRegistered() ||
@@ -586,7 +622,7 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
   cc::PaintRecorder recorder;
   auto* canvas = recorder.beginRecording();
   canvas->translate(-bounds.x(), -bounds.y());
-  const bool previous = blink::SetReachMediaCapture(true);
+  const bool previous = blink::SetReachMediaCapture(!dependencies->raster);
   base::ScopedClosureRunner restore(base::BindOnce(
       [](bool value) { blink::SetReachMediaCapture(value); }, previous));
   if (!web_frame->CapturePaintPreview(
@@ -899,6 +935,17 @@ bool IsDrawingDocument(blink::WebLocalFrame* web_frame,
          frame->GetDocument()->Token().ToString() == document;
 }
 
+// Initial local documents can paint before the browser supplies an embedding
+// token. Their document token is shared with the local owner and changes on
+// navigation; remote frames must wait for their browser-issued embedding token.
+std::string DrawingFrameIdentity(blink::Frame* frame) {
+  if (frame->GetEmbeddingToken())
+    return frame->GetEmbeddingToken()->ToString();
+  auto* local = blink::DynamicTo<blink::LocalFrame>(frame);
+  return local && local->GetDocument()
+      ? "document:" + local->GetDocument()->Token().ToString() : "";
+}
+
 CefDrawingCommands GetDrawingInputRoute(blink::WebLocalFrame* web_frame,
                                         bool keyboard, int x, int y) {
   CefDrawingCommands result;
@@ -940,13 +987,13 @@ CefDrawingCommands GetDrawingInputRoute(blink::WebLocalFrame* web_frame,
       }
     }
   }
-  if (child && !child->GetEmbeddingToken()) {
+  if (child && DrawingFrameIdentity(child).empty()) {
     result.error = "Input frame has no embedding identity";
     return result;
   }
   base::DictValue route;
   route.Set("document", frame->GetDocument()->Token().ToString());
-  route.Set("embedding", child ? child->GetEmbeddingToken()->ToString() : "");
+  route.Set("embedding", child ? DrawingFrameIdentity(child) : "");
   route.Set("x", route_x);
   route.Set("y", route_y);
   auto json = base::WriteJson(route);
@@ -958,7 +1005,8 @@ CefDrawingCommands GetDrawingInputRoute(blink::WebLocalFrame* web_frame,
   return result;
 }
 
-CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame) {
+CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame,
+                                      bool raster) {
   CefDrawingCommands result;
   auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
   if (!frame || !frame->IsAttached() || !frame->View() ||
@@ -972,11 +1020,11 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame) {
       blink::kIncludeScrollbars);
   base::DictValue info;
   info.Set("document", frame->GetDocument()->Token().ToString());
-  info.Set("embedding", frame->GetEmbeddingToken()
-      ? frame->GetEmbeddingToken()->ToString() : "");
+  info.Set("embedding", DrawingFrameIdentity(frame));
   info.Set("width", bounds.width());
   info.Set("height", bounds.height());
   PaintSerialization dependencies;
+  dependencies.raster = raster;
   if (!bounds.IsEmpty() &&
       !CaptureRequiredPaint(web_frame, bounds, &dependencies)) {
     result.error = dependencies.error;
@@ -998,20 +1046,20 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame) {
     if (!element ||
         !dependencies.media_ids.contains(element->GetDomNodeId()))
       continue;
-    if (!child->GetEmbeddingToken()) {
+    if (DrawingFrameIdentity(child).empty()) {
       result.error = "Paint-required child frame has no embedding identity";
       return result;
     }
-    if (children.size() >= 16) {
+    if (children.size() >= (raster ? 255u : 16u)) {
       result.error =
           "Paint-required child frame count budget exceeded: selected=16, attempted=17";
       return result;
     }
-    children.Append(child->GetEmbeddingToken()->ToString());
+    children.Append(DrawingFrameIdentity(child));
   }
   info.Set("children", std::move(children));
   auto json = base::WriteJson(info);
-  if (!json || json->size() > 8192) {
+  if (!json || json->size() > (raster ? 65536u : 8192u)) {
     result.error = "Frame metadata budget exceeded";
     return result;
   }
@@ -1022,7 +1070,8 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame) {
 CefDrawingCommands CaptureDrawingCommands(
     blink::WebLocalFrame* web_frame, const std::string& expected_document,
     const std::map<std::string, std::vector<uint8_t>>& children,
-    const std::map<std::string, std::vector<uint8_t>>& resources) {
+    const std::map<std::string, std::vector<uint8_t>>& resources,
+    const std::function<void(const std::string&, const void*, size_t)>& sink) {
   CefDrawingCommands result;
   blink::Persistent<blink::LocalFrame> frame =
       blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
@@ -1086,12 +1135,12 @@ CefDrawingCommands CaptureDrawingCommands(
           !dependencies.media_ids.contains(owner->GetDomNodeId()))
         continue;
       auto* child = owner ? owner->ContentFrame() : nullptr;
-      if (!child || !child->GetEmbeddingToken() ||
+      if (!child || DrawingFrameIdentity(child).empty() ||
           !blink::CanvasResourceProvider::IsReachCommandMode()) {
         result.error = "Embedded plugin or unready frame requires support";
         return result;
       }
-      const auto found = children.find(child->GetEmbeddingToken()->ToString());
+      const auto found = children.find(DrawingFrameIdentity(child));
       if (found == children.end() || frame_pictures.size() >= 16 ||
           (child_bytes += found->second.size()) > kMaxPaintBytes) {
         result.error = "Missing child frame picture or composition budget exceeded";
@@ -1162,6 +1211,7 @@ CefDrawingCommands CaptureDrawingCommands(
                          SkData::MakeWithCopy(json->data(), json->size()));
   }
   PaintSerialization state;
+  state.sink = sink;
   state.media_ids = dependencies.culled_paint_ids;
   state.culled_paint_ids = dependencies.culled_paint_ids;
   for (const auto& [id, picture] : frame_pictures) {
@@ -1233,7 +1283,8 @@ CefDrawingCommands CaptureDrawingCommands(
     return result;
   }
   result.picture = stream.TakeBytes();
-  if (result.picture.size() + state.bytes + state.font_bytes > kMaxPaintBytes) {
+  if (result.picture.size() + state.bytes + state.font_bytes +
+          state.identity_bytes > kMaxPaintBytes) {
     result.error = "Aggregate picture and original resource budget exceeded";
     return result;
   }
@@ -1244,6 +1295,103 @@ CefDrawingCommands CaptureDrawingCommands(
   }
   result.width = bounds.width();
   result.height = bounds.height();
+  return result;
+}
+
+CefDrawingCommands CaptureRasterFallback(
+    blink::WebLocalFrame* web_frame, const std::string& expected_document,
+    const std::map<std::string, std::vector<uint8_t>>& children) {
+  CefDrawingCommands result;
+  if (!blink::CanvasResourceProvider::IsReachCommandMode()) {
+    result.error = "Raster fallback requires a command-only runtime";
+    return result;
+  }
+  auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
+  if (!frame || !frame->IsAttached() || !frame->View() ||
+      !frame->GetDocument() ||
+      frame->GetDocument()->Token().ToString() != expected_document) {
+    result.error = "Raster fallback document is detached or changed";
+    return result;
+  }
+  frame->View()->UpdateAllLifecyclePhasesExceptPaint(
+      blink::DocumentUpdateReason::kInspector);
+  const auto bounds = frame->View()->LayoutViewport()->VisibleContentRect(
+      blink::kIncludeScrollbars);
+  PaintSerialization dependencies;
+  dependencies.raster = true;
+  auto recording = CaptureRequiredPaint(web_frame, bounds, &dependencies);
+  if (!recording) {
+    result.error = dependencies.error;
+    return result;
+  }
+  std::map<uint32_t, sk_sp<SkImage>> images;
+  size_t child_bytes = 0;
+  uint64_t child_pixels = 0;
+  for (auto* child = frame->Tree().FirstChild(); child;
+       child = child->Tree().NextSibling()) {
+    auto* owner = child->OwnerLayoutObject();
+    auto* element = owner
+        ? blink::DynamicTo<blink::HTMLFrameOwnerElement>(owner->GetNode())
+        : nullptr;
+    if (!element ||
+        !dependencies.media_ids.contains(element->GetDomNodeId()))
+      continue;
+    const auto found = children.find(DrawingFrameIdentity(child));
+    if (found == children.end() ||
+        (child_bytes += found->second.size()) > kMaxPaintBytes) {
+      result.error = "Raster fallback missing child picture or byte budget exceeded";
+      return result;
+    }
+    auto data = SkData::MakeWithCopy(found->second.data(), found->second.size());
+    auto image = SkImages::DeferredFromEncodedData(std::move(data));
+    if (!image || image->width() <= 0 || image->height() <= 0 ||
+        image->width() > 4096 || image->height() > 4096 ||
+        (child_pixels += uint64_t(image->width()) * image->height()) >
+            kMaxDecodedImagePixels) {
+      result.error = "Raster fallback child image exceeds decoded pixel budget";
+      return result;
+    }
+    images.emplace(element->GetDomNodeId(), std::move(image));
+  }
+  auto surface = SkSurfaces::Raster(
+      SkImageInfo::MakeN32Premul(bounds.width(), bounds.height()));
+  if (!surface) {
+    result.error = "Raster fallback surface allocation failed";
+    return result;
+  }
+  surface->getCanvas()->clear(SK_ColorWHITE);
+  cc::PlaybackCallbacks callbacks;
+  callbacks.custom_callback = base::BindRepeating(
+      [](const std::map<uint32_t, sk_sp<SkImage>>* images,
+         PaintSerialization* state, SkCanvas* canvas, uint32_t id) {
+        if (state->culled_paint_ids.contains(id) &&
+            canvas->quickReject(SkRect::MakeWH(1, 1))) return;
+        const auto found = images->find(id);
+        if (found == images->end()) {
+          state->error = "Raster fallback encountered unsupported custom paint";
+          return;
+        }
+        canvas->drawImageRect(found->second, SkRect::MakeWH(1, 1),
+                              SkSamplingOptions(), nullptr);
+      }, base::Unretained(&images), base::Unretained(&dependencies));
+  auto picture = recording->ToSkPicture(
+      SkRect::MakeWH(bounds.width(), bounds.height()), nullptr, callbacks);
+  if (!picture || !dependencies.error.empty()) {
+    result.error = dependencies.error.empty()
+        ? "Raster fallback paint picture failed" : dependencies.error;
+    return result;
+  }
+  picture->playback(surface->getCanvas());
+  BoundedPaintStream stream(kMaxPictureBytes);
+  SkPixmap pixels;
+  if (!surface->peekPixels(&pixels) ||
+      !SkPngRustEncoder::Encode(&stream, pixels, {}) || stream.failed()) {
+    result.error = "Raster fallback PNG encoding failed or exceeded byte budget";
+    return result;
+  }
+  result.width = bounds.width();
+  result.height = bounds.height();
+  result.picture = stream.TakeBytes();
   return result;
 }
 
