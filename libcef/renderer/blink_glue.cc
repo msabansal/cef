@@ -89,6 +89,7 @@
 #include "third_party/skia/include/core/SkSerialProcs.h"
 #include "third_party/skia/include/core/SkStream.h"
 #include "third_party/skia/include/core/SkTypeface.h"
+#include "third_party/skia/src/core/SkReachResource.h"
 #undef LOG
 
 #include "base/logging.h"
@@ -146,6 +147,40 @@ struct PaintSerialization {
   size_t record_bytes = 0;
   size_t record_shaders = 0;
   std::set<uint32_t> media_ids;
+  std::map<std::string, std::vector<uint8_t>> originals;
+  size_t font_bytes = 0;
+  size_t fonts = 0;
+  size_t typefaces = 0;
+
+  bool Export(uint8_t kind, const sk_sp<const SkData>& data, sk_reach::Hash* hash) {
+    if (!data || !data->size()) return false;
+    *hash = crypto::hash::Sha256(std::string_view(
+        static_cast<const char*>(data->data()), data->size()));
+    const std::string key = (kind == sk_reach::kImage ? "image:" : "font:") +
+                            sk_reach::Hex(*hash);
+    if (originals.contains(key)) return true;
+    if (originals.size() >= kMaxResources) {
+      error = "Original resource count budget exceeded";
+      return false;
+    }
+    if (kind == sk_reach::kImage) {
+      if (!AddResource(data->size())) return false;
+    } else {
+      if (fonts >= kMaxResources || data->size() > sk_reach::kFontBytes - font_bytes) {
+        error = "Original font resource byte or count budget exceeded";
+        return false;
+      }
+      ++fonts;
+      font_bytes += data->size();
+    }
+    if (bytes + font_bytes > kMaxPaintBytes) {
+      error = "Aggregate original resource budget exceeded";
+      return false;
+    }
+    const auto* start = static_cast<const uint8_t*>(data->data());
+    originals.emplace(key, std::vector<uint8_t>(start, start + data->size()));
+    return true;
+  }
 
   bool AddResource(size_t size) {
     if (!error.empty()) {
@@ -178,9 +213,10 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
   }
   if (state->error.empty()) {
     auto encoded = image->refEncodedData();
-    if (encoded && state->AddResource(encoded->size())) {
+    sk_reach::Hash hash;
+    if (encoded && state->Export(sk_reach::kImage, encoded, &hash)) {
       state->image_pixels += pixels;
-      return encoded;
+      return sk_reach::Write(sk_reach::kImage, hash, encoded->size());
     }
     if (state->error.empty()) {
       state->error =
@@ -194,23 +230,39 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
 
 SkSerialReturnType SerializeOriginalTypeface(SkTypeface* face, void* context) {
   auto* state = static_cast<PaintSerialization*>(context);
+  if (++state->typefaces > kMaxResources)
+    state->error = "Original typeface count budget exceeded";
   if (state->error.empty()) {
     int collection_index = 0;
     auto original = face->openStream(&collection_index);
     if (!original || original->getLength() == 0) {
       state->error = "Original font stream unavailable";
-    } else if (original->getLength() > kMaxResourceBytes - state->bytes) {
-      state->error = "Original font resource byte budget exceeded: font=" +
-          base::NumberToString(original->getLength()) + ", used=" +
-          base::NumberToString(state->bytes);
+    } else if (original->getLength() > sk_reach::kFontBytes) {
+      state->error = "Original font resource byte budget exceeded";
     } else {
-      BoundedPaintStream stream(kMaxResourceBytes - state->bytes);
-      if (face->serialize(&stream,
-                          SkTypeface::SerializeBehavior::kDoIncludeData) &&
-          !stream.failed()) {
-        auto bytes = stream.TakeBytes();
-        if (state->AddResource(bytes.size())) {
-          return SkData::MakeWithCopy(bytes.data(), bytes.size());
+      auto data = SkData::MakeFromStream(original.get(), original->getLength());
+      sk_reach::Hash hash;
+      if (state->Export(sk_reach::kFont, data, &hash)) {
+        SkFontDescriptor descriptor;
+        bool local = false;
+        face->getFontDescriptor(&descriptor, &local);
+        descriptor.detachStream();
+        descriptor.setCollectionIndex(collection_index);
+        descriptor.setSyntheticBold(face->isSyntheticBold());
+        descriptor.setSyntheticOblique(face->isSyntheticOblique());
+        const int axes = face->getVariationDesignPosition({});
+        if (axes > 0) {
+          if (axes > 256 || face->getVariationDesignPosition(
+                  {descriptor.setVariationCoordinates(axes), size_t(axes)}) != axes) {
+            state->error = "Original font variation metadata unavailable";
+            return SkData::MakeEmpty();
+          }
+        }
+        BoundedPaintStream stream(sk_reach::kDescriptorBytes);
+        if (descriptor.serialize(&stream) && !stream.failed()) {
+          const auto bytes = stream.TakeBytes();
+          auto meta = SkData::MakeWithCopy(bytes.data(), bytes.size());
+          return sk_reach::Write(sk_reach::kFont, hash, data->size(), meta.get());
         }
       }
     }
@@ -226,13 +278,29 @@ struct OriginalTypefaceCache {
   std::map<std::pair<std::array<uint8_t, 32>, std::optional<SkAlphaType>>,
            sk_sp<SkImage>> images;
   bool failed = false;
+  const std::map<std::string, std::vector<uint8_t>>* originals = nullptr;
+
+  sk_sp<SkData> Resolve(const sk_reach::Reference& ref) {
+    if (!originals) return nullptr;
+    const auto found = originals->find(
+        (ref.kind == sk_reach::kImage ? "image:" : "font:") + sk_reach::Hex(ref.hash));
+    if (found == originals->end() || found->second.size() != ref.length ||
+        crypto::hash::Sha256(std::string_view(
+            reinterpret_cast<const char*>(found->second.data()), found->second.size())) != ref.hash)
+      return nullptr;
+    return SkData::MakeWithCopy(found->second.data(), found->second.size());
+  }
 };
 
 sk_sp<SkImage> DeserializeOriginalImage(sk_sp<SkData> data,
                                       std::optional<SkAlphaType> alpha,
                                       void* context) {
   auto* cache = static_cast<OriginalTypefaceCache*>(context);
-  if (!data || !data->size() || data->size() > kMaxResourceBytes) {
+  sk_reach::Reference ref;
+  SkMemoryStream stream(data);
+  if (!data || data->size() != sk_reach::kHeaderBytes ||
+      !sk_reach::Read(stream, sk_reach::kImage, &ref) ||
+      !(data = cache->Resolve(ref))) {
     cache->failed = true;
     return nullptr;
   }
@@ -253,26 +321,28 @@ sk_sp<SkImage> DeserializeOriginalImage(sk_sp<SkData> data,
 
 sk_sp<SkTypeface> DeserializeOriginalTypeface(SkStream& stream, void* context) {
   auto* cache = static_cast<OriginalTypefaceCache*>(context);
-  const size_t start = stream.getPosition();
+  sk_reach::Reference ref;
   SkFontDescriptor descriptor;
-  if (!SkFontDescriptor::Deserialize(&stream, &descriptor) ||
-      !descriptor.hasStream() || !stream.getMemoryBase() ||
-      stream.getPosition() <= start ||
-      stream.getPosition() - start > kMaxResourceBytes) {
+  if (!sk_reach::Read(stream, sk_reach::kFont, &ref) ||
+      !sk_reach::Descriptor(ref, &descriptor)) {
     cache->failed = true;
     return nullptr;
   }
+  SkDynamicMemoryWStream identity;
+  identity.write(ref.hash.data(), ref.hash.size());
+  identity.write(ref.descriptor->data(), ref.descriptor->size());
+  auto identity_data = identity.detachAsData();
   const auto key = crypto::hash::Sha256(std::string_view(
-      static_cast<const char*>(stream.getMemoryBase()) + start,
-      stream.getPosition() - start));
+      static_cast<const char*>(identity_data->data()), identity_data->size()));
   if (const auto found = cache->faces.find(key); found != cache->faces.end())
     return found->second;
   if (cache->faces.size() >= kMaxResources) {
     cache->failed = true;
     return nullptr;
   }
-  auto face = skia::DefaultFontMgr()->makeFromStream(
-      descriptor.detachStream(), descriptor.getFontArguments());
+  auto data = cache->Resolve(ref);
+  auto face = data ? skia::DefaultFontMgr()->makeFromStream(
+      SkMemoryStream::Make(std::move(data)), descriptor.getFontArguments()) : nullptr;
   if (!face) {
     cache->failed = true;
     return nullptr;
@@ -826,7 +896,8 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame) {
 
 CefDrawingCommands CaptureDrawingCommands(
     blink::WebLocalFrame* web_frame, const std::string& expected_document,
-    const std::map<std::string, std::vector<uint8_t>>& children) {
+    const std::map<std::string, std::vector<uint8_t>>& children,
+    const std::map<std::string, std::vector<uint8_t>>& resources) {
   CefDrawingCommands result;
   blink::Persistent<blink::LocalFrame> frame =
       blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
@@ -863,6 +934,7 @@ CefDrawingCommands CaptureDrawingCommands(
   size_t objects = 0;
   size_t child_bytes = 0;
   OriginalTypefaceCache frame_fonts;
+  frame_fonts.originals = &resources;
   std::map<uint32_t, sk_sp<SkPicture>> frame_pictures;
   for (blink::LayoutObject* object = root; object;
        object = object->NextInPreOrder(root)) {
@@ -1071,6 +1143,11 @@ CefDrawingCommands CaptureDrawingCommands(
     return result;
   }
   result.picture = stream.TakeBytes();
+  if (result.picture.size() + state.bytes + state.font_bytes > kMaxPaintBytes) {
+    result.error = "Aggregate picture and original resource budget exceeded";
+    return result;
+  }
+  result.resources = std::move(state.originals);
   if (result.picture.empty()) {
     result.error = "Skia produced an empty picture";
     return result;

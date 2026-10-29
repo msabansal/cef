@@ -46,6 +46,8 @@ struct CefDrawingCommands {
   std::string error;
   std::string metadata;
   std::vector<uint8_t> picture;
+  // Keys are "image:" or "font:" followed by the raw original-byte SHA256.
+  std::map<std::string, std::vector<uint8_t>> resources;
   int width = 0;
   int height = 0;
 };
@@ -56,7 +58,8 @@ BLINK_EXPORT CefDrawingCommands
 CaptureDrawingCommands(
     blink::WebLocalFrame* frame,
     const std::string& document = {},
-    const std::map<std::string, std::vector<uint8_t>>& children = {});
+    const std::map<std::string, std::vector<uint8_t>>& children = {},
+    const std::map<std::string, std::vector<uint8_t>>& resources = {});
 
 BLINK_EXPORT CefDrawingCommands
 GetDrawingFrameInfo(blink::WebLocalFrame* frame);

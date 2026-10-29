@@ -899,11 +899,12 @@ void CefFrameImpl::SendMessage(const std::string& name,
     auto response = CefProcessMessage::Create("Reach.DrawingCommands.v1");
     auto values = response->GetArgumentList();
     blink_glue::CefDrawingCommands capture;
-    const bool valid = arguments.size() == 4 &&
+    const bool valid = arguments.size() == 5 &&
         arguments[0].is_int() && arguments[0].GetInt() > 0 &&
         arguments[1].is_bool() && arguments[2].is_string() &&
         arguments[2].GetString().size() <= 128 &&
-        arguments[3].is_dict() && arguments[3].GetDict().size() <= 16;
+        arguments[3].is_dict() && arguments[3].GetDict().size() <= 16 &&
+        arguments[4].is_dict() && arguments[4].GetDict().size() <= 64;
     values->SetInt(0, valid ? arguments[0].GetInt() : 0);
     if (!valid || !frame_) {
       capture.error = "Invalid or detached drawing-frame request";
@@ -911,6 +912,7 @@ void CefFrameImpl::SendMessage(const std::string& name,
       capture = blink_glue::GetDrawingFrameInfo(frame_);
     } else {
       std::map<std::string, std::vector<uint8_t>> children;
+      std::map<std::string, std::vector<uint8_t>> resources;
       size_t bytes = 0;
       for (const auto [key, value] : arguments[3].GetDict()) {
         if (key.size() > 128 || !value.is_blob() ||
@@ -921,9 +923,20 @@ void CefFrameImpl::SendMessage(const std::string& name,
         }
         children.emplace(key, value.GetBlob());
       }
+      for (const auto [key, value] : arguments[4].GetDict()) {
+        const bool image = key.starts_with("image:") && key.size() == 70;
+        const bool font = key.starts_with("font:") && key.size() == 69;
+        if ((!image && !font) || !value.is_blob() || value.GetBlob().empty() ||
+            value.GetBlob().size() > (image ? 4u : 32u) * 1024 * 1024 ||
+            (bytes += value.GetBlob().size()) > 32 * 1024 * 1024) {
+          capture.error = "Invalid original resource or composition byte budget exceeded";
+          break;
+        }
+        resources.emplace(key, value.GetBlob());
+      }
       if (capture.error.empty()) {
         capture = blink_glue::CaptureDrawingCommands(
-            frame_, arguments[2].GetString(), children);
+            frame_, arguments[2].GetString(), children, resources);
       }
     }
     values->SetString(1, capture.error);
@@ -932,9 +945,14 @@ void CefFrameImpl::SendMessage(const std::string& name,
     if (capture.error.empty()) {
       if (arguments[1].GetBool())
         values->SetString(4, capture.metadata);
-      else
+      else {
         values->SetBinary(4, CefBinaryValue::Create(
             capture.picture.data(), capture.picture.size()));
+        auto resources = CefDictionaryValue::Create();
+        for (const auto& [key, bytes] : capture.resources)
+          resources->SetBinary(key, CefBinaryValue::Create(bytes.data(), bytes.size()));
+        values->SetDictionary(5, resources);
+      }
     }
     SendProcessMessage(PID_BROWSER, response);
     return;
@@ -1029,6 +1047,10 @@ void CefFrameImpl::SendMessage(const std::string& name,
     if (capture.error.empty() && arguments.size() == 1) {
       values->SetBinary(4, CefBinaryValue::Create(capture.picture.data(),
                                                   capture.picture.size()));
+      auto resources = CefDictionaryValue::Create();
+      for (const auto& [key, bytes] : capture.resources)
+        resources->SetBinary(key, CefBinaryValue::Create(bytes.data(), bytes.size()));
+      values->SetDictionary(5, resources);
     }
     SendProcessMessage(PID_BROWSER, response);
     return;
