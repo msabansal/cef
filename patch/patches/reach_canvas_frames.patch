@@ -1,12 +1,20 @@
-diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-index ce8231f02d..3a27d3c537 100644
---- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-+++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-@@ -1187,6 +1187,28 @@ void HTMLCanvasElement::Paint(GraphicsContext& context,
+diff --git third_party/blink/renderer/core/html/canvas/html_canvas_element.cc third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index 2a5404e4cf..2e99b4a5f6 100644
+--- third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -34,6 +34,7 @@
+ #include <utility>
+ 
+ #include "base/auto_reset.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
+ #include "base/feature_list.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/location.h"
+@@ -1331,6 +1332,28 @@ void HTMLCanvasElement::Paint(GraphicsContext& context,
  
  void HTMLCanvasElement::PaintInternal(GraphicsContext& context,
                                        const PhysicalRect& r) {
-+  if (CanvasResourceProvider::IsReachCommandMode() &&
++  if (Canvas2DBitmapProvider::IsReachCommandMode() &&
 +      IsRenderingContext2D()) {
 +    RenderingContext()->FlushCanvas(FlushReason::kPrinting);
 +    const auto& recording = RenderingContext()->GetLastRecording();
@@ -31,23 +39,23 @@ index ce8231f02d..3a27d3c537 100644
    // For 2D Canvas, there are two ways of render Canvas for printing:
    // display list or image snapshot. Display list allows better PDF printing
    // and we prefer this method.
-diff --git a/third_party/blink/renderer/core/paint/embedded_content_painter.cc b/third_party/blink/renderer/core/paint/embedded_content_painter.cc
-index f5132f47e2..9937943e53 100644
---- a/third_party/blink/renderer/core/paint/embedded_content_painter.cc
-+++ b/third_party/blink/renderer/core/paint/embedded_content_painter.cc
+diff --git third_party/blink/renderer/core/paint/embedded_content_painter.cc third_party/blink/renderer/core/paint/embedded_content_painter.cc
+index 55382dc09e..548993a9f1 100644
+--- third_party/blink/renderer/core/paint/embedded_content_painter.cc
++++ third_party/blink/renderer/core/paint/embedded_content_painter.cc
 @@ -23,6 +23,7 @@
  #include "third_party/blink/renderer/core/paint/scrollable_area_painter.h"
  #include "third_party/blink/renderer/core/view_transition/view_transition.h"
  #include "third_party/blink/renderer/platform/geometry/physical_offset.h"
-+#include "third_party/blink/renderer/platform/graphics/canvas_resource_provider.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
  #include "third_party/blink/renderer/platform/graphics/paint/display_item_cache_skipper.h"
  #include "third_party/blink/renderer/platform/graphics/paint/drawing_recorder.h"
  #include "third_party/blink/renderer/platform/graphics/paint/foreign_layer_display_item.h"
-@@ -61,6 +62,26 @@ void EmbeddedContentPainter::PaintReplaced(const PaintInfo& paint_info,
+@@ -62,6 +63,26 @@ void EmbeddedContentPainter::PaintReplaced(const PaintInfo& paint_info,
    if (!embedded_content_view)
      return;
  
-+  if (CanvasResourceProvider::IsReachCommandMode() &&
++  if (Canvas2DBitmapProvider::IsReachCommandMode() &&
 +      layout_embedded_content_.GetDocument().GetPaintPreviewState() !=
 +          Document::kNotPaintingPreview) {
 +    PhysicalRect rect = layout_embedded_content_.ReplacedContentRect();
@@ -70,65 +78,43 @@ index f5132f47e2..9937943e53 100644
    std::optional<ScopedPaintChunkProperties> removed_svg_filter_paint =
        RemoveSvgFilterPaint(layout_embedded_content_, paint_info);
  
-diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
-index e6f01dd246..e96e6f4d45 100644
---- a/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
-+++ b/third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
-@@ -1098,6 +1098,11 @@ CanvasRenderingContext2D::CreateCanvasResourceProvider() {
-   const viz::SharedImageFormat format = GetSharedImageFormat();
-   const gfx::ColorSpace color_space = GetColorSpace();
- 
-+  if (CanvasResourceProvider::IsReachCommandMode()) {
-+    return Canvas2DResourceProviderBitmap::CreateWithClear(
-+        canvas()->Size(), format, alpha_type, color_space, canvas());
+diff --git third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
+index 4df9bb80ee..9938c8bdae 100644
+--- third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
++++ third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
+@@ -352,6 +352,11 @@ bool CanvasRenderingContext2D::WritePixels(const SkImageInfo& orig_info,
+                                            size_t row_bytes,
+                                            int x,
+                                            int y) {
++  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++    reach_recording_failed_ = true;
++    last_recording_.reset();
++    return false;
 +  }
-+
-   const bool is_gpu_compositing_enabled =
-       SharedGpuContext::IsGpuCompositingEnabled();
-   const bool use_gpu_raster = canvas()->ShouldTryToUseGpuRaster() &&
-diff --git a/third_party/blink/renderer/platform/graphics/canvas_resource_provider.cc b/third_party/blink/renderer/platform/graphics/canvas_resource_provider.cc
-index 6e02472e54..678448e71d 100644
---- a/third_party/blink/renderer/platform/graphics/canvas_resource_provider.cc
-+++ b/third_party/blink/renderer/platform/graphics/canvas_resource_provider.cc
-@@ -4,6 +4,8 @@
+   if (!IsResourceProviderValid() || isContextLost()) {
+     return false;
+   }
+@@ -504,6 +509,10 @@ MemoryManagedPaintCanvas* CanvasRenderingContext2D::GetOrCreatePaintCanvas() {
  
- #include "third_party/blink/renderer/platform/graphics/canvas_resource_provider.h"
- 
-+#include "base/command_line.h"
-+
- #include <inttypes.h>
- 
- #include <string>
-@@ -1769,7 +1771,10 @@ void CanvasResourceProvider::InitializeForRecording(
- }
- 
- void CanvasResourceProvider::RecordingCleared() {
--
-+  if (IsReachCommandMode()) {
+ void CanvasRenderingContext2D::RecordingCleared() {
+   BaseRenderingContext2D::RecordingCleared();
++  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
 +    last_recording_.reset();
 +    reach_recording_failed_ = false;
 +  }
-   // Since the recording has been cleared, it contains no draw commands and it
-   // is now safe to discard the old copy of canvas content on a subsequent
-   // CopyOnWrite.
-@@ -1783,6 +1788,11 @@ MemoryManagedPaintCanvas& CanvasResourceProvider::GetCanvasForTesting() {
- 
- scoped_refptr<UnacceleratedStaticBitmapImage>
- CanvasResourceProvider::UnacceleratedSnapshot(ImageOrientation orientation) {
-+  if (IsReachCommandMode()) {
-+    reach_recording_failed_ = true;
-+    last_recording_.reset();
-+    return nullptr;
-+  }
-   if (!IsValid())
-     return nullptr;
- 
-@@ -1928,6 +1938,27 @@ std::optional<cc::PaintRecord> CanvasResourceProvider::Flush(
-   if (!recorder_->HasReleasableDrawOps()) {
+   if (shared_image_provider_) {
+     shared_image_provider_->RecordingCleared();
+   }
+@@ -537,6 +546,35 @@ std::optional<cc::PaintRecord> CanvasRenderingContext2D::FlushCanvas(
+   if (!canvas()) {
      return std::nullopt;
    }
-+  if (IsReachCommandMode()) {
-+    auto recording = recorder_->ReleaseMainRecording();
++  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++    auto* recorder = Recorder();
++    if (!recorder || !recorder->HasReleasableDrawOps()) {
++      return std::nullopt;
++    }
++    auto recording = recorder->ReleaseMainRecording();
 +    const size_t bytes = recording.bytes_used() +
 +        (last_recording_ ? last_recording_->bytes_used() : 0);
 +    const size_t ops = recording.total_op_count() +
@@ -139,77 +125,281 @@ index 6e02472e54..678448e71d 100644
 +      last_recording_.reset();
 +      return std::nullopt;
 +    }
-+    // Append flat records, not an ever-deepening chain of DrawRecordOps.
++    // Keep repeated flushes flat rather than nesting DrawRecordOps.
 +    cc::PaintOpBuffer combined;
 +    if (last_recording_) {
 +      combined += last_recording_->buffer();
 +    }
 +    combined += recording.buffer();
 +    last_recording_ = combined.ReleaseAsRecord();
++    set_clear_frame(false);
++    if (Host()) {
++      Host()->DidFlush();
++    }
 +    return recording;
 +  }
-   auto timer = CreateScopedRasterTimer();
-   bool want_to_print = IsPrinting() || reason == FlushReason::kPrinting ||
-                        reason == FlushReason::kCanvasPushFrameWhilePrinting;
-@@ -2505,6 +2536,11 @@ bool CanvasResourceProvider::UnacceleratedWritePixels(
-     size_t row_bytes,
-     int x,
-     int y) {
-+  if (IsReachCommandMode()) {
+   return FlushCanvasInternal(shared_image_provider_.get(),
+                              bitmap_provider_.get(), reason);
+ }
+@@ -782,6 +820,11 @@ CanvasRenderingContext2D::PaintRenderingResultsToResource(
+ scoped_refptr<StaticBitmapImage>
+ CanvasRenderingContext2D::PaintRenderingResultsToSnapshot(
+     SourceDrawingBuffer source_buffer) {
++  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
 +    reach_recording_failed_ = true;
 +    last_recording_.reset();
-+    return false;
++    return nullptr;
 +  }
-   TRACE_EVENT0("blink", "CanvasResourceProvider::WritePixels");
-   CHECK(!IsAccelerated());
- 
-@@ -2543,7 +2579,16 @@ void CanvasResourceProvider::ClearAtCreation() {
-     recorder.getRecordingCanvas().clear(SkColors::kTransparent);
+   if (!IsResourceProviderValid()) {
+     return nullptr;
    }
- 
--  RasterRecord(recorder.ReleaseMainRecording());
-+  if (IsReachCommandMode()) {
-+    last_recording_ = recorder.ReleaseMainRecording();
-+  } else {
-+    RasterRecord(recorder.ReleaseMainRecording());
-+  }
-+}
-+
-+bool CanvasResourceProvider::IsReachCommandMode() {
-+  return base::CommandLine::ForCurrentProcess()->HasSwitch(
-+      "reach-drawing-commands");
+@@ -802,6 +845,11 @@ bool CanvasRenderingContext2D::CanCreateResourceProvider() {
  }
  
- void CanvasResourceProvider::RestoreBackBuffer(const cc::PaintImage& image) {
-diff --git a/third_party/blink/renderer/platform/graphics/canvas_resource_provider.h b/third_party/blink/renderer/platform/graphics/canvas_resource_provider.h
-index b5ef58f003..96b83a95d4 100644
---- a/third_party/blink/renderer/platform/graphics/canvas_resource_provider.h
-+++ b/third_party/blink/renderer/platform/graphics/canvas_resource_provider.h
-@@ -194,6 +194,8 @@ class PLATFORM_EXPORT CanvasResourceProvider
-     return last_recording_;
-   }
+ scoped_refptr<StaticBitmapImage> blink::CanvasRenderingContext2D::GetImage() {
++  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++    reach_recording_failed_ = true;
++    last_recording_.reset();
++    return nullptr;
++  }
+   if (IsHibernating()) {
+     return UnacceleratedStaticBitmapImage::Create(
+         GetHibernationHandler()->GetImage());
+@@ -825,6 +873,10 @@ ImageData* CanvasRenderingContext2D::getImageDataInternal(
+     int sh,
+     ImageDataSettings* image_data_settings,
+     ExceptionState& exception_state) {
++  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++    reach_recording_failed_ = true;
++    last_recording_.reset();
++  }
+   UMA_HISTOGRAM_BOOLEAN(
+       "Blink.Canvas.GetImageData.WillReadFrequently",
+       CreationAttributes().will_read_frequently ==
+@@ -1133,6 +1185,20 @@ void CanvasRenderingContext2D::Dispose() {
+ void CanvasRenderingContext2D::CreateProvider() {
+   CHECK(!shared_image_provider_ && !bitmap_provider_);
  
-+  static bool IsReachCommandMode();
++  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++    bitmap_provider_ = Canvas2DBitmapProvider::CreateWithClear(
++        canvas()->Size(), color_params_.GetSharedImageFormat(),
++        color_params_.GetAlphaType(), color_params_.GetGfxColorSpace(),
++        color_params_.GetGfxHdrMetadata(), canvas());
++    if (bitmap_provider_) {
++      ConfigureRecorder(canvas()->Size(), false);
++      Recorder()->getRecordingCanvas().clear(
++          color_params_.GetAlphaType() == kOpaque_SkAlphaType
++              ? SkColors::kBlack : SkColors::kTransparent);
++    }
++    return;
++  }
 +
-   class CanvasImageProvider;
+   canvas()->GetOrCreateResourceDispatcher();
  
-  protected:
-@@ -281,6 +283,7 @@ class PLATFORM_EXPORT CanvasResourceProvider
+   const SkAlphaType alpha_type = color_params_.GetAlphaType();
+@@ -1305,6 +1371,7 @@ void CanvasRenderingContext2D::ResetResourceProvider() {
+   auto old_shared = std::move(shared_image_provider_);
+   auto old_bitmap = std::move(bitmap_provider_);
+   last_recording_ = std::nullopt;
++  reach_recording_failed_ = false;
+   if (canvas()) {
+     canvas()->UpdateMemoryUsage();
+   }
+diff --git third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.h third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.h
+index d886b297f3..97da3ce00d 100644
+--- third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.h
++++ third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.h
+@@ -337,6 +337,7 @@ class MODULES_EXPORT CanvasRenderingContext2D final
  
-   bool clear_frame_ = true;
+  private:
    std::optional<cc::PaintRecord> last_recording_;
 +  bool reach_recording_failed_ = false;
  };
  
- // Renders canvas2D ops to a Skia RAM-backed bitmap. Mailboxing is not
-@@ -292,7 +295,9 @@ class PLATFORM_EXPORT Canvas2DResourceProviderBitmap
-  public:
-   ~Canvas2DResourceProviderBitmap() override = default;
+ }  // namespace blink
+diff --git third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_test.cc third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_test.cc
+index 509aae95e9..ce48251eed 100644
+--- third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_test.cc
++++ third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_test.cc
+@@ -28,6 +28,7 @@
+ #include "base/strings/string_number_conversions.h"
+ #include "base/test/bind.h"
+ #include "base/test/metrics/histogram_tester.h"
++#include "base/test/scoped_command_line.h"
+ #include "base/test/scoped_feature_list.h"
+ #include "base/time/time.h"
+ #include "cc/base/features.h"
+@@ -469,6 +470,42 @@ class CanvasRenderingContext2DTest : public CanvasRenderingContext2DTestBase {
  
--  bool IsValid() const override { return GetSkSurface(); }
-+  bool IsValid() const override {
-+    return IsReachCommandMode() || GetSkSurface();
+ INSTANTIATE_PAINT_TEST_SUITE_P(CanvasRenderingContext2DTest);
+ 
++TEST_P(CanvasRenderingContext2DTest, CommandModeRetainsFlushesAndClearsOnReset) {
++  base::test::ScopedCommandLine command_line;
++  command_line.GetProcessCommandLine()->AppendSwitch("reach-drawing-commands");
++  CreateContext(kNonOpaque);
++  CanvasElement().SetSize(gfx::Size(10, 10));
++  Context2D()->fillRect(1, 1, 2, 2);
++  Context2D()->FlushCanvas(FlushReason::kOther);
++  ASSERT_TRUE(Context2D()->GetLastRecording());
++  const size_t first_count = Context2D()->GetLastRecording()->total_op_count();
++  Context2D()->fillRect(4, 4, 2, 2);
++  Context2D()->FlushCanvas(FlushReason::kPrinting);
++  ASSERT_TRUE(Context2D()->GetLastRecording());
++  EXPECT_GT(Context2D()->GetLastRecording()->total_op_count(), first_count);
++  RunInTask(base::BindLambdaForTesting([this] { Context2D()->reset(); }));
++  EXPECT_FALSE(Context2D()->GetLastRecording());
++  Context2D()->fillRect(1, 1, 2, 2);
++  Context2D()->FlushCanvas(FlushReason::kPrinting);
++  ASSERT_TRUE(Context2D()->GetLastRecording());
++  EXPECT_LE(Context2D()->GetLastRecording()->total_op_count(), first_count);
++}
++
++TEST_P(CanvasRenderingContext2DTest, CommandModeReadbackInvalidatesCapture) {
++  base::test::ScopedCommandLine command_line;
++  command_line.GetProcessCommandLine()->AppendSwitch("reach-drawing-commands");
++  CreateContext(kNonOpaque);
++  CanvasElement().SetSize(gfx::Size(10, 10));
++  Context2D()->fillRect(1, 1, 2, 2);
++  Context2D()->FlushCanvas(FlushReason::kPrinting);
++  ASSERT_TRUE(Context2D()->GetLastRecording());
++  EXPECT_FALSE(Context2D()->GetImage());
++  EXPECT_FALSE(Context2D()->GetLastRecording());
++  Context2D()->fillRect(4, 4, 2, 2);
++  Context2D()->FlushCanvas(FlushReason::kPrinting);
++  EXPECT_FALSE(Context2D()->GetLastRecording());
++}
++
+ class CanvasRenderingContext2DTestAccelerated
+     : public CanvasRenderingContext2DTest {
+  protected:
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
+index 6aa6d12d4e..153c9246c6 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
++++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
+@@ -12,6 +12,7 @@
+ 
+ #include "base/check.h"
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/ptr_util.h"
+ #include "base/strings/stringprintf.h"
+@@ -37,6 +38,11 @@
+ 
+ namespace blink {
+ 
++bool Canvas2DBitmapProvider::IsReachCommandMode() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      "reach-drawing-commands");
++}
++
+ Canvas2DBitmapProvider::Canvas2DBitmapProvider(
+     gfx::Size size,
+     viz::SharedImageFormat format,
+@@ -135,6 +141,9 @@ Canvas2DBitmapProvider::GetOrCreateSWCanvasImageProvider() {
+ 
+ scoped_refptr<StaticBitmapImage> Canvas2DBitmapProvider::Snapshot(
+     ImageOrientation orientation) {
++  if (IsReachCommandMode()) {
++    return nullptr;
 +  }
-   bool IsAccelerated() const override { return false; }
-   bool IsGpuContextLost() const override { return true; }
-   scoped_refptr<StaticBitmapImage> Snapshot(
+   TRACE_EVENT0("blink", "Canvas2DBitmapProvider::Snapshot");
+   if (!IsValid()) {
+     return nullptr;
+@@ -211,6 +220,9 @@ void Canvas2DBitmapProvider::ApplyAnimatedImageFrameIndexesForId(
+ }
+ 
+ void Canvas2DBitmapProvider::ClearAtCreation() {
++  if (IsReachCommandMode()) {
++    return;
++  }
+   DCHECK(IsValid());
+   MemoryManagedPaintRecorder recorder(Size(), nullptr);
+   if (GetAlphaType() == kOpaque_SkAlphaType) {
+@@ -223,6 +235,7 @@ void Canvas2DBitmapProvider::ClearAtCreation() {
+ }
+ 
+ void Canvas2DBitmapProvider::RasterRecord(cc::PaintRecord last_recording) {
++  CHECK(!IsReachCommandMode());
+   if (!skia_canvas_) {
+     skia_canvas_ = std::make_unique<cc::SkiaPaintCanvas>(
+         GetSkSurface()->getCanvas(), GetOrCreateSWCanvasImageProvider());
+@@ -239,10 +252,13 @@ void Canvas2DBitmapProvider::RasterRecord(cc::PaintRecord last_recording) {
+ }
+ 
+ bool Canvas2DBitmapProvider::WritePixels(const SkImageInfo& orig_info,
+-                                         const void* pixels,
+-                                         size_t row_bytes,
+-                                         int x,
+-                                         int y) {
++                                        const void* pixels,
++                                        size_t row_bytes,
++                                        int x,
++                                        int y) {
++  if (IsReachCommandMode()) {
++    return false;
++  }
+   TRACE_EVENT0("blink", "Canvas2DBitmapProvider::WritePixels");
+   DCHECK(IsValid());
+ 
+@@ -252,7 +268,7 @@ bool Canvas2DBitmapProvider::WritePixels(const SkImageInfo& orig_info,
+   }
+ 
+   return GetSkSurface()->getCanvas()->writePixels(orig_info, pixels, row_bytes,
+-                                                  x, y);
++                                                 x, y);
+ }
+ 
+ std::unique_ptr<Canvas2DBitmapProvider> Canvas2DBitmapProvider::CreateWithClear(
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
+index dd887adc0f..2cb58aa169 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
++++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
+@@ -68,7 +68,8 @@ class PLATFORM_EXPORT Canvas2DBitmapProvider final
+ 
+   ~Canvas2DBitmapProvider() override;
+ 
+-  bool IsValid() const { return GetSkSurface(); }
++  static bool IsReachCommandMode();
++  bool IsValid() const { return IsReachCommandMode() || GetSkSurface(); }
+   void SetDelegate(CanvasResourceProviderDelegate* delegate) {
+     delegate_ = delegate;
+   }
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider_test.cc third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider_test.cc
+index a88e966b20..2103970559 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider_test.cc
++++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider_test.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
+ 
++#include "base/command_line.h"
++#include "base/test/scoped_command_line.h"
+ #include "components/viz/common/resources/shared_image_format_utils.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ #include "third_party/blink/renderer/platform/graphics/canvas_2d_color_params.h"
+@@ -63,6 +65,24 @@ TEST_F(Canvas2DBitmapProviderTest, HdrMetadata) {
+   EXPECT_EQ(snapshot->GetHdrMetadata(), hdr_metadata);
+ }
+ 
++TEST_F(Canvas2DBitmapProviderTest, CommandModeRejectsPixelsWithoutRasterStorage) {
++  base::test::ScopedCommandLine command_line;
++  command_line.GetProcessCommandLine()->AppendSwitch("reach-drawing-commands");
++  Canvas2DColorParams color_params(
++      PredefinedColorSpace::kSRGB, gfx::HDRMetadata(),
++      CanvasPixelFormat::kUint8, /*has_alpha=*/true);
++  auto provider = Canvas2DBitmapProvider::CreateForTesting(
++      gfx::Size(10, 10), color_params);
++  ASSERT_TRUE(provider);
++  EXPECT_TRUE(provider->IsValid());
++  EXPECT_EQ(static_cast<CanvasMemoryDumpClient*>(provider.get())->GetSize(), 0u);
++  EXPECT_FALSE(provider->Snapshot());
++  uint32_t pixel = 0xff00ff00;
++  EXPECT_FALSE(provider->WritePixels(SkImageInfo::MakeN32Premul(1, 1),
++                                     &pixel, sizeof(pixel), 0, 0));
++  EXPECT_EQ(static_cast<CanvasMemoryDumpClient*>(provider.get())->GetSize(), 0u);
++}
++
+ TEST_F(Canvas2DBitmapProviderTest, DimensionsExceedMaxTextureSize) {
+   Canvas2DColorParams color_params(PredefinedColorSpace::kSRGB,
+                                    gfx::HDRMetadata(),

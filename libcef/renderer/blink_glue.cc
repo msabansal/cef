@@ -4,6 +4,7 @@
 // found in the LICENSE file.
 
 #include "cef/libcef/renderer/blink_glue.h"
+#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
 #include "skia/ext/font_utils.h"
 #include "third_party/skia/include/core/SkFontMgr.h"
 #include "third_party/skia/src/core/SkFontDescriptor.h"
@@ -607,7 +608,7 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
       return std::nullopt;
     }
     if (context) {
-      if (!blink::CanvasResourceProvider::IsReachCommandMode()) {
+      if (!blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
         dependencies->error = "Canvas2D requires a command-only runtime";
         return std::nullopt;
       }
@@ -1136,7 +1137,7 @@ CefDrawingCommands CaptureDrawingCommands(
         continue;
       auto* child = owner ? owner->ContentFrame() : nullptr;
       if (!child || DrawingFrameIdentity(child).empty() ||
-          !blink::CanvasResourceProvider::IsReachCommandMode()) {
+          !blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
         result.error = "Embedded plugin or unready frame requires support";
         return result;
       }
@@ -1302,7 +1303,7 @@ CefDrawingCommands CaptureRasterFallback(
     blink::WebLocalFrame* web_frame, const std::string& expected_document,
     const std::map<std::string, std::vector<uint8_t>>& children) {
   CefDrawingCommands result;
-  if (!blink::CanvasResourceProvider::IsReachCommandMode()) {
+  if (!blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
     result.error = "Raster fallback requires a command-only runtime";
     return result;
   }

@@ -3,13 +3,13 @@
 This fork adds the private `Reach.CaptureDrawingCommands.v1` renderer IPC.
 It is a bounded local evaluator, not a public CEF API or universal browser
 remoting implementation. Original fonts/images and native drawing operations
-are serialized in unchanged SKP version 109. Command capture never silently
+are serialized in native SKP version 110. Command capture never silently
 substitutes source pixels. Explicit, separately identified raster capture is
 available when the application authorizes and traces a rendering fallback.
 
-The base is CEF `cf60f42d20a8c68c74bc790cf5ade0de8acbbcd3`, Chromium
-`17daf28c361f82916ecd9df505a7a656be1e77e0`, and Skia
-`9c7b2dffb2433f5a0cc2b77f06025a09126807ed`. Apply the fork's registered
+The base is CEF `e537569ecda2e3f23ffdac559ecf7f80b8e59467`, Chromium
+`9ce0cc67aed57702fcfc011b9e49b0b02d7d5e3a` (156.0.8078.0), and Skia
+`a02d4982d7658aa18fbbdc8f136776a76e6d771f`. Apply the fork's registered
 patches through the normal CEF patch workflow after dependency synchronization.
 Do not synchronize over an edited source checkout.
 
@@ -24,6 +24,8 @@ python3 cef/tools/reach_canvaskit.py
 The client helper synchronizes only its standalone dependencies at revisions
 from the pinned Skia DEPS and activates the pinned Emscripten SDK. For an
 already prepared checkout, `--skip-sync` builds without dependency setup.
+The helper retains existing Ninja outputs and archives; `--jobs` controls
+parallel compilation and defaults to all available CPUs.
 Stage both `third_party/skia/out/canvaskit_wasm/canvaskit.js` and
 `canvaskit.wasm` together. The npm CanvasKit bundle is not interchangeable:
 the matching client exposes `MakePictureWithMedia` and original-image decode

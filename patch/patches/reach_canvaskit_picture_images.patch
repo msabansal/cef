@@ -1,27 +1,37 @@
-diff --git a/modules/canvaskit/canvaskit_bindings.cpp b/modules/canvaskit/canvaskit_bindings.cpp
-index cabeb4d..2ab719e 100644
---- a/modules/canvaskit/canvaskit_bindings.cpp
-+++ b/modules/canvaskit/canvaskit_bindings.cpp
-@@ -61,6 +61,7 @@
+diff --git modules/canvaskit/canvaskit_bindings.cpp modules/canvaskit/canvaskit_bindings.cpp
+index 279ebb8c..fe19d22a 100644
+--- modules/canvaskit/canvaskit_bindings.cpp
++++ modules/canvaskit/canvaskit_bindings.cpp
+@@ -43,6 +43,8 @@
+ #include "include/core/SkSurface.h"
+ #include "include/core/SkTextBlob.h"
+ #include "include/core/SkTypeface.h"
++#include "src/core/SkReachResource.h"
++#include <map>
+ #include "include/core/SkTypes.h"
+ #include "include/core/SkVertices.h"
+ #include "include/effects/Sk1DPathEffect.h"
+@@ -61,6 +63,7 @@
  #include "include/encode/SkWebpEncoder.h"
- #include "include/private/base/SkOnce.h"
+ #include "include/private/SkOnce.h"
  #include "include/utils/SkParsePath.h"
 +#include "include/utils/SkNWayCanvas.h"
  #include "include/utils/SkShadowUtils.h"
- #include "src/base/SkFloatBits.h"
+ #include "src/core/SkFloatBits.h"
  #include "src/core/SkPathPriv.h"
-@@ -1209,7 +1210,9 @@ EMSCRIPTEN_BINDINGS(Skia) {
+@@ -1213,7 +1216,10 @@ EMSCRIPTEN_BINDINGS(Skia) {
  
  #ifdef CK_SERIALIZE_SKP
      function("_MakePicture",
 -             optional_override([](WASMPointerU8 dPtr, size_t bytes) -> sk_sp<SkPicture> {
 +             optional_override([](WASMPointerU8 dPtr, size_t bytes,
 +                                  emscripten::val imageDecoder,
-+                                  emscripten::val mediaDecoder) -> sk_sp<SkPicture> {
++                                  emscripten::val mediaDecoder,
++                                  emscripten::val fontResolver) -> sk_sp<SkPicture> {
                   uint8_t* d = reinterpret_cast<uint8_t*>(dPtr);
                   sk_sp<SkData> data = SkData::MakeFromMalloc(d, bytes);
  
-@@ -1222,16 +1225,35 @@ EMSCRIPTEN_BINDINGS(Skia) {
+@@ -1226,28 +1232,151 @@ EMSCRIPTEN_BINDINGS(Skia) {
                   });
  #endif
  
@@ -59,12 +69,74 @@ index cabeb4d..2ab719e 100644
                   };
  
  #ifndef CK_NO_FONTS
-@@ -1243,7 +1265,57 @@ EMSCRIPTEN_BINDINGS(Skia) {
+-                 sk_sp<SkFontMgr> fallback = SkFontMgr_New_Custom_Empty();
+-                 dProcs.fTypefaceCtx = &fallback;
++                 struct FontContext {
++                     emscripten::val resolver;
++                     sk_sp<SkFontMgr> fallback = SkFontMgr_New_Custom_Empty();
++                     std::map<std::string, sk_sp<SkData>> originals;
++                     size_t bytes = 0;
++                     size_t metadata_bytes = 0;
++                     bool failed = false;
++                 } fonts{fontResolver};
++                 dProcs.fTypefaceCtx = &fonts;
+                  dProcs.fTypefaceStreamProc = [](SkStream& stream, void* ctx) -> sk_sp<SkTypeface> {
+-                    return SkTypeface::MakeDeserialize(&stream,
+-                                                       *static_cast<sk_sp<SkFontMgr>*>(ctx));
++                     auto* fonts = static_cast<FontContext*>(ctx);
++                     if (fonts->resolver.isUndefined())
++                         return SkTypeface::MakeDeserialize(&stream, fonts->fallback);
++                     sk_reach::Reference ref;
++                     SkFontDescriptor descriptor;
++                     if (fonts->failed ||
++                         !sk_reach::Read(stream, sk_reach::kFont, &ref) ||
++                         !sk_reach::Descriptor(ref, &descriptor)) {
++                         fonts->failed = true;
++                         return nullptr;
++                     }
++                     const size_t metadata = sk_reach::kHeaderBytes + 4 + ref.descriptor->size();
++                     if (metadata > sk_reach::kFontBytes - fonts->metadata_bytes) {
++                         fonts->failed = true;
++                         return nullptr;
++                     }
++                     fonts->metadata_bytes += metadata;
++                     const auto hash = sk_reach::Hex(ref.hash);
++                     auto found = fonts->originals.find(hash);
++                     if (found == fonts->originals.end()) {
++                         if (ref.length > sk_reach::kFontBytes - fonts->bytes) {
++                             fonts->failed = true;
++                             return nullptr;
++                         }
++                         auto bytes = fonts->resolver(hash, ref.length);
++                         if (bytes.isNull() || bytes.isUndefined() ||
++                             bytes["byteLength"].as<size_t>() != ref.length ||
++                             bytes["BYTES_PER_ELEMENT"].as<int>() != 1) {
++                             fonts->failed = true;
++                             return nullptr;
++                         }
++                         auto original = SkData::MakeUninitialized(ref.length);
++                         emscripten::val(emscripten::typed_memory_view(
++                             ref.length, static_cast<uint8_t*>(original->writable_data())))
++                             .call<void>("set", bytes);
++                         fonts->bytes += ref.length;
++                         found = fonts->originals.emplace(hash, std::move(original)).first;
++                     }
++                     if (found->second->size() != ref.length) {
++                         fonts->failed = true;
++                         return nullptr;
++                     }
++                     auto face = SkTypeface_FreeType::MakeFromStream(
++                         SkMemoryStream::Make(found->second), descriptor.getFontArguments());
++                     fonts->failed |= !face;
++                     return face;
                   };
  #endif
  
 -                 return SkPicture::MakeFromData(data.get(), &dProcs);
 +                 auto picture = SkPicture::MakeFromData(data.get(), &dProcs);
++#ifndef CK_NO_FONTS
++                 if (fonts.failed) return nullptr;
++#endif
 +                 if (images.failed || !picture || mediaDecoder.isUndefined()) {
 +                     return images.failed ? nullptr : picture;
 +                 }
@@ -118,23 +190,23 @@ index cabeb4d..2ab719e 100644
               }),
               allow_raw_pointers());
  #endif
-diff --git a/modules/canvaskit/skp.js b/modules/canvaskit/skp.js
-index 9248d76..ff91402 100644
---- a/modules/canvaskit/skp.js
-+++ b/modules/canvaskit/skp.js
-@@ -1,17 +1,23 @@
+diff --git modules/canvaskit/skp.js modules/canvaskit/skp.js
+index 9248d763..8b2eee93 100644
+--- modules/canvaskit/skp.js
++++ modules/canvaskit/skp.js
+@@ -1,17 +1,29 @@
  CanvasKit._extraInitializations = CanvasKit._extraInitializations || [];
  CanvasKit._extraInitializations.push(function() {
    // data is a TypedArray or ArrayBuffer e.g. from fetch().then(resp.arrayBuffer())
 -  CanvasKit.MakePicture = function(data) {
-+  CanvasKit.MakePicture = function(data, imageDecoder, mediaDecoder) {
++  CanvasKit.MakePicture = function(data, imageDecoder, mediaDecoder, fontResolver) {
      data = new Uint8Array(data);
  
      var iptr = CanvasKit._malloc(data.byteLength);
      CanvasKit.HEAPU8.set(data, iptr);
      // The skp takes ownership of the malloc'd data.
 -    var pic = CanvasKit._MakePicture(iptr, data.byteLength);
-+    var pic = CanvasKit._MakePicture(iptr, data.byteLength, imageDecoder, mediaDecoder);
++    var pic = CanvasKit._MakePicture(iptr, data.byteLength, imageDecoder, mediaDecoder, fontResolver);
      if (!pic) {
        Debug('Could not decode picture');
        return null;
@@ -147,4 +219,195 @@ index 9248d76..ff91402 100644
 +  CanvasKit['MakePictureWithMedia'] = function(data, imageDecoder, mediaDecoder) {
 +    return CanvasKit.MakePicture(data, imageDecoder, mediaDecoder);
 +  };
++  CanvasKit['MakePictureWithResources'] = function(data, imageDecoder, mediaDecoder, fontResolver) {
++    if (typeof imageDecoder !== 'function' || typeof fontResolver !== 'function') {
++      return null;
++    }
++    return CanvasKit.MakePicture(data, imageDecoder, mediaDecoder, fontResolver);
++  };
  });
+diff --git src/core/SkReachResource.h src/core/SkReachResource.h
+new file mode 100644
+index 00000000..3084c1ee
+--- /dev/null
++++ src/core/SkReachResource.h
+@@ -0,0 +1,90 @@
++#ifndef SkReachResource_DEFINED
++#define SkReachResource_DEFINED
++
++#include "include/core/SkData.h"
++#include "include/core/SkStream.h"
++#include "src/core/SkFontDescriptor.h"
++#include <array>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace sk_reach {
++constexpr size_t kImageBytes = 4 * 1024 * 1024;
++constexpr size_t kFontBytes = 32 * 1024 * 1024;
++constexpr size_t kDescriptorBytes = 4096;
++constexpr size_t kHeaderBytes = 48;
++constexpr uint8_t kImage = 1;
++constexpr uint8_t kFont = 2;
++using Hash = std::array<uint8_t, 32>;
++
++inline uint32_t Read32(const uint8_t* p) {
++    return uint32_t(p[0]) | uint32_t(p[1]) << 8 |
++           uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
++}
++inline void Write32(uint8_t* p, uint32_t value) {
++    for (size_t i = 0; i < 4; ++i) p[i] = uint8_t(value >> (8 * i));
++}
++inline std::string Hex(const Hash& hash) {
++    static constexpr char digits[] = "0123456789abcdef";
++    std::string text;
++    text.reserve(64);
++    for (uint8_t byte : hash) {
++        text.push_back(digits[byte >> 4]);
++        text.push_back(digits[byte & 15]);
++    }
++    return text;
++}
++struct Reference {
++    uint8_t kind = 0;
++    uint32_t length = 0;
++    Hash hash{};
++    sk_sp<SkData> descriptor;
++};
++inline bool Read(SkStream& stream, uint8_t kind, Reference* ref) {
++    uint8_t header[kHeaderBytes];
++    if (stream.read(header, sizeof(header)) != sizeof(header) ||
++        std::memcmp(header, "REACHRS2", 8) || header[8] != kind ||
++        header[9] || header[10] || header[11]) return false;
++    ref->kind = kind;
++    ref->length = Read32(header + 12);
++    if (!ref->length ||
++        ref->length > (kind == kImage ? kImageBytes : kFontBytes)) return false;
++    std::memcpy(ref->hash.data(), header + 16, ref->hash.size());
++    if (kind == kFont) {
++        uint8_t size[4];
++        if (stream.read(size, 4) != 4) return false;
++        const uint32_t length = Read32(size);
++        if (!length || length > kDescriptorBytes) return false;
++        ref->descriptor = SkData::MakeUninitialized(length);
++        if (stream.read(ref->descriptor->writable_data(), length) != length) return false;
++    }
++    return true;
++}
++inline sk_sp<SkData> Write(uint8_t kind, const Hash& hash, size_t length,
++                           const SkData* descriptor = nullptr) {
++    if (!length || length > (kind == kImage ? kImageBytes : kFontBytes) ||
++        (kind == kFont && (!descriptor || !descriptor->size() ||
++                         descriptor->size() > kDescriptorBytes))) return nullptr;
++    const size_t extra = kind == kFont ? 4 + descriptor->size() : 0;
++    auto data = SkData::MakeUninitialized(kHeaderBytes + extra);
++    auto* out = static_cast<uint8_t*>(data->writable_data());
++    std::memset(out, 0, kHeaderBytes);
++    std::memcpy(out, "REACHRS2", 8);
++    out[8] = kind;
++    Write32(out + 12, length);
++    std::memcpy(out + 16, hash.data(), hash.size());
++    if (kind == kFont) {
++        Write32(out + kHeaderBytes, descriptor->size());
++        std::memcpy(out + kHeaderBytes + 4, descriptor->data(), descriptor->size());
++    }
++    return data;
++}
++inline bool Descriptor(const Reference& ref, SkFontDescriptor* descriptor) {
++    if (!ref.descriptor) return false;
++    SkMemoryStream stream(ref.descriptor);
++    return SkFontDescriptor::Deserialize(&stream, descriptor) &&
++           !descriptor->hasStream() && stream.getPosition() == ref.descriptor->size();
++}
++}  // namespace sk_reach
++#endif
+diff --git src/ports/SkFontHost_FreeType.cpp src/ports/SkFontHost_FreeType.cpp
+index 1534ed36..7069b1ef 100644
+--- src/ports/SkFontHost_FreeType.cpp
++++ src/ports/SkFontHost_FreeType.cpp
+@@ -2002,14 +2002,23 @@ void SkTypeface_FreeType::FontDataPaletteToDescriptorPalette(const SkFontData& f
+ 
+ SkTypeface_FreeTypeStream::SkTypeface_FreeTypeStream(std::unique_ptr<SkFontData> fontData,
+                                                      const SkString familyName,
+-                                                     const SkFontStyle& style, bool isFixedPitch)
++                                                     const SkFontStyle& style, bool isFixedPitch,
++                                                     bool syntheticBold, bool syntheticOblique)
+     : SkTypeface_FreeType(style, isFixedPitch)
+     , fFamilyName(std::move(familyName))
+     , fData(std::move(fontData))
++    , fSyntheticBold(syntheticBold)
++    , fSyntheticOblique(syntheticOblique)
+ { }
+ 
+ SkTypeface_FreeTypeStream::~SkTypeface_FreeTypeStream() {}
+ 
++void SkTypeface_FreeTypeStream::onFilterRec(SkScalerContextRec* rec) const {
++    if (fSyntheticBold) rec->fFlags |= SkScalerContext::kEmbolden_Flag;
++    if (fSyntheticOblique) rec->fPreSkewX -= SK_Scalar1 / 4;
++    SkTypeface_FreeType::onFilterRec(rec);
++}
++
+ void SkTypeface_FreeTypeStream::onGetFamilyName(SkString* familyName) const {
+     *familyName = fFamilyName;
+ }
+@@ -2034,7 +2043,9 @@ sk_sp<SkTypeface> SkTypeface_FreeTypeStream::onMakeClone(const SkFontArguments&
+     this->getFamilyName(&familyName);
+ 
+     return sk_make_sp<SkTypeface_FreeTypeStream>(
+-        std::move(data), familyName, style, this->isFixedPitch());
++        std::move(data), familyName, style, this->isFixedPitch(),
++        args.getSyntheticBold().value_or(fSyntheticBold),
++        args.getSyntheticOblique().value_or(fSyntheticOblique));
+ }
+ 
+ void SkTypeface_FreeTypeStream::onGetFontDescriptor(SkFontDescriptor* desc, bool* serialize) const {
+@@ -2042,6 +2053,8 @@ void SkTypeface_FreeTypeStream::onGetFontDescriptor(SkFontDescriptor* desc, bool
+     desc->setStyle(this->fontStyle());
+     desc->setFactoryId(SkTypeface_FreeType::FactoryId);
+     SkTypeface_FreeType::FontDataPaletteToDescriptorPalette(*fData, desc);
++    desc->setSyntheticBold(fSyntheticBold);
++    desc->setSyntheticOblique(fSyntheticOblique);
+     *serialize = true;
+ }
+ 
+@@ -2069,7 +2082,9 @@ sk_sp<SkTypeface> SkTypeface_FreeType::MakeFromStream(std::unique_ptr<SkStreamAs
+         std::move(stream), args.getCollectionIndex(), args.getPalette().index,
+         axisValues.get(), axisDefinitions.size(),
+         args.getPalette().overrides, args.getPalette().overrideCount);
+-    return sk_make_sp<SkTypeface_FreeTypeStream>(std::move(data), name, style, isFixedPitch);
++    return sk_make_sp<SkTypeface_FreeTypeStream>(
++        std::move(data), name, style, isFixedPitch,
++        args.getSyntheticBold().value_or(false), args.getSyntheticOblique().value_or(false));
+ }
+ 
+ SkFontScanner_FreeType::SkFontScanner_FreeType() : fLibrary(nullptr) {
+diff --git src/ports/SkTypeface_FreeType.h src/ports/SkTypeface_FreeType.h
+index b07f6337..0cda9fa6 100644
+--- src/ports/SkTypeface_FreeType.h
++++ src/ports/SkTypeface_FreeType.h
+@@ -96,10 +96,14 @@ private:
+ class SkTypeface_FreeTypeStream : public SkTypeface_FreeType {
+ public:
+     SkTypeface_FreeTypeStream(std::unique_ptr<SkFontData> fontData, const SkString familyName,
+-                              const SkFontStyle& style, bool isFixedPitch);
++                              const SkFontStyle& style, bool isFixedPitch,
++                              bool syntheticBold = false, bool syntheticOblique = false);
+     ~SkTypeface_FreeTypeStream() override;
+ 
+ protected:
++    bool onIsSyntheticBold() const override { return fSyntheticBold; }
++    bool onIsSyntheticOblique() const override { return fSyntheticOblique; }
++    void onFilterRec(SkScalerContextRec*) const override;
+     void onGetFamilyName(SkString* familyName) const override;
+     void onGetFontDescriptor(SkFontDescriptor*, bool* serialize) const override;
+     std::unique_ptr<SkStreamAsset> onOpenStream(int* ttcIndex) const override;
+@@ -109,6 +113,8 @@ protected:
+ private:
+     const SkString fFamilyName;
+     const std::unique_ptr<const SkFontData> fData;
++    const bool fSyntheticBold;
++    const bool fSyntheticOblique;
+ };
+ 
+ #endif // SkTypeface_Freetype_DEFINED

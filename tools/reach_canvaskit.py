@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import os
 from pathlib import Path
+import shlex
 import subprocess
 
 
@@ -14,12 +15,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-sync", action="store_true",
                         help="Use already synchronized standalone Skia dependencies")
+    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1,
+                        help="Parallel compile jobs (default: all available CPUs)")
     args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error("--jobs must be positive")
     if os.name != "posix":
         parser.error("Run inside the Linux Chromium/CEF source checkout")
     source = Path(__file__).resolve().parents[2]
     skia = source / "third_party" / "skia"
-    expected = "9c7b2dffb2433f5a0cc2b77f06025a09126807ed"
+    expected = "a02d4982d7658aa18fbbdc8f136776a76e6d771f"
     actual = subprocess.check_output(
         ["git", "-C", str(skia), "rev-parse", "HEAD"], text=True).strip()
     if actual != expected:
@@ -35,6 +40,7 @@ def main():
         required = [
             "brotli", "emsdk", "freetype", "highway", "libjpeg-turbo", "libpng",
             "libwebp", "wuffs", "zlib", "opengl-registry", "egl-registry",
+            "partition_alloc",
         ]
 
         def fetch(name):
@@ -51,12 +57,26 @@ def main():
             skia / "modules" / "canvaskit" / "skp.js").read_text():
         parser.error("Apply the registered reach_canvaskit_picture_images patch first")
     environment = dict(os.environ, EMSDK_QUIET="1")
+    # Upstream's driver deletes archives unconditionally. Keep the same GN and
+    # compiler commands, but let Ninja's dependency graph reuse valid outputs.
+    driver = (skia / "modules" / "canvaskit" / "compile.sh").read_text()
+    substitutions = {
+        "BASE_DIR=`cd $(dirname ${BASH_SOURCE[0]}) && pwd`":
+            "BASE_DIR=" + shlex.quote(str(skia / "modules" / "canvaskit")),
+        "rm -f $BUILD_DIR/*.a": ": # Retain Ninja-managed archives",
+        "${NINJA} -C ${BUILD_DIR} canvaskit.js -k 10":
+            "${NINJA} -C ${BUILD_DIR} canvaskit.js -k 10 -j" + str(args.jobs),
+    }
+    for original, replacement in substitutions.items():
+        if driver.count(original) != 1:
+            parser.error("Pinned CanvasKit build driver changed: " + original)
+        driver = driver.replace(original, replacement)
     subprocess.run([
         "bash", "-c",
         "set -euo pipefail; source third_party/externals/emsdk/emsdk_env.sh; "
-        "exec modules/canvaskit/compile.sh release no_skottie no_embedded_font "
+        "exec bash -s -- release no_skottie no_embedded_font "
         "no_paragraph primitive_shaper",
-    ], check=True, env=environment)
+    ], check=True, env=environment, input=driver, text=True)
     print("Matched client: " + str(skia / "out" / "canvaskit_wasm"))
 
 

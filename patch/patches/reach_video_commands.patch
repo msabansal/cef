@@ -1,7 +1,7 @@
-diff --git a/third_party/blink/renderer/core/paint/video_painter.cc b/third_party/blink/renderer/core/paint/video_painter.cc
-index efec6ccbf5..2ee395594c 100644
---- a/third_party/blink/renderer/core/paint/video_painter.cc
-+++ b/third_party/blink/renderer/core/paint/video_painter.cc
+diff --git third_party/blink/renderer/core/paint/video_painter.cc third_party/blink/renderer/core/paint/video_painter.cc
+index d1f3b52531..101c7b9d9b 100644
+--- third_party/blink/renderer/core/paint/video_painter.cc
++++ third_party/blink/renderer/core/paint/video_painter.cc
 @@ -17,12 +17,40 @@
  
  namespace blink {
@@ -43,10 +43,10 @@ index efec6ccbf5..2ee395594c 100644
    WebMediaPlayer* media_player =
        layout_video_.MediaElement()->GetWebMediaPlayer();
    bool force_video_poster =
-diff --git a/third_party/blink/renderer/core/paint/video_painter.h b/third_party/blink/renderer/core/paint/video_painter.h
+diff --git third_party/blink/renderer/core/paint/video_painter.h third_party/blink/renderer/core/paint/video_painter.h
 index 6e10199a5d..db92058002 100644
---- a/third_party/blink/renderer/core/paint/video_painter.h
-+++ b/third_party/blink/renderer/core/paint/video_painter.h
+--- third_party/blink/renderer/core/paint/video_painter.h
++++ third_party/blink/renderer/core/paint/video_painter.h
 @@ -5,11 +5,14 @@
  #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_PAINT_VIDEO_PAINTER_H_
  #define THIRD_PARTY_BLINK_RENDERER_CORE_PAINT_VIDEO_PAINTER_H_
