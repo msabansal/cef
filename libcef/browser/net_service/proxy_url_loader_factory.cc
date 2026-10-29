@@ -308,6 +308,8 @@ class InterceptedRequest : public network::mojom::URLLoader,
   int32_t id() const { return id_; }
 
  private:
+  friend class ProxyURLLoaderFactory;
+
   // Helpers for determining the request handler.
   void BeforeRequestReceived(const GURL& original_url,
                              bool intercept_request,
@@ -1409,6 +1411,18 @@ ProxyURLLoaderFactory::ProxyURLLoaderFactory(
 
 ProxyURLLoaderFactory::~ProxyURLLoaderFactory() {
   CEF_REQUIRE_IOT();
+
+  // BrowserContext teardown can delete the factory before the browser/context
+  // destruction observer cancels its requests. Finish those requests through
+  // the normal handler callbacks while request_handler_ is still alive.
+  weak_factory_.InvalidateWeakPtrs();
+  on_disconnect_.Reset();
+  target_factory_.reset();
+  proxy_receivers_.Clear();
+  url_loader_header_client_receiver_.reset();
+  while (!requests_.empty()) {
+    requests_.begin()->second->SendErrorAndCompleteImmediately(net::ERR_ABORTED);
+  }
 }
 
 // static
