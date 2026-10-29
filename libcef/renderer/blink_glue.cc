@@ -147,6 +147,8 @@ struct PaintSerialization {
   size_t record_bytes = 0;
   size_t record_shaders = 0;
   std::set<uint32_t> media_ids;
+  std::set<uint32_t> culled_paint_ids;
+  bool collect_paint_ids = false;
   std::map<std::string, std::vector<uint8_t>> originals;
   size_t font_bytes = 0;
   size_t fonts = 0;
@@ -436,11 +438,14 @@ const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
   if (!state->error.empty()) {
     return nullptr;
   }
-  if (operation.GetType() == cc::PaintOpType::kCustomData &&
-      !state->media_ids.contains(
-          static_cast<const cc::CustomDataOp&>(operation).id)) {
-    state->error = "Subframe/compositor transaction requires command support";
-    return nullptr;
+  if (operation.GetType() == cc::PaintOpType::kCustomData) {
+    const auto id = static_cast<const cc::CustomDataOp&>(operation).id;
+    if (state->collect_paint_ids) {
+      state->media_ids.insert(id);
+    } else if (!state->media_ids.contains(id)) {
+      state->error = "Subframe/compositor transaction requires command support";
+      return nullptr;
+    }
   }
   if (operation.GetType() == cc::PaintOpType::kDrawRecord &&
       !CheckPaintRecord(
@@ -527,6 +532,106 @@ bool CheckPaintRecord(PaintSerialization* state,
     }
   }
   return true;
+}
+
+std::optional<cc::PaintRecord> CaptureRequiredPaint(
+    blink::WebLocalFrame* web_frame, const gfx::Rect& bounds,
+    PaintSerialization* dependencies) {
+  if (bounds.IsEmpty() || bounds.width() > 4096 || bounds.height() > 4096 ||
+      static_cast<uint64_t>(bounds.width()) * bounds.height() >
+          kMaxViewportPixels) {
+    dependencies->error = "Capture viewport is empty or exceeds budget";
+    return std::nullopt;
+  }
+  auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
+  auto* root = frame->GetDocument()->GetLayoutView();
+  size_t objects = 0;
+  std::set<uint32_t> frame_ids;
+  for (blink::LayoutObject* object = root; object;
+       object = object->NextInPreOrder(root)) {
+    if (++objects > kMaxLayoutObjects) {
+      dependencies->error = "Layout object budget exceeded";
+      return std::nullopt;
+    }
+    if (object->IsLayoutEmbeddedContent()) {
+      if (auto* owner =
+              blink::DynamicTo<blink::HTMLFrameOwnerElement>(object->GetNode())) {
+        frame_ids.insert(owner->GetDomNodeId());
+      }
+    }
+    const auto* element =
+        blink::DynamicTo<blink::HTMLCanvasElement>(object->GetNode());
+    if (!element)
+      continue;
+    auto* context = element->RenderingContext();
+    if (element->IsOffscreenCanvasRegistered() ||
+        (context && !context->IsRenderingContext2D())) {
+      dependencies->error =
+          "GPU, bitmap or offscreen canvas requires command transport";
+      return std::nullopt;
+    }
+    if (context) {
+      if (!blink::CanvasResourceProvider::IsReachCommandMode()) {
+        dependencies->error = "Canvas2D requires a command-only runtime";
+        return std::nullopt;
+      }
+      context->FlushCanvas(blink::FlushReason::kPrinting);
+      if (context->IsPaintable() && !context->GetLastRecording()) {
+        dependencies->error =
+            "Canvas2D readback, raw pixels or command budget requires support";
+        return std::nullopt;
+      }
+    }
+  }
+  cc::PaintRecorder recorder;
+  auto* canvas = recorder.beginRecording();
+  canvas->translate(-bounds.x(), -bounds.y());
+  const bool previous = blink::SetReachMediaCapture(true);
+  base::ScopedClosureRunner restore(base::BindOnce(
+      [](bool value) { blink::SetReachMediaCapture(value); }, previous));
+  if (!web_frame->CapturePaintPreview(
+          bounds, canvas, /*include_linked_destinations=*/false,
+          /*skip_accelerated_content=*/false, /*allow_scrollbars=*/true)) {
+    dependencies->error = "Blink paint recording failed";
+    return std::nullopt;
+  }
+  auto recording = recorder.finishRecordingAsPicture();
+  dependencies->collect_paint_ids = true;
+  if (!CheckPaintRecord(dependencies, recording, 0)) {
+    return std::nullopt;
+  }
+  std::set<uint32_t> visible_ids;
+  cc::PlaybackCallbacks callbacks;
+  // EmbeddedContentPainter transforms each iframe marker to a unit rectangle.
+  // Vector recording preserves those transforms/clips without rasterizing.
+  // Unknown custom operations are never culled by this iframe-only proof.
+  callbacks.custom_callback = base::BindRepeating(
+      [](PaintSerialization* dependencies, const std::set<uint32_t>* frames,
+         std::set<uint32_t>* visible,
+         SkCanvas* canvas, uint32_t id) {
+        if (!frames->contains(id)) {
+          return;
+        }
+        if (canvas->quickReject(SkRect::MakeWH(1, 1))) {
+          dependencies->culled_paint_ids.insert(id);
+        } else {
+          visible->insert(id);
+        }
+      }, base::Unretained(dependencies), base::Unretained(&frame_ids),
+      base::Unretained(&visible_ids));
+  auto dependency_picture = recording.ToSkPicture(
+      SkRect::MakeWH(bounds.width(), bounds.height()), nullptr, callbacks);
+  if (!dependency_picture) {
+    dependencies->error = "Paint dependency recording failed";
+    return std::nullopt;
+  }
+  for (const auto id : visible_ids) {
+    dependencies->culled_paint_ids.erase(id);
+  }
+  for (const auto id : dependencies->culled_paint_ids) {
+    dependencies->media_ids.erase(id);
+  }
+  return recording;
 }
 
 blink::ExecutionContext* GetExecutionContext(v8::Local<v8::Context> context) {
@@ -871,15 +976,35 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame) {
       ? frame->GetEmbeddingToken()->ToString() : "");
   info.Set("width", bounds.width());
   info.Set("height", bounds.height());
+  PaintSerialization dependencies;
+  if (!bounds.IsEmpty() &&
+      !CaptureRequiredPaint(web_frame, bounds, &dependencies)) {
+    result.error = dependencies.error;
+    return result;
+  }
+  if (!frame->IsAttached() || !frame->GetDocument() ||
+      frame->GetDocument()->Token().ToString() !=
+          *info.FindString("document")) {
+    result.error = "Frame changed during dependency recording";
+    return result;
+  }
   base::ListValue children;
   for (auto* child = frame->Tree().FirstChild(); child;
        child = child->Tree().NextSibling()) {
     const auto* owner = child->OwnerLayoutObject();
-    if (!owner || owner->ReplacedContentRect().IsEmpty() ||
-        owner->StyleRef().Visibility() != blink::EVisibility::kVisible)
+    auto* element = owner
+        ? blink::DynamicTo<blink::HTMLFrameOwnerElement>(owner->GetNode())
+        : nullptr;
+    if (!element ||
+        !dependencies.media_ids.contains(element->GetDomNodeId()))
       continue;
-    if (!child->GetEmbeddingToken() || children.size() >= 16) {
-      result.error = "Frame identity or child budget exceeded";
+    if (!child->GetEmbeddingToken()) {
+      result.error = "Paint-required child frame has no embedding identity";
+      return result;
+    }
+    if (children.size() >= 16) {
+      result.error =
+          "Paint-required child frame count budget exceeded: selected=16, attempted=17";
       return result;
     }
     children.Append(child->GetEmbeddingToken()->ToString());
@@ -931,25 +1056,35 @@ CefDrawingCommands CaptureDrawingCommands(
     result.error = "Document has no layout";
     return result;
   }
-  size_t objects = 0;
+  const auto bounds = frame->View()->LayoutViewport()->VisibleContentRect(
+      blink::kIncludeScrollbars);
+  PaintSerialization dependencies;
+  auto required_recording =
+      CaptureRequiredPaint(web_frame, bounds, &dependencies);
+  if (!required_recording) {
+    result.error = dependencies.error;
+    return result;
+  }
+  if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
+      frame->GetPage() != page.Get()) {
+    result.error = "Frame changed during paint recording";
+    return result;
+  }
+  auto recording = std::move(*required_recording);
   size_t child_bytes = 0;
   OriginalTypefaceCache frame_fonts;
   frame_fonts.originals = &resources;
   std::map<uint32_t, sk_sp<SkPicture>> frame_pictures;
+  root = document->GetLayoutView();
   for (blink::LayoutObject* object = root; object;
        object = object->NextInPreOrder(root)) {
-    if (++objects > kMaxLayoutObjects) {
-      result.error = "Layout object budget exceeded";
-      return result;
-    }
     auto* node = object->GetNode();
     if (object->IsLayoutEmbeddedContent()) {
-      const auto* layout = blink::To<blink::LayoutEmbeddedContent>(object);
-      if (layout->ReplacedContentRect().IsEmpty() ||
-          layout->StyleRef().Visibility() != blink::EVisibility::kVisible)
-        continue;
       auto* owner =
           blink::DynamicTo<blink::HTMLFrameOwnerElement>(node);
+      if (!owner ||
+          !dependencies.media_ids.contains(owner->GetDomNodeId()))
+        continue;
       auto* child = owner ? owner->ContentFrame() : nullptr;
       if (!child || !child->GetEmbeddingToken() ||
           !blink::CanvasResourceProvider::IsReachCommandMode()) {
@@ -977,36 +1112,7 @@ CefDrawingCommands CaptureDrawingCommands(
       }
       frame_pictures.emplace(owner->GetDomNodeId(), std::move(picture));
     }
-    if (const auto* element = blink::DynamicTo<blink::HTMLCanvasElement>(node)) {
-      auto* context = element->RenderingContext();
-      if (element->IsOffscreenCanvasRegistered() ||
-          (context && !context->IsRenderingContext2D())) {
-        result.error = "GPU, bitmap or offscreen canvas requires command transport";
-        return result;
-      }
-      if (context) {
-        if (!blink::CanvasResourceProvider::IsReachCommandMode()) {
-          result.error = "Canvas2D requires a command-only runtime";
-          return result;
-        }
-        context->FlushCanvas(blink::FlushReason::kPrinting);
-        if (context->IsPaintable() && !context->GetLastRecording()) {
-          result.error = "Canvas2D readback, raw pixels or command budget requires support";
-          return result;
-        }
-      }
-    }
   }
-  const auto bounds = frame->View()->LayoutViewport()->VisibleContentRect(
-      blink::kIncludeScrollbars);
-  if (bounds.IsEmpty() || bounds.width() > 4096 || bounds.height() > 4096 ||
-      static_cast<uint64_t>(bounds.width()) * bounds.height() >
-          kMaxViewportPixels) {
-    result.error = "Capture viewport is empty or exceeds budget";
-    return result;
-  }
-  cc::PaintRecorder recorder;
-  auto* canvas = recorder.beginRecording();
   size_t media_count = 0;
   std::map<uint32_t, sk_sp<SkData>> media_states;
   for (auto& node : blink::FlatTreeTraversal::DescendantsOf(*document)) {
@@ -1055,29 +1161,9 @@ CefDrawingCommands CaptureDrawingCommands(
     media_states.emplace(media->GetDomNodeId(),
                          SkData::MakeWithCopy(json->data(), json->size()));
   }
-  canvas->translate(-bounds.x(), -bounds.y());
-  const bool previous_media_capture = blink::SetReachMediaCapture(true);
-  base::ScopedClosureRunner restore_media_capture(base::BindOnce(
-      [](bool previous) { blink::SetReachMediaCapture(previous); },
-      previous_media_capture));
-  if (!web_frame->CapturePaintPreview(
-          bounds, canvas, /*include_linked_destinations=*/false,
-          /*skip_accelerated_content=*/false, /*allow_scrollbars=*/true)) {
-    result.error = "Blink paint recording failed";
-    return result;
-  }
-  auto recording = recorder.finishRecordingAsPicture();
-  if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
-      frame->GetPage() != page.Get()) {
-    result.error = "Frame changed during paint recording";
-    return result;
-  }
-  if (recording.bytes_used() > kMaxPaintBytes ||
-      recording.total_op_count() > kMaxPaintOps) {
-    result.error = "Paint record budget exceeded";
-    return result;
-  }
   PaintSerialization state;
+  state.media_ids = dependencies.culled_paint_ids;
+  state.culled_paint_ids = dependencies.culled_paint_ids;
   for (const auto& [id, picture] : frame_pictures) {
     state.media_ids.insert(id);
   }
@@ -1095,6 +1181,10 @@ CefDrawingCommands CaptureDrawingCommands(
       [](const std::map<uint32_t, sk_sp<SkData>>* states,
          const std::map<uint32_t, sk_sp<SkPicture>>* frames,
          PaintSerialization* state, SkCanvas* canvas, uint32_t id) {
+        if (state->culled_paint_ids.contains(id) &&
+            canvas->quickReject(SkRect::MakeWH(1, 1))) {
+          return;
+        }
         const auto child = frames->find(id);
         if (child != frames->end()) {
           SkAutoCanvasRestore restore(canvas, true);
