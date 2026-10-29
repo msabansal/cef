@@ -228,10 +228,10 @@ index 9248d763..8b2eee93 100644
  });
 diff --git src/core/SkReachResource.h src/core/SkReachResource.h
 new file mode 100644
-index 00000000..3084c1ee
+index 00000000..3e386661
 --- /dev/null
 +++ src/core/SkReachResource.h
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,92 @@
 +#ifndef SkReachResource_DEFINED
 +#define SkReachResource_DEFINED
 +
@@ -317,7 +317,9 @@ index 00000000..3084c1ee
 +inline bool Descriptor(const Reference& ref, SkFontDescriptor* descriptor) {
 +    if (!ref.descriptor) return false;
 +    SkMemoryStream stream(ref.descriptor);
-+    return SkFontDescriptor::Deserialize(&stream, descriptor) &&
++    return SkFontDescriptor::Deserialize(
++               &stream, descriptor,
++               [](sk_sp<const SkData>) -> sk_sp<SkData> { return nullptr; }) &&
 +           !descriptor->hasStream() && stream.getPosition() == ref.descriptor->size();
 +}
 +}  // namespace sk_reach
