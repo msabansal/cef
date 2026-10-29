@@ -899,17 +899,22 @@ void CefFrameImpl::SendMessage(const std::string& name,
     auto response = CefProcessMessage::Create("Reach.DrawingCommands.v1");
     auto values = response->GetArgumentList();
     blink_glue::CefDrawingCommands capture;
-    const bool valid = arguments.size() == 5 &&
+    const bool valid = (arguments.size() == 5 || arguments.size() == 6) &&
         arguments[0].is_int() && arguments[0].GetInt() > 0 &&
         arguments[1].is_bool() && arguments[2].is_string() &&
         arguments[2].GetString().size() <= 128 &&
-        arguments[3].is_dict() && arguments[3].GetDict().size() <= 16 &&
-        arguments[4].is_dict() && arguments[4].GetDict().size() <= 64;
+        arguments[3].is_dict() && arguments[3].GetDict().size() <= 255 &&
+        arguments[4].is_dict() &&
+        (arguments.size() == 5 ||
+         (arguments[5].is_int() && arguments[5].GetInt() >= 0 &&
+          arguments[5].GetInt() <= 2));
+    const int mode = valid && arguments.size() == 6
+        ? arguments[5].GetInt() : 0;
     values->SetInt(0, valid ? arguments[0].GetInt() : 0);
     if (!valid || !frame_) {
       capture.error = "Invalid or detached drawing-frame request";
     } else if (arguments[1].GetBool()) {
-      capture = blink_glue::GetDrawingFrameInfo(frame_);
+      capture = blink_glue::GetDrawingFrameInfo(frame_, mode == 2);
     } else {
       std::map<std::string, std::vector<uint8_t>> children;
       std::map<std::string, std::vector<uint8_t>> resources;
@@ -935,8 +940,25 @@ void CefFrameImpl::SendMessage(const std::string& name,
         resources.emplace(key, value.GetBlob());
       }
       if (capture.error.empty()) {
-        capture = blink_glue::CaptureDrawingCommands(
-            frame_, arguments[2].GetString(), children, resources);
+        if (mode == 2) {
+          capture = blink_glue::CaptureRasterFallback(
+              frame_, arguments[2].GetString(), children);
+        } else {
+          std::function<void(const std::string&, const void*, size_t)> sink;
+          if (mode == 1) {
+            sink = [this, request = arguments[0].GetInt()](
+                const std::string& id, const void* bytes, size_t size) {
+              auto event = CefProcessMessage::Create("Reach.DrawingOriginal.v1");
+              auto values = event->GetArgumentList();
+              values->SetInt(0, request);
+              values->SetString(1, id);
+              values->SetBinary(2, CefBinaryValue::Create(bytes, size));
+              SendProcessMessage(PID_BROWSER, event);
+            };
+          }
+          capture = blink_glue::CaptureDrawingCommands(
+              frame_, arguments[2].GetString(), children, resources, sink);
+        }
       }
     }
     values->SetString(1, capture.error);
