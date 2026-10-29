@@ -1902,10 +1902,12 @@ bool CefRenderWidgetHostViewOSR::ResizeRootLayer() {
   if (!hold_resize_) {
     // The resize hold is not currently active.
     if (SetRootLayerSize(false /* force */)) {
-      // The size has changed. Avoid resizing again until ReleaseResizeHold() is
-      // called.
-      hold_resize_ = true;
-      cached_scale_factor_ = GetDeviceScaleFactor();
+      // Command capture has no pixel callback to release a resize hold.
+      if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
+              "reach-drawing-commands")) {
+        hold_resize_ = true;
+        cached_scale_factor_ = GetDeviceScaleFactor();
+      }
       return true;
     }
   } else if (!pending_resize_) {
