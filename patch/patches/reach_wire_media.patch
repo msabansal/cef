@@ -1,7 +1,7 @@
-diff --git a/content/browser/devtools/protocol/devtools_network_resource_loader.cc b/content/browser/devtools/protocol/devtools_network_resource_loader.cc
+diff --git content/browser/devtools/protocol/devtools_network_resource_loader.cc content/browser/devtools/protocol/devtools_network_resource_loader.cc
 index 6cca7077489c57c80389103acb7f89206be64e95..81641468c8f54b8268a18b1446e175f5df660a06 100644
---- a/content/browser/devtools/protocol/devtools_network_resource_loader.cc
-+++ b/content/browser/devtools/protocol/devtools_network_resource_loader.cc
+--- content/browser/devtools/protocol/devtools_network_resource_loader.cc
++++ content/browser/devtools/protocol/devtools_network_resource_loader.cc
 @@ -16,6 +16,7 @@
  #include "net/url_request/redirect_info.h"
  #include "services/network/public/cpp/simple_url_loader.h"
@@ -111,10 +111,10 @@ index 6cca7077489c57c80389103acb7f89206be64e95..81641468c8f54b8268a18b1446e175f5
  
    std::move(completion_callback_)
        .Run(this, response_headers, success, loader_->NetError(),
-diff --git a/content/browser/devtools/protocol/devtools_network_resource_loader.h b/content/browser/devtools/protocol/devtools_network_resource_loader.h
+diff --git content/browser/devtools/protocol/devtools_network_resource_loader.h content/browser/devtools/protocol/devtools_network_resource_loader.h
 index 58b3220ef4aeaa4c14f0ff692cc90334ac2576d0..2073f55f5068c5411f6874e1d52139a7933299b9 100644
---- a/content/browser/devtools/protocol/devtools_network_resource_loader.h
-+++ b/content/browser/devtools/protocol/devtools_network_resource_loader.h
+--- content/browser/devtools/protocol/devtools_network_resource_loader.h
++++ content/browser/devtools/protocol/devtools_network_resource_loader.h
 @@ -53,7 +53,16 @@ class CONTENT_EXPORT DevToolsNetworkResourceLoader
        Credentials include_credentials,
        CompletionCallback complete_callback,
@@ -151,10 +151,10 @@ index 58b3220ef4aeaa4c14f0ff692cc90334ac2576d0..2073f55f5068c5411f6874e1d52139a7
  };
  
  }  // namespace protocol
-diff --git a/content/browser/devtools/protocol/network_handler.cc b/content/browser/devtools/protocol/network_handler.cc
+diff --git content/browser/devtools/protocol/network_handler.cc content/browser/devtools/protocol/network_handler.cc
 index 7a9d60a1e3bf3cf217cf88ab760dfcb7e37b25ed..3713c107d8623df0793d696b771e931111ec8fa6 100644
---- a/content/browser/devtools/protocol/network_handler.cc
-+++ b/content/browser/devtools/protocol/network_handler.cc
+--- content/browser/devtools/protocol/network_handler.cc
++++ content/browser/devtools/protocol/network_handler.cc
 @@ -4097,9 +4097,11 @@ void NetworkHandler::OnLoadNetworkResourceFinished(
    auto it = loaders_.find(loader);
    CHECK(it != loaders_.end());
@@ -265,10 +265,10 @@ index 7a9d60a1e3bf3cf217cf88ab760dfcb7e37b25ed..3713c107d8623df0793d696b771e9311
  DispatchResponse NetworkHandler::SetCookieControls(
      bool enable_third_party_cookie_restriction) {
    enable_third_party_cookie_restriction_ =
-diff --git a/content/browser/devtools/protocol/network_handler.h b/content/browser/devtools/protocol/network_handler.h
+diff --git content/browser/devtools/protocol/network_handler.h content/browser/devtools/protocol/network_handler.h
 index 7606ba57cc4286e5e2e6742c83ae7327d14c3c60..ac078a98d6052a28398d86573a6a882da2034f01 100644
---- a/content/browser/devtools/protocol/network_handler.h
-+++ b/content/browser/devtools/protocol/network_handler.h
+--- content/browser/devtools/protocol/network_handler.h
++++ content/browser/devtools/protocol/network_handler.h
 @@ -349,6 +349,8 @@ class NetworkHandler : public DevToolsDomainHandler,
        std::unique_ptr<protocol::Network::LoadNetworkResourceOptions> options,
        std::unique_ptr<LoadNetworkResourceCallback> callback) override;
@@ -278,10 +278,10 @@ index 7606ba57cc4286e5e2e6742c83ae7327d14c3c60..ac078a98d6052a28398d86573a6a882d
    DispatchResponse SetCookieControls(
        bool enable_third_party_cookie_restriction) override;
  
-diff --git a/content/browser/devtools/protocol_config.json b/content/browser/devtools/protocol_config.json
+diff --git content/browser/devtools/protocol_config.json content/browser/devtools/protocol_config.json
 index d5ffdcfd662a795102ffe0e0f830305292a7a8ca..c18375ff34cedd6ad06b65d1a42c3a44754963ef 100644
---- a/content/browser/devtools/protocol_config.json
-+++ b/content/browser/devtools/protocol_config.json
+--- content/browser/devtools/protocol_config.json
++++ content/browser/devtools/protocol_config.json
 @@ -130,6 +130,7 @@
                    "takeResponseBodyForInterceptionAsStream",
                    "getSecurityIsolationStatus",
@@ -290,10 +290,10 @@ index d5ffdcfd662a795102ffe0e0f830305292a7a8ca..c18375ff34cedd6ad06b65d1a42c3a44
                    "enableReportingApi",
                    "enableDeviceBoundSessions",
                    "fetchSchemefulSite",
-diff --git a/services/network/public/cpp/content_security_policy/content_security_policy.cc b/services/network/public/cpp/content_security_policy/content_security_policy.cc
+diff --git services/network/public/cpp/content_security_policy/content_security_policy.cc services/network/public/cpp/content_security_policy/content_security_policy.cc
 index e2a8ce30fdaf6bb243e59d5ce17bc525aa9143d9..236da6220c1ece7d6028be79a47cc14719c59f36 100644
---- a/services/network/public/cpp/content_security_policy/content_security_policy.cc
-+++ b/services/network/public/cpp/content_security_policy/content_security_policy.cc
+--- services/network/public/cpp/content_security_policy/content_security_policy.cc
++++ services/network/public/cpp/content_security_policy/content_security_policy.cc
 @@ -269,13 +269,15 @@ std::string ErrorMessage(CSPDirectiveName directive,
      case CSPDirectiveName::ConnectSrc:
        action = "Connecting to '$1'";
@@ -311,10 +311,10 @@ index e2a8ce30fdaf6bb243e59d5ce17bc525aa9143d9..236da6220c1ece7d6028be79a47cc147
      case CSPDirectiveName::ManifestSrc:
      case CSPDirectiveName::MediaSrc:
      case CSPDirectiveName::ObjectSrc:
-diff --git a/third_party/blink/public/devtools_protocol/domains/Network.pdl b/third_party/blink/public/devtools_protocol/domains/Network.pdl
+diff --git third_party/blink/public/devtools_protocol/domains/Network.pdl third_party/blink/public/devtools_protocol/domains/Network.pdl
 index 0161e0583b8ff7baedf8626a36a87b07c8ca17db..a137904b64875252589038d8f74bd3abe06cf553 100644
---- a/third_party/blink/public/devtools_protocol/domains/Network.pdl
-+++ b/third_party/blink/public/devtools_protocol/domains/Network.pdl
+--- third_party/blink/public/devtools_protocol/domains/Network.pdl
++++ third_party/blink/public/devtools_protocol/domains/Network.pdl
 @@ -2233,6 +2233,8 @@ domain Network
        optional IO.StreamHandle stream
        # Response headers.
@@ -351,10 +351,10 @@ index 0161e0583b8ff7baedf8626a36a87b07c8ca17db..a137904b64875252589038d8f74bd3ab
    # Sets Controls for third-party cookie access
    # Page reload is required before the new cookie behavior will be observed
    experimental command setCookieControls
-diff --git a/third_party/blink/renderer/core/inspector/inspector_protocol_config.json b/third_party/blink/renderer/core/inspector/inspector_protocol_config.json
+diff --git third_party/blink/renderer/core/inspector/inspector_protocol_config.json third_party/blink/renderer/core/inspector/inspector_protocol_config.json
 index 6886876630b1e75bb5ce7e4fb02280604df259ff..2b4ec214118c3383f32f3a1b521c3537cadc2485 100644
---- a/third_party/blink/renderer/core/inspector/inspector_protocol_config.json
-+++ b/third_party/blink/renderer/core/inspector/inspector_protocol_config.json
+--- third_party/blink/renderer/core/inspector/inspector_protocol_config.json
++++ third_party/blink/renderer/core/inspector/inspector_protocol_config.json
 @@ -124,6 +124,7 @@
                              "takeResponseBodyForInterceptionAsStream",
                              "getSecurityIsolationStatus",

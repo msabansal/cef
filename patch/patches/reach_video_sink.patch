@@ -1,6 +1,6 @@
-diff --git a/components/viz/host/host_display_client.cc b/components/viz/host/host_display_client.cc
---- a/components/viz/host/host_display_client.cc
-+++ b/components/viz/host/host_display_client.cc
+diff --git components/viz/host/host_display_client.cc components/viz/host/host_display_client.cc
+--- components/viz/host/host_display_client.cc
++++ components/viz/host/host_display_client.cc
 @@ -63,6 +63,11 @@
  #endif
  }
@@ -13,9 +13,9 @@ diff --git a/components/viz/host/host_display_client.cc b/components/viz/host/ho
  #if BUILDFLAG(IS_WIN)
  void HostDisplayClient::AddChildWindowToBrowser(
      gpu::SurfaceHandle child_window) {
-diff --git a/components/viz/host/host_display_client.h b/components/viz/host/host_display_client.h
---- a/components/viz/host/host_display_client.h
-+++ b/components/viz/host/host_display_client.h
+diff --git components/viz/host/host_display_client.h components/viz/host/host_display_client.h
+--- components/viz/host/host_display_client.h
++++ components/viz/host/host_display_client.h
 @@ -48,6 +48,8 @@
  
    void CreateLayeredWindowUpdater(
@@ -25,9 +25,9 @@ diff --git a/components/viz/host/host_display_client.h b/components/viz/host/hos
  #if BUILDFLAG(IS_WIN)
    void AddChildWindowToBrowser(gpu::SurfaceHandle child_window) override;
  #endif
-diff --git a/components/viz/service/BUILD.gn b/components/viz/service/BUILD.gn
---- a/components/viz/service/BUILD.gn
-+++ b/components/viz/service/BUILD.gn
+diff --git components/viz/service/BUILD.gn components/viz/service/BUILD.gn
+--- components/viz/service/BUILD.gn
++++ components/viz/service/BUILD.gn
 @@ -140,6 +140,8 @@
      "display/skia_renderer.cc",
      "display/skia_renderer.h",
@@ -45,10 +45,10 @@ diff --git a/components/viz/service/BUILD.gn b/components/viz/service/BUILD.gn
      "display_embedder/vsync_parameter_listener_unittest.cc",
      "frame_sinks/begin_frame_tracker_unittest.cc",
      "frame_sinks/compositor_frame_sink_support_unittest.cc",
-diff --git a/components/viz/service/display_embedder/reach_video_output_device.cc b/components/viz/service/display_embedder/reach_video_output_device.cc
+diff --git components/viz/service/display_embedder/reach_video_output_device.cc components/viz/service/display_embedder/reach_video_output_device.cc
 new file mode 100644
 --- /dev/null
-+++ b/components/viz/service/display_embedder/reach_video_output_device.cc
++++ components/viz/service/display_embedder/reach_video_output_device.cc
 @@ -0,0 +1,93 @@
 +#include "components/viz/service/display_embedder/reach_video_output_device.h"
 +
@@ -143,10 +143,10 @@ new file mode 100644
 +}
 +
 +}  // namespace viz
-diff --git a/components/viz/service/display_embedder/reach_video_output_device.h b/components/viz/service/display_embedder/reach_video_output_device.h
+diff --git components/viz/service/display_embedder/reach_video_output_device.h components/viz/service/display_embedder/reach_video_output_device.h
 new file mode 100644
 --- /dev/null
-+++ b/components/viz/service/display_embedder/reach_video_output_device.h
++++ components/viz/service/display_embedder/reach_video_output_device.h
 @@ -0,0 +1,41 @@
 +#ifndef COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_REACH_VIDEO_OUTPUT_DEVICE_H_
 +#define COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_REACH_VIDEO_OUTPUT_DEVICE_H_
@@ -189,10 +189,10 @@ new file mode 100644
 +
 +}  // namespace viz
 +#endif
-diff --git a/components/viz/service/display_embedder/reach_video_output_device_unittest.cc b/components/viz/service/display_embedder/reach_video_output_device_unittest.cc
+diff --git components/viz/service/display_embedder/reach_video_output_device_unittest.cc components/viz/service/display_embedder/reach_video_output_device_unittest.cc
 new file mode 100644
 --- /dev/null
-+++ b/components/viz/service/display_embedder/reach_video_output_device_unittest.cc
++++ components/viz/service/display_embedder/reach_video_output_device_unittest.cc
 @@ -0,0 +1,123 @@
 +#include "components/viz/service/display_embedder/reach_video_output_device.h"
 +
@@ -317,9 +317,9 @@ new file mode 100644
 +
 +}  // namespace
 +}  // namespace viz
-diff --git a/components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc b/components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
---- a/components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
-+++ b/components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
+diff --git components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
+--- components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
++++ components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
 @@ -3,6 +3,9 @@
  // found in the LICENSE file.
  
@@ -362,9 +362,9 @@ diff --git a/components/viz/service/frame_sinks/root_compositor_frame_sink_impl.
  
    // Creating output surface failed. The host can send a new request, possibly
    // with a different compositing mode.
-diff --git a/services/viz/privileged/mojom/compositing/display_private.mojom b/services/viz/privileged/mojom/compositing/display_private.mojom
---- a/services/viz/privileged/mojom/compositing/display_private.mojom
-+++ b/services/viz/privileged/mojom/compositing/display_private.mojom
+diff --git services/viz/privileged/mojom/compositing/display_private.mojom services/viz/privileged/mojom/compositing/display_private.mojom
+--- services/viz/privileged/mojom/compositing/display_private.mojom
++++ services/viz/privileged/mojom/compositing/display_private.mojom
 @@ -7,6 +7,7 @@
  import "gpu/ipc/common/context_result.mojom";
  import "gpu/ipc/common/surface_handle.mojom";
