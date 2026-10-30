@@ -1,13 +1,21 @@
 diff --git third_party/blink/renderer/core/paint/video_painter.cc third_party/blink/renderer/core/paint/video_painter.cc
-index d1f3b52531..101c7b9d9b 100644
+index d1f3b52..0121229
 --- third_party/blink/renderer/core/paint/video_painter.cc
 +++ third_party/blink/renderer/core/paint/video_painter.cc
-@@ -17,12 +17,40 @@
+@@ -12,17 +12,53 @@
+ #include "third_party/blink/renderer/core/paint/box_painter.h"
+ #include "third_party/blink/renderer/core/paint/image_painter.h"
+ #include "third_party/blink/renderer/core/paint/paint_info.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/drawing_recorder.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/foreign_layer_display_item.h"
  
  namespace blink {
  
 +namespace {
-+thread_local bool g_reach_media_capture = false;
++// Command mode paints video markers in its normal lifecycle paint; only the
++// out-of-lifecycle raster fallback disables them to paint software frames.
++thread_local bool g_reach_media_capture = true;
 +}
 +
 +bool SetReachMediaCapture(bool enabled) {
@@ -22,7 +30,7 @@ index d1f3b52531..101c7b9d9b 100644
        paint_info.phase != PaintPhase::kSelectionDragImage)
      return;
  
-+  if (g_reach_media_capture &&
++  if (Canvas2DBitmapProvider::IsReachCommandMode() && g_reach_media_capture &&
 +      !layout_video_.MediaElement()->currentSrc().IsEmpty() &&
 +      layout_video_.GetDisplayMode() != LayoutVideo::kPoster) {
 +    PhysicalRect rect = layout_video_.ReplacedContentRect();
@@ -30,6 +38,11 @@ index d1f3b52531..101c7b9d9b 100644
 +    if (rect.IsEmpty())
 +      return;
 +    GraphicsContext& context = paint_info.context;
++    // Markers are part of the cached lifecycle paint in command mode.
++    if (DrawingRecorder::UseCachedDrawingIfPossible(context, layout_video_,
++                                                    paint_info.phase)) {
++      return;
++    }
 +    DrawingRecorder recorder(context, layout_video_, paint_info.phase,
 +                             ToEnclosingRect(rect));
 +    cc::PaintCanvasAutoRestore restore(context.Canvas(), true);
@@ -44,7 +57,7 @@ index d1f3b52531..101c7b9d9b 100644
        layout_video_.MediaElement()->GetWebMediaPlayer();
    bool force_video_poster =
 diff --git third_party/blink/renderer/core/paint/video_painter.h third_party/blink/renderer/core/paint/video_painter.h
-index 6e10199a5d..db92058002 100644
+index 6e10199..db92058 100644
 --- third_party/blink/renderer/core/paint/video_painter.h
 +++ third_party/blink/renderer/core/paint/video_painter.h
 @@ -5,11 +5,14 @@

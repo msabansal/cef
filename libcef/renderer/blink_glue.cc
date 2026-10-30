@@ -4,12 +4,7 @@
 // found in the LICENSE file.
 
 #include "cef/libcef/renderer/blink_glue.h"
-#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
-#include "skia/ext/font_utils.h"
-#include "third_party/skia/include/core/SkFontMgr.h"
-#include "third_party/skia/src/core/SkFontDescriptor.h"
 
-#include "third_party/blink/public/mojom/frame/frame.mojom-blink.h"
 #include <cmath>
 #include <map>
 #include <set>
@@ -20,20 +15,18 @@
 #include "base/strings/string_number_conversions.h"
 #include "base/time/time.h"
 #include "base/values.h"
-#include "third_party/blink/renderer/core/animation/pending_animations.h"
-#include "crypto/hash.h"
-#include "cc/paint/paint_op.h"
 #include "cc/paint/paint_filter.h"
+#include "cc/paint/paint_op.h"
 #include "cc/paint/paint_op_buffer_iterator.h"
 #include "cc/paint/paint_record.h"
 #include "cc/paint/paint_recorder.h"
 #include "cc/paint/paint_shader.h"
 #include "cc/trees/scroll_source_type.h"
-#include "third_party/blink/public/common/input/web_mouse_wheel_event.h"
+#include "crypto/hash.h"
+#include "skia/ext/font_utils.h"
 #include "third_party/blink/public/common/input/web_keyboard_event.h"
-#include "ui/events/keycodes/dom/keycode_converter.h"
-#include "ui/events/keycodes/dom/dom_key.h"
-#include "ui/events/keycodes/keyboard_code_conversion.h"
+#include "third_party/blink/public/common/input/web_mouse_wheel_event.h"
+#include "third_party/blink/public/mojom/frame/frame.mojom-blink.h"
 #include "third_party/blink/public/mojom/v8_cache_options.mojom-blink.h"
 #include "third_party/blink/public/platform/web_string.h"
 #include "third_party/blink/public/platform/web_url_response.h"
@@ -46,6 +39,7 @@
 #include "third_party/blink/renderer/bindings/core/v8/sanitize_script_errors.h"
 #include "third_party/blink/renderer/bindings/core/v8/script_evaluation_result.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
+#include "third_party/blink/renderer/core/animation/pending_animations.h"
 #include "third_party/blink/renderer/core/dom/document.h"
 #include "third_party/blink/renderer/core/dom/element.h"
 #include "third_party/blink/renderer/core/dom/flat_tree_traversal.h"
@@ -70,31 +64,40 @@
 #include "third_party/blink/renderer/core/layout/layout_object.h"
 #include "third_party/blink/renderer/core/layout/layout_view.h"
 #include "third_party/blink/renderer/core/loader/frame_load_request.h"
-#include "third_party/blink/renderer/core/page/page.h"
 #include "third_party/blink/renderer/core/page/focus_controller.h"
+#include "third_party/blink/renderer/core/page/page.h"
 #include "third_party/blink/renderer/core/page/page_animator.h"
+#include "third_party/blink/renderer/core/paint/paint_flags.h"
 #include "third_party/blink/renderer/core/paint/paint_layer_scrollable_area.h"
 #include "third_party/blink/renderer/core/paint/video_painter.h"
-#include "third_party/blink/renderer/modules/encryptedmedia/html_media_element_encrypted_media.h"
 #include "third_party/blink/renderer/core/script/classic_script.h"
 #include "third_party/blink/renderer/core/scroll/scrollable_area.h"
+#include "third_party/blink/renderer/modules/encryptedmedia/html_media_element_encrypted_media.h"
 #include "third_party/blink/renderer/platform/bindings/script_forbidden_scope.h"
 #include "third_party/blink/renderer/platform/bindings/v8_binding.h"
+#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
+#include "third_party/blink/renderer/platform/graphics/paint/cull_rect.h"
+#include "third_party/blink/renderer/platform/graphics/paint/paint_record_builder.h"
 #include "third_party/blink/renderer/platform/heap/persistent.h"
 #include "third_party/blink/renderer/platform/loader/fetch/resource_response.h"
 #include "third_party/blink/renderer/platform/loader/fetch/script_fetch_options.h"
 #include "third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.h"
 #include "third_party/blink/renderer/platform/weborigin/scheme_registry.h"
 #include "third_party/skia/include/core/SkData.h"
+#include "third_party/skia/include/core/SkFontMgr.h"
 #include "third_party/skia/include/core/SkImage.h"
 #include "third_party/skia/include/core/SkPicture.h"
 #include "third_party/skia/include/core/SkPictureRecorder.h"
 #include "third_party/skia/include/core/SkSerialProcs.h"
 #include "third_party/skia/include/core/SkStream.h"
-#include "third_party/skia/include/core/SkTypeface.h"
 #include "third_party/skia/include/core/SkSurface.h"
+#include "third_party/skia/include/core/SkTypeface.h"
 #include "third_party/skia/include/encode/SkPngRustEncoder.h"
+#include "third_party/skia/src/core/SkFontDescriptor.h"
 #include "third_party/skia/src/core/SkReachResource.h"
+#include "ui/events/keycodes/dom/dom_key.h"
+#include "ui/events/keycodes/dom/keycode_converter.h"
+#include "ui/events/keycodes/keyboard_code_conversion.h"
 #undef LOG
 
 #include "base/logging.h"
@@ -579,6 +582,40 @@ bool CheckPaintRecord(PaintSerialization* state,
   return true;
 }
 
+// Same-process child frames paint inline into their local root, as in normal
+// Chromium paint. Only remote frames and plugins are composed by identity.
+bool IsInlinePaintFrame(blink::LocalFrame* root, blink::Frame* frame) {
+  auto* local = blink::DynamicTo<blink::LocalFrame>(frame);
+  return local && &local->LocalFrameRoot() == &root->LocalFrameRoot();
+}
+
+// Remote child frames whose owner element paints inside |root|'s output.
+bool IsComposedChildFrame(blink::LocalFrame* root, blink::Frame* frame) {
+  return !blink::IsA<blink::LocalFrame>(frame) &&
+         IsInlinePaintFrame(root, frame->Tree().Parent());
+}
+
+// Captures read the normal lifecycle paint artifact, so the local root must be
+// paint-clean. Post-lifecycle steps such as IntersectionObserver delivery can
+// dirty it again; a following lifecycle update settles that work.
+bool EnsurePaintClean(blink::LocalFrame* frame) {
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (!frame->IsAttached() || !frame->View() || !frame->GetPage() ||
+        !frame->GetDocument()) {
+      return false;
+    }
+    if (frame->GetDocument()->Lifecycle().GetState() ==
+        blink::DocumentLifecycle::kPaintClean) {
+      return true;
+    }
+    frame->GetPage()->Animator().UpdateAllLifecyclePhases(
+        *frame, blink::DocumentUpdateReason::kInspector);
+  }
+  return frame->IsAttached() && frame->View() && frame->GetDocument() &&
+         frame->GetDocument()->Lifecycle().GetState() ==
+             blink::DocumentLifecycle::kPaintClean;
+}
+
 std::optional<cc::PaintRecord> CaptureRequiredPaint(
     blink::WebLocalFrame* web_frame, const gfx::Rect& bounds,
     PaintSerialization* dependencies) {
@@ -589,58 +626,95 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
     return std::nullopt;
   }
   auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
-  auto* root = frame->GetDocument()->GetLayoutView();
-  size_t objects = 0;
-  std::set<uint32_t> frame_ids;
-  for (blink::LayoutObject* object = root; object;
-       object = object->NextInPreOrder(root)) {
-    if (++objects > kMaxLayoutObjects) {
-      dependencies->error = "Layout object budget exceeded";
-      return std::nullopt;
-    }
-    if (object->IsLayoutEmbeddedContent()) {
-      if (auto* owner =
-              blink::DynamicTo<blink::HTMLFrameOwnerElement>(object->GetNode())) {
-        frame_ids.insert(owner->GetDomNodeId());
-      }
-    }
-    const auto* element =
-        blink::DynamicTo<blink::HTMLCanvasElement>(object->GetNode());
-    if (!element || dependencies->raster)
-      continue;
-    auto* context = element->RenderingContext();
-    if (element->IsOffscreenCanvasRegistered() ||
-        (context && !context->IsRenderingContext2D())) {
-      dependencies->error =
-          "GPU, bitmap or offscreen canvas requires command transport";
-      return std::nullopt;
-    }
-    if (context) {
-      if (!blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
-        dependencies->error = "Canvas2D requires a command-only runtime";
-        return std::nullopt;
-      }
-      context->FlushCanvas(blink::FlushReason::kPrinting);
-      if (context->IsPaintable() && !context->GetLastRecording()) {
-        dependencies->error =
-            "Canvas2D readback, raw pixels or command budget requires support";
-        return std::nullopt;
-      }
-    }
+  if (!frame->IsLocalRoot()) {
+    // Painted inline by its local root; it has no separate picture.
+    return cc::PaintRecord();
   }
-  cc::PaintRecorder recorder;
-  auto* canvas = recorder.beginRecording();
-  canvas->translate(-bounds.x(), -bounds.y());
-  const bool previous = blink::SetReachMediaCapture(!dependencies->raster);
-  base::ScopedClosureRunner restore(base::BindOnce(
-      [](bool value) { blink::SetReachMediaCapture(value); }, previous));
-  if (!web_frame->CapturePaintPreview(
-          bounds, canvas, /*include_linked_destinations=*/false,
-          /*skip_accelerated_content=*/false, /*allow_scrollbars=*/true)) {
-    dependencies->error = "Blink paint recording failed";
+  if (!dependencies->raster && !EnsurePaintClean(frame)) {
+    dependencies->error = "Frame lifecycle did not reach paint-clean";
     return std::nullopt;
   }
-  auto recording = recorder.finishRecordingAsPicture();
+  if (!frame->GetDocument() || !frame->GetDocument()->GetLayoutView()) {
+    dependencies->error = "Frame changed during lifecycle update";
+    return std::nullopt;
+  }
+  size_t objects = 0;
+  std::set<uint32_t> frame_ids;
+  for (blink::Frame* tree_frame = frame; tree_frame;
+       tree_frame = tree_frame->Tree().TraverseNext(frame)) {
+    if (!IsInlinePaintFrame(frame, tree_frame)) {
+      continue;
+    }
+    auto* tree_document =
+        blink::To<blink::LocalFrame>(tree_frame)->GetDocument();
+    auto* root = tree_document ? tree_document->GetLayoutView() : nullptr;
+    for (blink::LayoutObject* object = root; object;
+         object = object->NextInPreOrder(root)) {
+      if (++objects > kMaxLayoutObjects) {
+        dependencies->error = "Layout object budget exceeded";
+        return std::nullopt;
+      }
+      if (object->IsLayoutEmbeddedContent()) {
+        if (auto* owner = blink::DynamicTo<blink::HTMLFrameOwnerElement>(
+                object->GetNode())) {
+          frame_ids.insert(owner->GetDomNodeId());
+        }
+      }
+      const auto* element =
+          blink::DynamicTo<blink::HTMLCanvasElement>(object->GetNode());
+      if (!element || dependencies->raster) {
+        continue;
+      }
+      auto* context = element->RenderingContext();
+      if (element->IsOffscreenCanvasRegistered() ||
+          (context && !context->IsRenderingContext2D())) {
+        dependencies->error =
+            "GPU, bitmap or offscreen canvas requires command transport";
+        return std::nullopt;
+      }
+      if (context) {
+        if (!blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
+          dependencies->error = "Canvas2D requires a command-only runtime";
+          return std::nullopt;
+        }
+        context->FlushCanvas(blink::FlushReason::kPrinting);
+        if (context->IsPaintable() && !context->GetLastRecording()) {
+          dependencies->error =
+              "Canvas2D readback, raw pixels or command budget requires "
+              "support";
+          return std::nullopt;
+        }
+      }
+    }
+  }
+  cc::PaintRecord recording;
+  if (dependencies->raster) {
+    // Server raster fallback paints software video frames, so it records a
+    // separate out-of-lifecycle paint without command-mode media markers.
+    cc::PaintRecorder recorder;
+    auto* canvas = recorder.beginRecording();
+    canvas->translate(-bounds.x(), -bounds.y());
+    const bool previous = blink::SetReachMediaCapture(false);
+    base::ScopedClosureRunner restore(base::BindOnce(
+        [](bool value) { blink::SetReachMediaCapture(value); }, previous));
+    blink::PaintRecordBuilder builder;
+    frame->View()->PaintOutsideOfLifecycle(
+        builder.Context(), blink::PaintFlag::kOmitCompositingInfo,
+        blink::CullRect(bounds));
+    auto* layout_view =
+        frame->GetDocument() ? frame->GetDocument()->GetLayoutView() : nullptr;
+    if (!frame->IsAttached() || !layout_view) {
+      dependencies->error = "Blink paint recording failed";
+      return std::nullopt;
+    }
+    canvas->drawPicture(builder.EndRecording(
+        layout_view->FirstFragment().ContentsProperties().Unalias()));
+    recording = recorder.finishRecordingAsPicture();
+  } else {
+    // The normal lifecycle paint, replayed in viewport coordinates.
+    const gfx::Rect viewport(bounds.size());
+    recording = frame->View()->GetPaintRecord(&viewport);
+  }
   dependencies->collect_paint_ids = true;
   if (!CheckPaintRecord(dependencies, recording, 0)) {
     return std::nullopt;
@@ -1046,8 +1120,11 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame,
     return result;
   }
   base::ListValue children;
-  for (auto* child = frame->Tree().FirstChild(); child;
-       child = child->Tree().NextSibling()) {
+  for (auto* child = frame->Tree().TraverseNext(frame); child;
+       child = child->Tree().TraverseNext(frame)) {
+    if (!IsComposedChildFrame(frame, child)) {
+      continue;
+    }
     const auto* owner = child->OwnerLayoutObject();
     auto* element = owner
         ? blink::DynamicTo<blink::HTMLFrameOwnerElement>(owner->GetNode())
@@ -1169,91 +1246,115 @@ CefDrawingCommands CaptureDrawingCommands(
   OriginalTypefaceCache frame_fonts;
   frame_fonts.originals = &resources;
   std::map<uint32_t, sk_sp<SkPicture>> frame_pictures;
-  root = document->GetLayoutView();
-  for (blink::LayoutObject* object = root; object;
-       object = object->NextInPreOrder(root)) {
-    auto* node = object->GetNode();
-    if (object->IsLayoutEmbeddedContent()) {
-      auto* owner =
-          blink::DynamicTo<blink::HTMLFrameOwnerElement>(node);
-      if (!owner ||
-          !dependencies.media_ids.contains(owner->GetDomNodeId()))
-        continue;
-      auto* child = owner ? owner->ContentFrame() : nullptr;
-      if (!child || DrawingFrameIdentity(child).empty() ||
-          !blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
-        result.error = "Embedded plugin or unready frame requires support";
-        return result;
+  for (blink::Frame* tree_frame = frame.Get(); tree_frame;
+       tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
+    if (!IsInlinePaintFrame(frame.Get(), tree_frame)) {
+      continue;
+    }
+    auto* tree_document =
+        blink::To<blink::LocalFrame>(tree_frame)->GetDocument();
+    root = tree_document ? tree_document->GetLayoutView() : nullptr;
+    for (blink::LayoutObject* object = root; object;
+         object = object->NextInPreOrder(root)) {
+      auto* node = object->GetNode();
+      if (object->IsLayoutEmbeddedContent()) {
+        auto* owner = blink::DynamicTo<blink::HTMLFrameOwnerElement>(node);
+        if (!owner || !dependencies.media_ids.contains(owner->GetDomNodeId()))
+          continue;
+        auto* child = owner ? owner->ContentFrame() : nullptr;
+        if (!child || DrawingFrameIdentity(child).empty() ||
+            !blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
+          result.error = "Embedded plugin or unready frame requires support";
+          return result;
+        }
+        const auto found = children.find(DrawingFrameIdentity(child));
+        if (found == children.end() || frame_pictures.size() >= 16 ||
+            (child_bytes += found->second.size()) > kMaxPaintBytes) {
+          result.error =
+              "Missing child frame picture or composition budget exceeded";
+          return result;
+        }
+        SkDeserialProcs procs;
+        procs.fTypefaceStreamProc = DeserializeOriginalTypeface;
+        procs.fTypefaceCtx = &frame_fonts;
+        procs.fImageDataProc = DeserializeOriginalImage;
+        procs.fImageCtx = &frame_fonts;
+        auto picture = SkPicture::MakeFromData(found->second.data(),
+                                               found->second.size(), &procs);
+        if (frame_fonts.failed || !picture || picture->cullRect().isEmpty() ||
+            picture->cullRect().left() != 0 || picture->cullRect().top() != 0) {
+          result.error = "Invalid child frame command picture";
+          return result;
+        }
+        frame_pictures.emplace(owner->GetDomNodeId(), std::move(picture));
       }
-      const auto found = children.find(DrawingFrameIdentity(child));
-      if (found == children.end() || frame_pictures.size() >= 16 ||
-          (child_bytes += found->second.size()) > kMaxPaintBytes) {
-        result.error = "Missing child frame picture or composition budget exceeded";
-        return result;
-      }
-      SkDeserialProcs procs;
-      procs.fTypefaceStreamProc = DeserializeOriginalTypeface;
-      procs.fTypefaceCtx = &frame_fonts;
-      procs.fImageDataProc = DeserializeOriginalImage;
-      procs.fImageCtx = &frame_fonts;
-      auto picture = SkPicture::MakeFromData(
-          found->second.data(), found->second.size(), &procs);
-      if (frame_fonts.failed || !picture || picture->cullRect().isEmpty() ||
-          picture->cullRect().left() != 0 ||
-          picture->cullRect().top() != 0) {
-        result.error = "Invalid child frame command picture";
-        return result;
-      }
-      frame_pictures.emplace(owner->GetDomNodeId(), std::move(picture));
     }
   }
   size_t media_count = 0;
   std::map<uint32_t, sk_sp<SkData>> media_states;
-  for (auto& node : blink::FlatTreeTraversal::DescendantsOf(*document)) {
-    auto* media = blink::DynamicTo<blink::HTMLMediaElement>(node);
-    if (!media)
+  for (blink::Frame* tree_frame = frame.Get(); tree_frame;
+       tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
+    if (!IsInlinePaintFrame(frame.Get(), tree_frame)) {
       continue;
-    const auto& url = media->currentSrc();
-    if (media->HasMediaSource() ||
-        blink::HTMLMediaElementEncryptedMedia::mediaKeys(*media) ||
-        std::visit([](auto* object) { return object != nullptr; },
-                   media->GetSrcObjectVariant()) ||
-        (!url.IsEmpty() && !url.ProtocolIs("http") && !url.ProtocolIs("https") &&
-         !url.ProtocolIsData())) {
-      result.error = "MediaSource, MediaStream or encrypted media requires transport support";
-      return result;
     }
-    if (url.IsEmpty())
+    auto* media_document =
+        blink::To<blink::LocalFrame>(tree_frame)->GetDocument();
+    if (!media_document) {
       continue;
-    if (web_frame->Parent()) {
-      result.error = "Child-frame media requires frame-scoped resource routing";
-      return result;
     }
-    if (++media_count > 16 || !std::isfinite(media->currentTime()) ||
-        !std::isfinite(media->playbackRate()) ||
-        media->playbackRate() < 0.25 || media->playbackRate() > 4) {
-      result.error = "Media count or playback state exceeds budget";
-      return result;
+    for (auto& node :
+         blink::FlatTreeTraversal::DescendantsOf(*media_document)) {
+      auto* media = blink::DynamicTo<blink::HTMLMediaElement>(node);
+      if (!media)
+        continue;
+      const auto& url = media->currentSrc();
+      if (media->HasMediaSource() ||
+          blink::HTMLMediaElementEncryptedMedia::mediaKeys(*media) ||
+          std::visit([](auto* object) { return object != nullptr; },
+                     media->GetSrcObjectVariant()) ||
+          (!url.IsEmpty() && !url.ProtocolIs("http") &&
+           !url.ProtocolIs("https") && !url.ProtocolIsData())) {
+        result.error =
+            "MediaSource, MediaStream or encrypted media requires transport "
+            "support";
+        return result;
+      }
+      if (url.IsEmpty())
+        continue;
+      if (web_frame->Parent() || tree_frame != frame.Get()) {
+        result.error =
+            "Child-frame media requires frame-scoped resource routing";
+        return result;
+      }
+      if (++media_count > 16 || !std::isfinite(media->currentTime()) ||
+          !std::isfinite(media->playbackRate()) ||
+          media->playbackRate() < 0.25 || media->playbackRate() > 4) {
+        result.error = "Media count or playback state exceeds budget";
+        return result;
+      }
+      base::DictValue state;
+      state.Set("id", media->GetDomNodeId());
+      state.Set("kind", media->IsHTMLVideoElement() ? "video" : "audio");
+      state.Set(
+          "resource",
+          url.IsEmpty()
+              ? ""
+              : base::HexEncode(crypto::hash::Sha256(url.GetString().Utf8())));
+      state.Set("time", media->currentTime());
+      state.Set("paused", media->paused());
+      state.Set("ended", media->ended());
+      state.Set("rate", media->playbackRate());
+      state.Set("volume", media->volume());
+      state.Set("muted", media->muted());
+      state.Set("loop", media->Loop());
+      auto json = base::WriteJson(state);
+      if (!json || json->size() > 4096) {
+        result.error = "Media state serialization failed";
+        return result;
+      }
+      media_states.emplace(media->GetDomNodeId(),
+                           SkData::MakeWithCopy(json->data(), json->size()));
     }
-    base::DictValue state;
-    state.Set("id", media->GetDomNodeId());
-    state.Set("kind", media->IsHTMLVideoElement() ? "video" : "audio");
-    state.Set("resource", url.IsEmpty() ? "" :
-        base::HexEncode(crypto::hash::Sha256(url.GetString().Utf8())));
-    state.Set("time", media->currentTime());
-    state.Set("paused", media->paused());
-    state.Set("ended", media->ended());
-    state.Set("rate", media->playbackRate());
-    state.Set("volume", media->volume());
-    state.Set("muted", media->muted());
-    state.Set("loop", media->Loop());
-    auto json = base::WriteJson(state);
-    if (!json || json->size() > 4096) {
-      result.error = "Media state serialization failed";
-      return result;
-    }
-    media_states.emplace(media->GetDomNodeId(),
-                         SkData::MakeWithCopy(json->data(), json->size()));
   }
   PaintSerialization state;
   state.sink = sink;
@@ -1372,8 +1473,11 @@ CefDrawingCommands CaptureRasterFallback(
   std::map<uint32_t, sk_sp<SkImage>> images;
   size_t child_bytes = 0;
   uint64_t child_pixels = 0;
-  for (auto* child = frame->Tree().FirstChild(); child;
-       child = child->Tree().NextSibling()) {
+  for (auto* child = frame->Tree().TraverseNext(frame); child;
+       child = child->Tree().TraverseNext(frame)) {
+    if (!IsComposedChildFrame(frame, child)) {
+      continue;
+    }
     auto* owner = child->OwnerLayoutObject();
     auto* element = owner
         ? blink::DynamicTo<blink::HTMLFrameOwnerElement>(owner->GetNode())
