@@ -1,0 +1,16 @@
+diff --git third_party/blink/renderer/core/display_lock/display_lock_context.cc third_party/blink/renderer/core/display_lock/display_lock_context.cc
+index 203ad55..a427783
+--- third_party/blink/renderer/core/display_lock/display_lock_context.cc
++++ third_party/blink/renderer/core/display_lock/display_lock_context.cc
+@@ -705,6 +705,11 @@ bool DisplayLockContext::MarkForLayoutIfNeeded() {
+       // different time / opportunity to restore the offset.
+       layout_object->SetChildNeedsLayout();
+       child_layout_was_blocked_ = false;
++      // Backport of upstream 491571b360 (crbug.com/40063752):
++      // |SetChildNeedsLayout()| skips the ancestors when this object was
++      // already child-dirty, but dirty-bit propagation from the locked
++      // subtree stopped here, so they are clean.
++      layout_object->MarkContainerChainForLayout();
+     } else {
+       // Since the dirty layout propagation stops at the locked element, we need
+       // to mark its ancestors as dirty here so that it will be traversed to on
