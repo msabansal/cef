@@ -20,6 +20,7 @@
 #include "base/strings/string_number_conversions.h"
 #include "base/time/time.h"
 #include "base/values.h"
+#include "third_party/blink/renderer/core/animation/pending_animations.h"
 #include "crypto/hash.h"
 #include "cc/paint/paint_op.h"
 #include "cc/paint/paint_filter.h"
@@ -82,6 +83,7 @@
 #include "third_party/blink/renderer/platform/heap/persistent.h"
 #include "third_party/blink/renderer/platform/loader/fetch/resource_response.h"
 #include "third_party/blink/renderer/platform/loader/fetch/script_fetch_options.h"
+#include "third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.h"
 #include "third_party/blink/renderer/platform/weborigin/scheme_registry.h"
 #include "third_party/skia/include/core/SkData.h"
 #include "third_party/skia/include/core/SkImage.h"
@@ -425,6 +427,12 @@ bool CheckPaintFilter(PaintSerialization* state,
     }
     case cc::PaintFilter::Type::kColorFilter:
       break;
+    case cc::PaintFilter::Type::kXfermode: {
+      const auto* blend =
+          static_cast<const cc::XfermodePaintFilter*>(filter);
+      return CheckPaintFilter(state, blend->background().get(), depth + 1) &&
+             CheckPaintFilter(state, blend->foreground().get(), depth + 1);
+    }
     case cc::PaintFilter::Type::kCompose: {
       const auto* compose =
           static_cast<const cc::ComposePaintFilter*>(filter);
@@ -1088,6 +1096,11 @@ CefDrawingCommands CaptureDrawingCommands(
     return result;
   }
   blink::Persistent<blink::Page> page = frame->GetPage();
+  // Held begin frames also suppress the compositor's idle-period signal.
+  // Let Blink schedule idle work normally between command captures.
+  static_cast<blink::scheduler::MainThreadSchedulerImpl&>(
+      blink::scheduler::WebThreadScheduler::MainThreadScheduler())
+      .BeginFrameNotExpectedSoon();
   page->Animator().ServiceScriptedAnimations(base::TimeTicks::Now());
   if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
       frame->GetPage() != page.Get() || !frame->View()) {
@@ -1099,6 +1112,37 @@ CefDrawingCommands CaptureDrawingCommands(
   if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
       frame->GetPage() != page.Get() || !frame->View()) {
     result.error = "Frame changed during layout";
+    return result;
+  }
+  // Start pending CSS animations and transitions on the main thread;
+  // no compositor commit exists to start them there.
+  for (blink::Frame* tree_frame = frame.Get(); tree_frame;
+       tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
+    auto* local = blink::DynamicTo<blink::LocalFrame>(tree_frame);
+    blink::Document* local_document = local ? local->GetDocument() : nullptr;
+    if (!local_document || local_document->Lifecycle().GetState() <
+                               blink::DocumentLifecycle::kLayoutClean) {
+      continue;
+    }
+    blink::ScriptForbiddenScope forbid_script;
+    local_document->GetPendingAnimations().Update(
+        nullptr, /*start_on_compositor=*/false);
+  }
+  // External begin frames stay held so nothing commits or rasters, which also
+  // means BeginMainFrame never runs. Perform its main-thread steps here: the
+  // paint-clean lifecycle delivers ResizeObservers and the post-lifecycle
+  // steps compute IntersectionObservers (including loading=lazy).
+  page->Animator().UpdateAllLifecyclePhases(
+      *frame, blink::DocumentUpdateReason::kInspector);
+  if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
+      frame->GetPage() != page.Get() || !frame->View()) {
+    result.error = "Frame changed during animation start";
+    return result;
+  }
+  frame->LocalFrameRoot().View()->RunPostLifecycleSteps();
+  if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
+      frame->GetPage() != page.Get() || !frame->View()) {
+    result.error = "Frame changed during post-lifecycle steps";
     return result;
   }
   auto* root = document->GetLayoutView();
