@@ -1,8 +1,23 @@
 diff --git third_party/blink/renderer/core/display_lock/display_lock_context.cc third_party/blink/renderer/core/display_lock/display_lock_context.cc
-index 203ad55..a427783
 --- third_party/blink/renderer/core/display_lock/display_lock_context.cc
 +++ third_party/blink/renderer/core/display_lock/display_lock_context.cc
-@@ -705,6 +705,11 @@ bool DisplayLockContext::MarkForLayoutIfNeeded() {
+@@ -686,7 +686,14 @@
+     // Ensure any layout-type specific caches are dirty.
+     layout_object->SetGridPlacementDirty(true);
+ 
+-    if (child_layout_was_blocked_ || HasStashedScrollOffset()) {
++    // A locked element that kept |NeedsSimplifiedLayout()| also skipped its
++    // children (ClearNeedsLayoutWithoutPaintInvalidation() only reports a
++    // blocked traversal when no child bits remain), and its cached fragment
++    // has no children. Simplified layout would iterate that childless
++    // fragment, clear the bits and leave the children dirty, so require a
++    // full child traversal as for a reported block.
++    if (child_layout_was_blocked_ || HasStashedScrollOffset() ||
++        layout_object->NeedsSimplifiedLayout()) {
+       // We've previously blocked a child traversal when doing self-layout for
+       // the locked element, so we're marking it with child-needs-layout so that
+       // it will traverse to the locked element and do the child traversal
+@@ -705,6 +712,11 @@
        // different time / opportunity to restore the offset.
        layout_object->SetChildNeedsLayout();
        child_layout_was_blocked_ = false;
