@@ -1595,6 +1595,14 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       auto* media = blink::DynamicTo<blink::HTMLMediaElement>(node);
       if (!media)
         continue;
+      // Video state is only replayed where its marker painted. Unpainted
+      // videos (e.g. a long feed outside the paint cull rect) are not in this
+      // picture, so they neither need transport support nor count against
+      // the media budget. Audio has no marker and always does.
+      if (media->IsHTMLVideoElement() &&
+          !dependencies.media_ids.contains(media->GetDomNodeId())) {
+        continue;
+      }
       const auto& url = media->currentSrc();
       if (media->HasMediaSource() ||
           blink::HTMLMediaElementEncryptedMedia::mediaKeys(*media) ||
