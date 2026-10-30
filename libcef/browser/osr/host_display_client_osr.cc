@@ -6,6 +6,8 @@
 
 #include <utility>
 
+#include "base/command_line.h"
+#include "base/functional/callback_helpers.h"
 #include "base/memory/raw_ptr.h"
 #include "base/memory/shared_memory_mapping.h"
 #include "cef/libcef/browser/osr/render_widget_host_view_osr.h"
@@ -21,6 +23,58 @@
 #if BUILDFLAG(IS_WIN)
 #include "skia/ext/skia_utils_win.h"
 #endif
+
+class CefReachVideoSink : public viz::mojom::ReachVideoSink {
+ public:
+  CefReachVideoSink(
+      CefRenderWidgetHostViewOSR* view,
+      mojo::PendingReceiver<viz::mojom::ReachVideoSink> receiver)
+      : view_(view), receiver_(this, std::move(receiver)) {
+    receiver_.set_disconnect_handler(base::BindOnce(
+        &CefReachVideoSink::Disconnected, base::Unretained(this)));
+  }
+
+  void Started(const std::string& stream) override {
+    stream_ = stream;
+    view_->OnVideoSinkEvent(0, stream_, "", 0, 0, gfx::Size(), 0, 0, nullptr, 0);
+  }
+
+  void FrameReady(base::ReadOnlySharedMemoryRegion pixels,
+                  const gfx::Size& size,
+                  uint32_t stride,
+                  uint64_t generation,
+                  uint64_t sequence,
+                  base::TimeTicks timestamp,
+                  FrameReadyCallback released) override {
+    base::ScopedClosureRunner release(std::move(released));
+    const uint64_t bytes = static_cast<uint64_t>(stride) * size.height();
+    if (stream_.empty() || size.IsEmpty() || size.width() > 8192 ||
+        size.height() > 8192 || stride != static_cast<uint32_t>(size.width()) * 4 ||
+        bytes > 64 * 1024 * 1024 || !generation || !sequence) {
+      Error("Invalid Reach video frame metadata");
+      return;
+    }
+    auto mapping = pixels.Map();
+    if (!mapping.IsValid() || mapping.size() != bytes) {
+      Error("Invalid Reach video shared-memory frame");
+      return;
+    }
+    view_->OnVideoSinkEvent(
+        1, stream_, "", generation, sequence, size, stride,
+        timestamp.since_origin().InMicroseconds(), mapping.memory(), bytes);
+  }
+
+  void Error(const std::string& message) override {
+    view_->OnVideoSinkEvent(2, stream_, message, 0, 0, gfx::Size(), 0, 0, nullptr, 0);
+  }
+
+ private:
+  void Disconnected() { Error("Reach compositor video sink disconnected"); }
+
+  const raw_ptr<CefRenderWidgetHostViewOSR> view_;
+  mojo::Receiver<viz::mojom::ReachVideoSink> receiver_;
+  std::string stream_;
+};
 
 class CefLayeredWindowUpdaterOSR : public viz::mojom::LayeredWindowUpdater {
  public:
@@ -135,9 +189,16 @@ gfx::Size CefHostDisplayClientOSR::GetPixelSize() const {
 
 void CefHostDisplayClientOSR::CreateLayeredWindowUpdater(
     mojo::PendingReceiver<viz::mojom::LayeredWindowUpdater> receiver) {
+  CHECK(!base::CommandLine::ForCurrentProcess()->HasSwitch("reach-video-sink"));
   layered_window_updater_ =
       std::make_unique<CefLayeredWindowUpdaterOSR>(view_, std::move(receiver));
   layered_window_updater_->SetActive(active_);
+}
+
+void CefHostDisplayClientOSR::CreateReachVideoSink(
+    mojo::PendingReceiver<viz::mojom::ReachVideoSink> receiver) {
+  CHECK(base::CommandLine::ForCurrentProcess()->HasSwitch("reach-video-sink"));
+  video_sink_ = std::make_unique<CefReachVideoSink>(view_, std::move(receiver));
 }
 
 #if BUILDFLAG(IS_LINUX) && BUILDFLAG(SUPPORTS_OZONE_X11)

@@ -15,6 +15,7 @@
 #include "ui/gfx/native_ui_types.h"
 
 class CefLayeredWindowUpdaterOSR;
+class CefReachVideoSink;
 class CefRenderWidgetHostViewOSR;
 
 class CefHostDisplayClientOSR : public viz::HostDisplayClient {
@@ -36,6 +37,8 @@ class CefHostDisplayClientOSR : public viz::HostDisplayClient {
   void CreateLayeredWindowUpdater(
       mojo::PendingReceiver<viz::mojom::LayeredWindowUpdater> receiver)
       override;
+  void CreateReachVideoSink(
+      mojo::PendingReceiver<viz::mojom::ReachVideoSink> receiver) override;
 
 #if BUILDFLAG(IS_LINUX) && BUILDFLAG(SUPPORTS_OZONE_X11)
   void DidCompleteSwapWithNewSize(const gfx::Size& size) override;
@@ -43,6 +46,7 @@ class CefHostDisplayClientOSR : public viz::HostDisplayClient {
 
   const raw_ptr<CefRenderWidgetHostViewOSR> view_;
   std::unique_ptr<CefLayeredWindowUpdaterOSR> layered_window_updater_;
+  std::unique_ptr<CefReachVideoSink> video_sink_;
   bool active_ = false;
 };
 

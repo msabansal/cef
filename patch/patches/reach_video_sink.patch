@@ -1,0 +1,399 @@
+diff --git a/components/viz/host/host_display_client.cc b/components/viz/host/host_display_client.cc
+--- a/components/viz/host/host_display_client.cc
++++ b/components/viz/host/host_display_client.cc
+@@ -63,6 +63,11 @@
+ #endif
+ }
+ 
++void HostDisplayClient::CreateReachVideoSink(
++    mojo::PendingReceiver<mojom::ReachVideoSink> receiver) {
++  // Only an explicitly opted-in embedder may consume video output.
++}
++
+ #if BUILDFLAG(IS_WIN)
+ void HostDisplayClient::AddChildWindowToBrowser(
+     gpu::SurfaceHandle child_window) {
+diff --git a/components/viz/host/host_display_client.h b/components/viz/host/host_display_client.h
+--- a/components/viz/host/host_display_client.h
++++ b/components/viz/host/host_display_client.h
+@@ -48,6 +48,8 @@
+ 
+   void CreateLayeredWindowUpdater(
+       mojo::PendingReceiver<mojom::LayeredWindowUpdater> receiver) override;
++  void CreateReachVideoSink(
++      mojo::PendingReceiver<mojom::ReachVideoSink> receiver) override;
+ #if BUILDFLAG(IS_WIN)
+   void AddChildWindowToBrowser(gpu::SurfaceHandle child_window) override;
+ #endif
+diff --git a/components/viz/service/BUILD.gn b/components/viz/service/BUILD.gn
+--- a/components/viz/service/BUILD.gn
++++ b/components/viz/service/BUILD.gn
+@@ -140,6 +140,8 @@
+     "display/skia_renderer.cc",
+     "display/skia_renderer.h",
+     "display/software_output_device.cc",
++    "display_embedder/reach_video_output_device.cc",
++    "display_embedder/reach_video_output_device.h",
+     "display/software_output_device.h",
+     "display/software_renderer.cc",
+     "display/software_renderer.h",
+@@ -643,6 +645,7 @@
+     "display_embedder/skia_output_device_buffer_queue_unittest.cc",
+     "display_embedder/skia_output_surface_impl_unittest.cc",
+     "display_embedder/software_output_surface_unittest.cc",
++    "display_embedder/reach_video_output_device_unittest.cc",
+     "display_embedder/vsync_parameter_listener_unittest.cc",
+     "frame_sinks/begin_frame_tracker_unittest.cc",
+     "frame_sinks/compositor_frame_sink_support_unittest.cc",
+diff --git a/components/viz/service/display_embedder/reach_video_output_device.cc b/components/viz/service/display_embedder/reach_video_output_device.cc
+new file mode 100644
+--- /dev/null
++++ b/components/viz/service/display_embedder/reach_video_output_device.cc
+@@ -0,0 +1,93 @@
++#include "components/viz/service/display_embedder/reach_video_output_device.h"
++
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/trace_event/trace_event.h"
++#include "base/unguessable_token.h"
++#include "third_party/skia/include/core/SkColorSpace.h"
++
++namespace viz {
++
++ReachVideoOutputDevice::ReachVideoOutputDevice(
++    mojo::PendingRemote<mojom::ReachVideoSink> sink)
++    : sink_(std::move(sink)) {
++  sink_.set_disconnect_handler(base::BindOnce(
++      &ReachVideoOutputDevice::Fail, weak_factory_.GetWeakPtr(),
++      "Reach video consumer disconnected"));
++  sink_->Started(base::UnguessableToken::Create().ToString());
++}
++
++ReachVideoOutputDevice::~ReachVideoOutputDevice() = default;
++
++void ReachVideoOutputDevice::Resize(const gfx::Size& size, float scale_factor) {
++  if (size == viewport_pixel_size_)
++    return;
++  if (size.IsEmpty() || size.width() > 8192 || size.height() > 8192 ||
++      static_cast<uint64_t>(size.width()) * size.height() > 16 * 1024 * 1024) {
++    Fail("Reach video output dimensions exceed the capture budget");
++    return;
++  }
++  SoftwareOutputDevice::Resize(size, scale_factor);
++  ++generation_;
++  pending_ = false;
++  if (!surface_)
++    Fail("Reach video raster surface allocation failed");
++}
++
++void ReachVideoOutputDevice::EndPaint() {
++  TRACE_EVENT0("viz", "ReachVideoOutputDevice::EndPaint");
++  if (failed_ || !surface_)
++    return;
++  pending_ = true;
++  pending_timestamp_ = base::TimeTicks::Now();
++  DeliverLatest();
++}
++
++void ReachVideoOutputDevice::DeliverLatest() {
++  if (failed_ || in_flight_ || !pending_)
++    return;
++  const uint32_t stride = viewport_pixel_size_.width() * 4;
++  const size_t bytes = static_cast<size_t>(stride) * viewport_pixel_size_.height();
++  if (!snapshot_.mapping.IsValid() || snapshot_.mapping.size() != bytes)
++    snapshot_ = base::ReadOnlySharedMemoryRegion::Create(bytes);
++  if (!snapshot_.IsValid()) {
++    Fail("Reach video snapshot allocation failed");
++    return;
++  }
++  const auto info = SkImageInfo::Make(
++      viewport_pixel_size_.width(), viewport_pixel_size_.height(),
++      kBGRA_8888_SkColorType, kOpaque_SkAlphaType, SkColorSpace::MakeSRGB());
++  if (!surface_->readPixels(info, snapshot_.mapping.memory(), stride, 0, 0)) {
++    Fail("Reach video raster snapshot failed");
++    return;
++  }
++  auto region = snapshot_.region.Duplicate();
++  if (!region.IsValid()) {
++    Fail("Reach video snapshot duplication failed");
++    return;
++  }
++  pending_ = false;
++  in_flight_ = true;
++  sink_->FrameReady(
++      std::move(region), viewport_pixel_size_, stride, generation_, ++sequence_,
++      pending_timestamp_,
++      base::BindOnce(&ReachVideoOutputDevice::Released,
++                     weak_factory_.GetWeakPtr()));
++}
++
++void ReachVideoOutputDevice::Released() {
++  CHECK(in_flight_);
++  in_flight_ = false;
++  DeliverLatest();
++}
++
++void ReachVideoOutputDevice::Fail(const std::string& message) {
++  if (failed_)
++    return;
++  failed_ = true;
++  LOG(ERROR) << message;
++  if (sink_.is_connected())
++    sink_->Error(message);
++}
++
++}  // namespace viz
+diff --git a/components/viz/service/display_embedder/reach_video_output_device.h b/components/viz/service/display_embedder/reach_video_output_device.h
+new file mode 100644
+--- /dev/null
++++ b/components/viz/service/display_embedder/reach_video_output_device.h
+@@ -0,0 +1,41 @@
++#ifndef COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_REACH_VIDEO_OUTPUT_DEVICE_H_
++#define COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_REACH_VIDEO_OUTPUT_DEVICE_H_
++
++#include "base/memory/read_only_shared_memory_region.h"
++#include "base/memory/weak_ptr.h"
++#include "components/viz/service/display/software_output_device.h"
++#include "components/viz/service/viz_service_export.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "services/viz/privileged/mojom/compositing/display_private.mojom.h"
++
++namespace viz {
++
++// A presentation-free software raster destination. The encoder consumer owns
++// each immutable snapshot until its reply; intervening paints are coalesced.
++class VIZ_SERVICE_EXPORT ReachVideoOutputDevice : public SoftwareOutputDevice {
++ public:
++  explicit ReachVideoOutputDevice(
++      mojo::PendingRemote<mojom::ReachVideoSink> sink);
++  ~ReachVideoOutputDevice() override;
++
++  void Resize(const gfx::Size& size, float scale_factor) override;
++  void EndPaint() override;
++
++ private:
++  void DeliverLatest();
++  void Released();
++  void Fail(const std::string& message);
++
++  mojo::Remote<mojom::ReachVideoSink> sink_;
++  base::MappedReadOnlyRegion snapshot_;
++  uint64_t generation_ = 0;
++  uint64_t sequence_ = 0;
++  bool pending_ = false;
++  base::TimeTicks pending_timestamp_;
++  bool in_flight_ = false;
++  bool failed_ = false;
++  base::WeakPtrFactory<ReachVideoOutputDevice> weak_factory_{this};
++};
++
++}  // namespace viz
++#endif
+diff --git a/components/viz/service/display_embedder/reach_video_output_device_unittest.cc b/components/viz/service/display_embedder/reach_video_output_device_unittest.cc
+new file mode 100644
+--- /dev/null
++++ b/components/viz/service/display_embedder/reach_video_output_device_unittest.cc
+@@ -0,0 +1,123 @@
++#include "components/viz/service/display_embedder/reach_video_output_device.h"
++
++#include "base/memory/read_only_shared_memory_region.h"
++#include "base/test/task_environment.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "third_party/skia/include/core/SkCanvas.h"
++
++namespace viz {
++namespace {
++
++class Consumer : public mojom::ReachVideoSink {
++ public:
++  ~Consumer() override {
++    receiver_.reset();
++    released_.Reset();
++  }
++  void Started(const std::string& stream) override { stream_ = stream; }
++  void FrameReady(base::ReadOnlySharedMemoryRegion pixels,
++                  const gfx::Size& size,
++                  uint32_t stride,
++                  uint64_t generation,
++                  uint64_t sequence,
++                  base::TimeTicks timestamp,
++                  FrameReadyCallback released) override {
++    mapping_ = pixels.Map();
++    size_ = size;
++    stride_ = stride;
++    generation_ = generation;
++    sequence_ = sequence;
++    timestamp_ = timestamp;
++    released_ = std::move(released);
++    ++deliveries_;
++  }
++  void Error(const std::string& message) override { error_ = message; }
++
++  mojo::Receiver<mojom::ReachVideoSink> receiver_{this};
++  base::ReadOnlySharedMemoryMapping mapping_;
++  gfx::Size size_;
++  uint32_t stride_ = 0;
++  uint64_t generation_ = 0;
++  uint64_t sequence_ = 0;
++  base::TimeTicks timestamp_;
++  int deliveries_ = 0;
++  std::string stream_;
++  std::string error_;
++  FrameReadyCallback released_;
++};
++
++TEST(ReachVideoOutputDeviceTest, OwnsPixelsAndCoalescesSlowConsumerToLatest) {
++  base::test::SingleThreadTaskEnvironment tasks(
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
++  Consumer consumer;
++  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote());
++  device.Resize(gfx::Size(2, 2), 1.0f);
++  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++  device.EndPaint();
++  tasks.RunUntilIdle();
++  ASSERT_EQ(consumer.deliveries_, 1);
++  ASSERT_TRUE(consumer.mapping_.IsValid());
++  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
++  const auto sequence = consumer.sequence_;
++  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
++  device.EndPaint();
++  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorBLUE);
++  const auto latest_paint = base::TimeTicks::Now();
++  device.EndPaint();
++  tasks.RunUntilIdle();
++  EXPECT_EQ(consumer.deliveries_, 1);
++  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
++  tasks.FastForwardBy(base::Seconds(2));
++  consumer.mapping_ = {};
++  std::move(consumer.released_).Run();
++  tasks.RunUntilIdle();
++  ASSERT_EQ(consumer.deliveries_, 2);
++  EXPECT_GT(consumer.sequence_, sequence);
++  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorBLUE);
++  EXPECT_EQ(consumer.timestamp_, latest_paint);
++}
++
++TEST(ReachVideoOutputDeviceTest, ResizeDoesNotInvalidateAnOutstandingFrame) {
++  base::test::SingleThreadTaskEnvironment tasks;
++  Consumer consumer;
++  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote());
++  device.Resize(gfx::Size(2, 2), 1.0f);
++  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++  device.EndPaint();
++  tasks.RunUntilIdle();
++  const auto generation = consumer.generation_;
++  device.Resize(gfx::Size(3, 2), 1.0f);
++  device.BeginPaint(gfx::Rect(3, 2))->clear(SK_ColorGREEN);
++  device.EndPaint();
++  tasks.RunUntilIdle();
++  EXPECT_EQ(consumer.size_, gfx::Size(2, 2));
++  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
++  consumer.mapping_ = {};
++  std::move(consumer.released_).Run();
++  tasks.RunUntilIdle();
++  EXPECT_EQ(consumer.size_, gfx::Size(3, 2));
++  EXPECT_EQ(consumer.stride_, 12u);
++  EXPECT_GT(consumer.generation_, generation);
++  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorGREEN);
++}
++
++TEST(ReachVideoOutputDeviceTest, SnapshotAndLateReplySurviveProducerTeardown) {
++  base::test::SingleThreadTaskEnvironment tasks;
++  Consumer consumer;
++  auto device = std::make_unique<ReachVideoOutputDevice>(
++      consumer.receiver_.BindNewPipeAndPassRemote());
++  device->Resize(gfx::Size(2, 2), 1.0f);
++  device->BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++  device->EndPaint();
++  tasks.RunUntilIdle();
++  ASSERT_EQ(consumer.deliveries_, 1);
++  device.reset();
++  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
++  std::move(consumer.released_).Run();
++  tasks.RunUntilIdle();
++  EXPECT_EQ(consumer.deliveries_, 1);
++}
++
++}  // namespace
++}  // namespace viz
+diff --git a/components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc b/components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
+--- a/components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
++++ b/components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "components/viz/service/frame_sinks/root_compositor_frame_sink_impl.h"
++#include "base/command_line.h"
++#include "components/viz/service/display_embedder/reach_video_output_device.h"
++#include "components/viz/service/display_embedder/software_output_surface.h"
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -129,10 +132,27 @@
+       std::move(params->display_client));
+   auto display_controller = output_surface_provider->CreateGpuDependency(
+       params->gpu_compositing, params->widget);
+-  auto output_surface = output_surface_provider->CreateOutputSurface(
+-      params->widget, params->gpu_compositing, display_client.get(),
+-      display_controller.get(), params->renderer_settings, debug_settings,
+-      params->use_proxy_output_device);
++  std::unique_ptr<OutputSurface> output_surface;
++  const bool reach_video =
++      base::CommandLine::ForCurrentProcess()->HasSwitch("reach-video-sink") &&
++      params->use_proxy_output_device;
++  if (reach_video) {
++    CHECK(!base::CommandLine::ForCurrentProcess()->HasSwitch(
++        "reach-drawing-commands"));
++    // GPU output requires a qualified shared-image encoder import backend.
++    // Do not quietly use display presentation if the requested mode differs.
++    CHECK(!params->gpu_compositing);
++    mojo::PendingRemote<mojom::ReachVideoSink> sink;
++    display_client->CreateReachVideoSink(
++        sink.InitWithNewPipeAndPassReceiver());
++    output_surface = std::make_unique<SoftwareOutputSurface>(
++        std::make_unique<ReachVideoOutputDevice>(std::move(sink)));
++  } else {
++    output_surface = output_surface_provider->CreateOutputSurface(
++        params->widget, params->gpu_compositing, display_client.get(),
++        display_controller.get(), params->renderer_settings, debug_settings,
++        params->use_proxy_output_device);
++  }
+ 
+   // Creating output surface failed. The host can send a new request, possibly
+   // with a different compositing mode.
+diff --git a/services/viz/privileged/mojom/compositing/display_private.mojom b/services/viz/privileged/mojom/compositing/display_private.mojom
+--- a/services/viz/privileged/mojom/compositing/display_private.mojom
++++ b/services/viz/privileged/mojom/compositing/display_private.mojom
+@@ -7,6 +7,7 @@
+ import "gpu/ipc/common/context_result.mojom";
+ import "gpu/ipc/common/surface_handle.mojom";
+ import "mojo/public/mojom/base/time.mojom";
++import "mojo/public/mojom/base/shared_memory.mojom";
+ import "ui/display/mojom/display_constants.mojom";
+ import "ui/gfx/mojom/ca_layer_params.mojom";
+ import "ui/gfx/mojom/delegated_ink_point_renderer.mojom";
+@@ -116,6 +117,16 @@
+     display.mojom.VariableRefreshRateState vrr_state);
+ };
+ 
++// The reply releases the immutable snapshot. Consumers must finish reading
++// before replying; the producer never waits for encoder completion.
++interface ReachVideoSink {
++  Started(string stream);
++  FrameReady(mojo_base.mojom.ReadOnlySharedMemoryRegion pixels,
++             gfx.mojom.Size size, uint32 stride, uint64 generation,
++             uint64 sequence, mojo_base.mojom.TimeTicks timestamp) => ();
++  Error(string message);
++};
++
+ // DisplayClient allows privileged clients to receive events from the Display.
+ interface DisplayClient {
+   // Called when new Core Animation Layer params are received.
+@@ -153,4 +164,6 @@
+   // Notifies that there is a new refresh rate preference.
+   [EnableIf=can_set_refresh_rate]
+   SetPreferredRefreshRate(float refresh_rate);
++
++  CreateReachVideoSink(pending_receiver<ReachVideoSink> receiver);
+ };

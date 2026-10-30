@@ -268,6 +268,16 @@ class CefRenderWidgetHostViewOSR
   void UpdateFrameRate();
 
   gfx::Size SizeInPixels();
+  void OnVideoSinkEvent(int kind,
+                       const std::string& stream,
+                       const std::string& error,
+                       uint64_t generation,
+                       uint64_t sequence,
+                       const gfx::Size& size,
+                       uint32_t stride,
+                       int64_t timestamp_us,
+                       const void* pixels,
+                       size_t bytes);
   void OnPaint(const gfx::Rect& damage_rect,
                const gfx::Size& pixel_size,
                const void* pixels);

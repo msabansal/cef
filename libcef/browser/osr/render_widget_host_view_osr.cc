@@ -432,7 +432,8 @@ void CefRenderWidgetHostViewOSR::ShowWithVisibility(
                                     /*record_tab_switch_time_request=*/{});
   }
 
-  if (!content::GpuDataManagerImpl::GetInstance()->IsGpuCompositingDisabled()) {
+  if (!base::CommandLine::ForCurrentProcess()->HasSwitch("reach-video-sink") &&
+      !content::GpuDataManagerImpl::GetInstance()->IsGpuCompositingDisabled()) {
     // Start generating frames when we're visible and at the correct size.
     if (!video_consumer_) {
       video_consumer_ =
@@ -1711,10 +1712,57 @@ uint64_t CefRenderWidgetHostViewOSR::GetNSViewId() const {
 }
 #endif  // BUILDFLAG(IS_MAC)
 
+void CefRenderWidgetHostViewOSR::OnVideoSinkEvent(
+    int kind,
+    const std::string& stream,
+    const std::string& error,
+    uint64_t generation,
+    uint64_t sequence,
+    const gfx::Size& size,
+    uint32_t stride,
+    int64_t timestamp_us,
+    const void* pixels,
+    size_t bytes) {
+  TRACE_EVENT0("cef", "CefRenderWidgetHostViewOSR::OnVideoSinkEvent");
+  if (!browser_impl_ || is_destroyed_ || (kind != 2 && !is_showing_))
+    return;
+  // Reannounce the active widget when restoring a hidden root after fullscreen.
+  if (kind == 1) {
+    auto weak_this = weak_ptr_factory_.GetWeakPtr();
+    OnVideoSinkEvent(0, stream, "", 0, 0, gfx::Size(), 0, 0, nullptr, 0);
+    if (!weak_this)
+      return;
+  }
+  auto message = CefProcessMessage::Create("Reach.VideoSink.v1");
+  auto values = message->GetArgumentList();
+  values->SetInt(0, kind);
+  values->SetInt(1, IsPopupWidget() ? 1 : 0);
+  values->SetString(2, stream);
+  values->SetString(3, std::to_string(generation));
+  values->SetString(4, std::to_string(sequence));
+  values->SetInt(5, size.width());
+  values->SetInt(6, size.height());
+  values->SetInt(7, stride);
+  values->SetString(8, std::to_string(timestamp_us));
+  if (kind == 1)
+    values->SetBinary(9, CefBinaryValue::Create(pixels, bytes));
+  values->SetString(10, error);
+  auto browser = browser_impl_;
+  auto frame = browser->GetMainFrame();
+  auto weak_this = weak_ptr_factory_.GetWeakPtr();
+  browser->client()->OnProcessMessageReceived(browser, frame, PID_BROWSER, message);
+  if (!weak_this)
+    return;
+  if (kind == 1 && hold_resize_ &&
+      size == gfx::ScaleToCeiledSize(GetViewBounds().size(), cached_scale_factor_))
+    ReleaseResizeHold();
+}
+
 void CefRenderWidgetHostViewOSR::OnPaint(const gfx::Rect& damage_rect,
                                          const gfx::Size& pixel_size,
                                          const void* pixels) {
   TRACE_EVENT0("cef", "CefRenderWidgetHostViewOSR::OnPaint");
+  CHECK(!base::CommandLine::ForCurrentProcess()->HasSwitch("reach-video-sink"));
 
   // Workaround for issue #2817.
   if (!is_showing_) {
@@ -1761,6 +1809,7 @@ void CefRenderWidgetHostViewOSR::OnAcceleratedPaint(
     const gfx::Size& pixel_size,
     const CefAcceleratedPaintInfo& info) {
   TRACE_EVENT0("cef", "CefRenderWidgetHostViewOSR::OnAcceleratedPaint");
+  CHECK(!base::CommandLine::ForCurrentProcess()->HasSwitch("reach-video-sink"));
 
   // Workaround for https://github.com/chromiumembedded/cef/issues/2817
   if (!is_showing_) {
@@ -2004,7 +2053,10 @@ void CefRenderWidgetHostViewOSR::RemoveGuestHostView(
 
 void CefRenderWidgetHostViewOSR::InvalidateInternal(
     const gfx::Rect& bounds_in_pixels) {
-  if (video_consumer_) {
+  if (base::CommandLine::ForCurrentProcess()->HasSwitch("reach-video-sink")) {
+    if (compositor_)
+      compositor_->ScheduleFullRedraw();
+  } else if (video_consumer_) {
     video_consumer_->RequestRefreshFrame(bounds_in_pixels);
   } else if (host_display_client_) {
     OnPaint(bounds_in_pixels, host_display_client_->GetPixelSize(),
