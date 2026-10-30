@@ -1615,9 +1615,13 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
             "support";
         return result;
       }
-      if (url.IsEmpty())
+      // A painted video without a source (e.g. lazily loaded) still needs its
+      // state so the client can match the marker; it has no resource to route.
+      // Unpainted audio without a source has nothing to replay.
+      if (url.IsEmpty() && !media->IsHTMLVideoElement())
         continue;
-      if (web_frame->Parent() || tree_frame != frame.Get()) {
+      if (!url.IsEmpty() &&
+          (web_frame->Parent() || tree_frame != frame.Get())) {
         result.error =
             "Child-frame media requires frame-scoped resource routing";
         return result;
