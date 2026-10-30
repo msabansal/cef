@@ -19,6 +19,7 @@
 #include "base/trace_event/trace_event.h"
 #include "cc/base/switches.h"
 #include "cef/libcef/browser/alloy/alloy_browser_host_impl.h"
+#include "cef/libcef/browser/native/cursor_util.h"
 #include "cef/libcef/browser/osr/osr_util.h"
 #include "cef/libcef/browser/osr/synthetic_gesture_target_osr.h"
 #include "cef/libcef/browser/osr/touch_selection_controller_client_osr.h"
@@ -689,7 +690,15 @@ void CefRenderWidgetHostViewOSR::InitAsPopup(
   ShowWithVisibility(content::PageVisibilityState::kVisible);
 }
 
-void CefRenderWidgetHostViewOSR::UpdateCursor(const ui::Cursor& cursor) {}
+void CefRenderWidgetHostViewOSR::UpdateCursor(const ui::Cursor& cursor) {
+  cursor_manager_->UpdateCursor(this, cursor);
+}
+
+void CefRenderWidgetHostViewOSR::DisplayCursor(const ui::Cursor& cursor) {
+  if (browser_impl_) {
+    cursor_util::OnCursorChange(browser_impl_.get(), cursor);
+  }
+}
 
 input::CursorManager* CefRenderWidgetHostViewOSR::GetCursorManager() {
   return cursor_manager_.get();

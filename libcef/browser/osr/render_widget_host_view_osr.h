@@ -169,6 +169,7 @@ class CefRenderWidgetHostViewOSR
                    const gfx::Rect& bounds,
                    const gfx::Rect& anchor_rect) override;
   void UpdateCursor(const ui::Cursor& cursor) override;
+  void DisplayCursor(const ui::Cursor& cursor) override;
   void SetIsLoading(bool is_loading) override;
   void RenderProcessGone() override;
   void DestroyImpl() override;

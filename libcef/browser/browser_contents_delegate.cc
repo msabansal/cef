@@ -61,7 +61,10 @@ class CefWidgetHostInterceptor
 
   // WidgetHostInterceptorForTesting method:
   void SetCursor(const ui::Cursor& cursor) override {
-    if (cursor_util::OnCursorChange(browser_, cursor)) {
+    // OSR reports the effective cursor from its root CursorManager, including
+    // cached cursors restored when the pointer crosses process boundaries.
+    if (!browser_->GetHost()->IsWindowRenderingDisabled() &&
+        cursor_util::OnCursorChange(browser_, cursor)) {
       // Don't change the cursor.
       return;
     }

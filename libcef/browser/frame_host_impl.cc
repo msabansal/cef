@@ -17,7 +17,9 @@
 #include "cef/libcef/common/request_impl.h"
 #include "cef/libcef/common/string_util.h"
 #include "cef/libcef/common/task_runner_impl.h"
+#include "components/input/cursor_manager.h"
 #include "content/browser/renderer_host/frame_tree_node.h"
+#include "content/browser/renderer_host/render_widget_host_view_base.h"
 #include "content/public/browser/navigation_controller.h"
 #include "content/public/browser/render_process_host.h"
 #include "content/public/browser/render_view_host.h"
@@ -296,6 +298,22 @@ void CefFrameHostImpl::SendProcessMessage(
       response.Append(0);
       SendMessage("Reach.DrawingCommands.v1", std::move(response));
       return;
+    }
+    if (name == "Reach.DrawingInput.v1") {
+      auto arguments = message->GetArgumentList();
+      auto input = arguments ? arguments->GetList(2) : nullptr;
+      if (input && input->GetSize() == 7 && input->GetInt(0) == 0) {
+        // Drawing dispatch already resolved the exact live frame. It bypasses
+        // the widget input router, so mirror only its cursor-owner handoff.
+        auto* view = static_cast<content::RenderWidgetHostViewBase*>(
+            render_frame_host_->GetView());
+        if (view) {
+          auto* root = view->GetRootView();
+          if (root && root->GetCursorManager()) {
+            root->GetCursorManager()->UpdateViewUnderCursor(view);
+          }
+        }
+      }
     }
   }
 
