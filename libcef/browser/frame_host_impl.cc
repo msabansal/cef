@@ -19,12 +19,17 @@
 #include "cef/libcef/common/task_runner_impl.h"
 #include "components/input/cursor_manager.h"
 #include "content/browser/renderer_host/frame_tree_node.h"
+#include "content/browser/renderer_host/render_widget_host_impl.h"
 #include "content/browser/renderer_host/render_widget_host_view_base.h"
+#include "content/browser/web_contents/web_contents_impl.h"
 #include "content/public/browser/navigation_controller.h"
 #include "content/public/browser/render_process_host.h"
 #include "content/public/browser/render_view_host.h"
 #include "content/public/browser/web_contents.h"
 #include "services/service_manager/public/cpp/interface_provider.h"
+#include "third_party/blink/public/common/input/web_keyboard_event.h"
+#include "third_party/blink/public/common/input/web_mouse_event.h"
+#include "ui/events/base_event_utils.h"
 
 namespace {
 
@@ -302,9 +307,36 @@ void CefFrameHostImpl::SendProcessMessage(
     if (name == "Reach.DrawingInput.v1") {
       auto arguments = message->GetArgumentList();
       auto input = arguments ? arguments->GetList(2) : nullptr;
+      // Drawing dispatch bypasses the widget input router, so mirror its
+      // user-interaction bookkeeping for key and button presses. Browser
+      // policies such as clipboard paste require recent interaction.
+      const bool key_down = input && input->GetSize() == 6 && input->GetInt(0) == 0;
+      const bool mouse_down = input && input->GetSize() == 7 &&
+                              input->GetInt(0) == 2 && input->GetInt(5) == 0;
+      if (key_down || mouse_down) {
+        auto* widget = static_cast<content::RenderWidgetHostImpl*>(
+            render_frame_host_->GetRenderWidgetHost());
+        auto* contents = static_cast<content::WebContentsImpl*>(
+            content::WebContents::FromRenderFrameHost(render_frame_host_));
+        if (widget && contents) {
+          if (key_down) {
+            contents->SimulateUserInteraction(
+                widget, blink::WebKeyboardEvent(
+                            blink::WebInputEvent::Type::kRawKeyDown,
+                            blink::WebInputEvent::kNoModifiers,
+                            ui::EventTimeForNow()));
+          } else {
+            contents->SimulateUserInteraction(
+                widget, blink::WebMouseEvent(
+                            blink::WebInputEvent::Type::kMouseDown,
+                            blink::WebInputEvent::kNoModifiers,
+                            ui::EventTimeForNow()));
+          }
+        }
+      }
       if (input && input->GetSize() == 7 && input->GetInt(0) == 0) {
-        // Drawing dispatch already resolved the exact live frame. It bypasses
-        // the widget input router, so mirror only its cursor-owner handoff.
+        // Drawing dispatch already resolved the exact live frame. Mirror the
+        // router's cursor-owner handoff for pointer moves.
         auto* view = static_cast<content::RenderWidgetHostViewBase*>(
             render_frame_host_->GetView());
         if (view) {
