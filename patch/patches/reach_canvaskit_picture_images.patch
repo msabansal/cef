@@ -1,5 +1,5 @@
 diff --git modules/canvaskit/canvaskit_bindings.cpp modules/canvaskit/canvaskit_bindings.cpp
-index 279ebb8c..fe19d22a 100644
+index 279ebb8c..d1fe64a5 100644
 --- modules/canvaskit/canvaskit_bindings.cpp
 +++ modules/canvaskit/canvaskit_bindings.cpp
 @@ -43,6 +43,8 @@
@@ -19,7 +19,7 @@ index 279ebb8c..fe19d22a 100644
  #include "include/utils/SkShadowUtils.h"
  #include "src/core/SkFloatBits.h"
  #include "src/core/SkPathPriv.h"
-@@ -1213,7 +1216,10 @@ EMSCRIPTEN_BINDINGS(Skia) {
+@@ -1213,7 +1216,11 @@ EMSCRIPTEN_BINDINGS(Skia) {
  
  #ifdef CK_SERIALIZE_SKP
      function("_MakePicture",
@@ -27,11 +27,12 @@ index 279ebb8c..fe19d22a 100644
 +             optional_override([](WASMPointerU8 dPtr, size_t bytes,
 +                                  emscripten::val imageDecoder,
 +                                  emscripten::val mediaDecoder,
-+                                  emscripten::val fontResolver) -> sk_sp<SkPicture> {
++                                  emscripten::val fontResolver,
++                                  emscripten::val pictureResolver) -> sk_sp<SkPicture> {
                   uint8_t* d = reinterpret_cast<uint8_t*>(dPtr);
                   sk_sp<SkData> data = SkData::MakeFromMalloc(d, bytes);
  
-@@ -1226,28 +1232,151 @@ EMSCRIPTEN_BINDINGS(Skia) {
+@@ -1226,28 +1233,181 @@ EMSCRIPTEN_BINDINGS(Skia) {
                   });
  #endif
  
@@ -133,10 +134,40 @@ index 279ebb8c..fe19d22a 100644
  #endif
  
 -                 return SkPicture::MakeFromData(data.get(), &dProcs);
++                 // Nested pictures serialized by key resolve to caller-owned pictures; the
++                 // deserialized picture takes its own reference to each one.
++                 struct PictureContext {
++                     emscripten::val resolver;
++                     bool failed = false;
++                 } pictures{pictureResolver};
++                 if (!pictureResolver.isUndefined() && !pictureResolver.isNull()) {
++                     dProcs.fPictureCtx = &pictures;
++                     dProcs.fPictureProc = [](const void* key, size_t length,
++                                              void* context) -> sk_sp<SkPicture> {
++                         auto* pictures = static_cast<PictureContext*>(context);
++                         if (pictures->failed || !key || length == 0) {
++                             pictures->failed = true;
++                             return nullptr;
++                         }
++                         auto copy = emscripten::val::global("Uint8Array").new_(
++                             emscripten::val(emscripten::typed_memory_view(
++                                 length, static_cast<const uint8_t*>(key))));
++                         auto resolved = pictures->resolver(copy);
++                         if (resolved.isNull() || resolved.isUndefined() ||
++                             !resolved.instanceof(emscripten::val::module_property("Picture")) ||
++                             resolved.call<bool>("isDeleted")) {
++                             pictures->failed = true;
++                             return nullptr;
++                         }
++                         return resolved.as<sk_sp<SkPicture>>();
++                     };
++                 }
++
 +                 auto picture = SkPicture::MakeFromData(data.get(), &dProcs);
 +#ifndef CK_NO_FONTS
 +                 if (fonts.failed) return nullptr;
 +#endif
++                 if (pictures.failed) return nullptr;
 +                 if (images.failed || !picture || mediaDecoder.isUndefined()) {
 +                     return images.failed ? nullptr : picture;
 +                 }
@@ -191,22 +222,25 @@ index 279ebb8c..fe19d22a 100644
               allow_raw_pointers());
  #endif
 diff --git modules/canvaskit/skp.js modules/canvaskit/skp.js
-index 9248d763..8b2eee93 100644
+index 9248d763..76a8b29a 100644
 --- modules/canvaskit/skp.js
 +++ modules/canvaskit/skp.js
-@@ -1,17 +1,29 @@
+@@ -1,17 +1,35 @@
  CanvasKit._extraInitializations = CanvasKit._extraInitializations || [];
  CanvasKit._extraInitializations.push(function() {
    // data is a TypedArray or ArrayBuffer e.g. from fetch().then(resp.arrayBuffer())
 -  CanvasKit.MakePicture = function(data) {
-+  CanvasKit.MakePicture = function(data, imageDecoder, mediaDecoder, fontResolver) {
++  // pictureResolver(key: Uint8Array) returns a caller-owned Picture (or null to
++  // fail deserialization) for nested pictures serialized by key.
++  CanvasKit.MakePicture = function(data, imageDecoder, mediaDecoder, fontResolver, pictureResolver) {
      data = new Uint8Array(data);
  
      var iptr = CanvasKit._malloc(data.byteLength);
      CanvasKit.HEAPU8.set(data, iptr);
      // The skp takes ownership of the malloc'd data.
 -    var pic = CanvasKit._MakePicture(iptr, data.byteLength);
-+    var pic = CanvasKit._MakePicture(iptr, data.byteLength, imageDecoder, mediaDecoder, fontResolver);
++    var pic = CanvasKit._MakePicture(iptr, data.byteLength, imageDecoder, mediaDecoder, fontResolver,
++                                     pictureResolver);
      if (!pic) {
        Debug('Could not decode picture');
        return null;
@@ -219,16 +253,19 @@ index 9248d763..8b2eee93 100644
 +  CanvasKit['MakePictureWithMedia'] = function(data, imageDecoder, mediaDecoder) {
 +    return CanvasKit.MakePicture(data, imageDecoder, mediaDecoder);
 +  };
-+  CanvasKit['MakePictureWithResources'] = function(data, imageDecoder, mediaDecoder, fontResolver) {
-+    if (typeof imageDecoder !== 'function' || typeof fontResolver !== 'function') {
++  CanvasKit['MakePictureWithResources'] = function(data, imageDecoder, mediaDecoder, fontResolver,
++                                                   pictureResolver) {
++    if (typeof imageDecoder !== 'function' || typeof fontResolver !== 'function' ||
++        (pictureResolver != null && typeof pictureResolver !== 'function')) {
 +      return null;
 +    }
-+    return CanvasKit.MakePicture(data, imageDecoder, mediaDecoder, fontResolver);
++    return CanvasKit.MakePicture(data, imageDecoder, mediaDecoder, fontResolver, pictureResolver);
 +  };
++  CanvasKit['SupportsPictureResolver'] = true;
  });
 diff --git src/core/SkReachResource.h src/core/SkReachResource.h
 new file mode 100644
-index 00000000..3e386661
+index 00000000..b144d2c1
 --- /dev/null
 +++ src/core/SkReachResource.h
 @@ -0,0 +1,92 @@

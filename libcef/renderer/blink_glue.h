@@ -49,6 +49,11 @@ struct CefDrawingCommands {
   std::vector<uint8_t> picture;
   // Keys are "image:" or "font:" followed by the raw original-byte SHA256.
   std::map<std::string, std::vector<uint8_t>> resources;
+  // Incremental captures only: |picture| is the skeleton, |refs| holds
+  // [key 16][hash 32] per referenced chunk and |chunks| holds
+  // [key 16][length u32 LE][SKP] for chunks absent from the known set.
+  std::vector<uint8_t> refs;
+  std::vector<uint8_t> chunks;
   int width = 0;
   int height = 0;
 };
@@ -62,6 +67,16 @@ CaptureDrawingCommands(
     const std::map<std::string, std::vector<uint8_t>>& children = {},
     const std::map<std::string, std::vector<uint8_t>>& resources = {},
     const std::function<void(const std::string&, const void*, size_t)>& sink = {});
+
+// Root frame only. |known| is the client's chunk cache as concatenated
+// [key 16][hash 32] entries; an empty set requests a keyframe.
+BLINK_EXPORT CefDrawingCommands CaptureIncrementalDrawingCommands(
+    blink::WebLocalFrame* frame,
+    const std::string& document,
+    const std::map<std::string, std::vector<uint8_t>>& children,
+    const std::map<std::string, std::vector<uint8_t>>& resources,
+    const std::vector<uint8_t>& known,
+    const std::function<void(const std::string&, const void*, size_t)>& sink);
 
 BLINK_EXPORT CefDrawingCommands
 CaptureRasterFallback(

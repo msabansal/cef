@@ -899,7 +899,10 @@ void CefFrameImpl::SendMessage(const std::string& name,
     auto response = CefProcessMessage::Create("Reach.DrawingCommands.v1");
     auto values = response->GetArgumentList();
     blink_glue::CefDrawingCommands capture;
-    const bool valid = (arguments.size() == 5 || arguments.size() == 6) &&
+    // Optional argument 6 requests an incremental root-frame picture. It is
+    // the known chunk set: null when empty, else [key 16][hash 32] entries.
+    const bool incremental = arguments.size() == 7;
+    const bool valid = arguments.size() >= 5 && arguments.size() <= 7 &&
         arguments[0].is_int() && arguments[0].GetInt() > 0 &&
         arguments[1].is_bool() && arguments[2].is_string() &&
         arguments[2].GetString().size() <= 128 &&
@@ -907,12 +910,21 @@ void CefFrameImpl::SendMessage(const std::string& name,
         arguments[4].is_dict() &&
         (arguments.size() == 5 ||
          (arguments[5].is_int() && arguments[5].GetInt() >= 0 &&
-          arguments[5].GetInt() <= 2));
-    const int mode = valid && arguments.size() == 6
+          arguments[5].GetInt() <= 2)) &&
+        (!incremental ||
+         (!arguments[1].GetBool() && !arguments[2].GetString().empty() &&
+          arguments[5].GetInt() <= 1 &&
+          (arguments[6].is_none() ||
+           (arguments[6].is_blob() && !arguments[6].GetBlob().empty() &&
+            arguments[6].GetBlob().size() % 48 == 0 &&
+            arguments[6].GetBlob().size() <= 4096 * 48))));
+    const int mode = valid && arguments.size() >= 6
         ? arguments[5].GetInt() : 0;
     values->SetInt(0, valid ? arguments[0].GetInt() : 0);
     if (!valid || !frame_) {
       capture.error = "Invalid or detached drawing-frame request";
+    } else if (incremental && frame_->Parent()) {
+      capture.error = "Incremental drawing requires the root frame";
     } else if (arguments[1].GetBool()) {
       capture = blink_glue::GetDrawingFrameInfo(frame_, mode == 2);
     } else {
@@ -956,8 +968,17 @@ void CefFrameImpl::SendMessage(const std::string& name,
               SendProcessMessage(PID_BROWSER, event);
             };
           }
-          capture = blink_glue::CaptureDrawingCommands(
-              frame_, arguments[2].GetString(), children, resources, sink);
+          if (incremental) {
+            static const std::vector<uint8_t> kNoKnownChunks;
+            capture = blink_glue::CaptureIncrementalDrawingCommands(
+                frame_, arguments[2].GetString(), children, resources,
+                arguments[6].is_blob() ? arguments[6].GetBlob()
+                                       : kNoKnownChunks,
+                sink);
+          } else {
+            capture = blink_glue::CaptureDrawingCommands(
+                frame_, arguments[2].GetString(), children, resources, sink);
+          }
         }
       }
     }
@@ -974,6 +995,17 @@ void CefFrameImpl::SendMessage(const std::string& name,
         for (const auto& [key, bytes] : capture.resources)
           resources->SetBinary(key, CefBinaryValue::Create(bytes.data(), bytes.size()));
         values->SetDictionary(5, resources);
+        if (incremental) {
+          // CEF binary values cannot be empty; null encodes an empty list.
+          for (const auto& [index, bytes] :
+               {std::pair{6, &capture.refs}, std::pair{7, &capture.chunks}}) {
+            if (bytes->empty())
+              values->SetNull(index);
+            else
+              values->SetBinary(index, CefBinaryValue::Create(
+                  bytes->data(), bytes->size()));
+          }
+        }
       }
     }
     SendProcessMessage(PID_BROWSER, response);

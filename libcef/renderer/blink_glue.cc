@@ -5,9 +5,11 @@
 
 #include "cef/libcef/renderer/blink_glue.h"
 
+#include <array>
 #include <cmath>
 #include <map>
 #include <set>
+#include <tuple>
 
 #include "base/functional/bind.h"
 #include "base/functional/callback_helpers.h"
@@ -17,6 +19,7 @@
 #include "base/values.h"
 #include "cc/paint/paint_filter.h"
 #include "cc/paint/paint_op.h"
+#include "cc/paint/paint_op_buffer.h"
 #include "cc/paint/paint_op_buffer_iterator.h"
 #include "cc/paint/paint_record.h"
 #include "cc/paint/paint_recorder.h"
@@ -76,8 +79,13 @@
 #include "third_party/blink/renderer/platform/bindings/script_forbidden_scope.h"
 #include "third_party/blink/renderer/platform/bindings/v8_binding.h"
 #include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
+#include "third_party/blink/renderer/platform/graphics/compositing/paint_chunks_to_cc_layer.h"
 #include "third_party/blink/renderer/platform/graphics/paint/cull_rect.h"
+#include "third_party/blink/renderer/platform/graphics/paint/paint_artifact.h"
+#include "third_party/blink/renderer/platform/graphics/paint/paint_chunk.h"
+#include "third_party/blink/renderer/platform/graphics/paint/paint_chunk_subset.h"
 #include "third_party/blink/renderer/platform/graphics/paint/paint_record_builder.h"
+#include "third_party/blink/renderer/platform/graphics/paint/property_tree_state.h"
 #include "third_party/blink/renderer/platform/heap/persistent.h"
 #include "third_party/blink/renderer/platform/loader/fetch/resource_response.h"
 #include "third_party/blink/renderer/platform/loader/fetch/script_fetch_options.h"
@@ -98,6 +106,7 @@
 #include "ui/events/keycodes/dom/dom_key.h"
 #include "ui/events/keycodes/dom/keycode_converter.h"
 #include "ui/events/keycodes/keyboard_code_conversion.h"
+#include "ui/gfx/geometry/skia_conversions.h"
 #undef LOG
 
 #include "base/logging.h"
@@ -1153,11 +1162,287 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame,
   return result;
 }
 
-CefDrawingCommands CaptureDrawingCommands(
+namespace {
+
+constexpr size_t kChunkKeyBytes = 16;
+constexpr size_t kChunkRefBytes = 48;
+constexpr size_t kMaxChunkRefs = 4096;
+
+using ChunkKey = std::array<uint8_t, kChunkKeyBytes>;
+using ChunkHash = std::array<uint8_t, 32>;
+
+void AppendLE(std::vector<uint8_t>* out, uint64_t value, size_t bytes) {
+  for (size_t i = 0; i < bytes; ++i)
+    out->push_back(static_cast<uint8_t>(value >> (8 * i)));
+}
+
+// First 16 bytes of SHA-256 over [client_id u64][type u32][fragment u32]
+// (little endian). A repeated id in one artifact appends its occurrence u32.
+ChunkKey MakeChunkKey(const blink::PaintChunk::Id& id, uint32_t occurrence) {
+  std::vector<uint8_t> input;
+  AppendLE(&input, static_cast<uint64_t>(id.client_id), 8);
+  AppendLE(&input, static_cast<uint32_t>(id.type), 4);
+  AppendLE(&input, static_cast<uint32_t>(id.fragment), 4);
+  if (occurrence)
+    AppendLE(&input, occurrence, 4);
+  const auto digest = crypto::hash::Sha256(input);
+  ChunkKey key;
+  std::copy_n(digest.begin(), key.size(), key.begin());
+  return key;
+}
+
+struct SkeletonSerialization {
+  std::map<const SkPicture*, size_t> placeholders;
+  const std::vector<ChunkKey>* keys = nullptr;
+  std::vector<size_t> referenced;
+  std::set<size_t> seen;
+};
+
+SkSerialReturnType SerializeChunkReference(SkPicture* picture, void* context) {
+  auto* skeleton = static_cast<SkeletonSerialization*>(context);
+  const auto found = skeleton->placeholders.find(picture);
+  if (found == skeleton->placeholders.end())
+    return nullptr;
+  if (skeleton->seen.insert(found->second).second)
+    skeleton->referenced.push_back(found->second);
+  const auto& key = (*skeleton->keys)[found->second];
+  return SkData::MakeWithCopy(key.data(), key.size());
+}
+
+// The skeleton is the normal lifecycle conversion of the local root's paint
+// artifact, with each kept chunk's drawings replaced by a placeholder picture
+// that serializes as its 16-byte key. Chunks are culled as a whole against the
+// viewport expanded by one viewport height above and below.
+CefDrawingCommands CaptureIncrementalPicture(
+    blink::LocalFrame* frame, const gfx::Rect& bounds,
+    const std::set<uint32_t>& frame_ids,
+    const std::map<uint32_t, sk_sp<SkPicture>>& frame_pictures,
+    const std::map<uint32_t, sk_sp<SkData>>& media_states,
+    const std::vector<uint8_t>& known_bytes,
+    const std::function<void(const std::string&, const void*, size_t)>& sink) {
+  CefDrawingCommands result;
+  if (known_bytes.size() % kChunkRefBytes ||
+      known_bytes.size() / kChunkRefBytes > kMaxChunkRefs) {
+    result.error = "Invalid known paint chunk set";
+    return result;
+  }
+  std::map<ChunkKey, ChunkHash> known;
+  for (size_t offset = 0; offset < known_bytes.size();
+       offset += kChunkRefBytes) {
+    ChunkKey key;
+    ChunkHash hash;
+    std::copy_n(known_bytes.begin() + offset, key.size(), key.begin());
+    std::copy_n(known_bytes.begin() + offset + key.size(), hash.size(),
+                hash.begin());
+    if (!known.emplace(key, hash).second) {
+      result.error = "Duplicate known paint chunk key";
+      return result;
+    }
+  }
+  if (!frame->IsAttached() || !frame->View() || !frame->GetDocument() ||
+      frame->GetDocument()->Lifecycle().GetState() !=
+          blink::DocumentLifecycle::kPaintClean) {
+    result.error = "Frame is not paint-clean for incremental capture";
+    return result;
+  }
+  struct Chunk {
+    ChunkKey key;
+    cc::PaintRecord record;
+    SkRect bounds;
+  };
+  std::vector<Chunk> chunks;
+  std::map<std::tuple<uint64_t, uint32_t, uint32_t>, uint32_t> occurrences;
+  bool overflow = false;
+  const gfx::Rect cull(0, -bounds.height(), bounds.width(),
+                       3 * bounds.height());
+  auto skeleton_record = blink::PaintChunksToCcLayer::Convert(
+      blink::PaintChunkSubset(frame->View()->GetPaintArtifact()),
+      blink::PropertyTreeState::Root(), &cull,
+      [&](const blink::PaintChunk& chunk, cc::PaintRecord items) {
+        if (chunks.size() >= kMaxChunkRefs) {
+          overflow = true;
+          return cc::PaintRecord();
+        }
+        const auto occurrence = occurrences[{
+            static_cast<uint64_t>(chunk.id.client_id),
+            static_cast<uint32_t>(chunk.id.type), chunk.id.fragment}]++;
+        cc::PaintOpBuffer marker;
+        marker.push<cc::CustomDataOp>(static_cast<uint32_t>(chunks.size()));
+        chunks.push_back({MakeChunkKey(chunk.id, occurrence), std::move(items),
+                          gfx::RectToSkRect(chunk.drawable_bounds)});
+        return marker.ReleaseAsRecord();
+      });
+  if (overflow) {
+    result.error = "Paint chunk reference budget exceeded";
+    return result;
+  }
+  PaintSerialization state;
+  state.sink = sink;
+  // The skeleton holds only property-state operations and chunk markers.
+  state.collect_paint_ids = true;
+  if (!CheckPaintRecord(&state, skeleton_record, 0)) {
+    result.error = state.error;
+    return result;
+  }
+  for (const auto id : state.media_ids) {
+    if (id >= chunks.size()) {
+      result.error = "Unknown paint chunk marker";
+      return result;
+    }
+  }
+  state.collect_paint_ids = false;
+  state.media_ids = frame_ids;
+  for (const auto& [id, picture] : frame_pictures)
+    state.media_ids.insert(id);
+  for (const auto& [id, data] : media_states)
+    state.media_ids.insert(id);
+  for (const auto& chunk : chunks) {
+    if (!CheckPaintRecord(&state, chunk.record, 0)) {
+      result.error = state.error;
+      return result;
+    }
+  }
+  std::vector<ChunkKey> keys;
+  std::vector<sk_sp<SkPicture>> placeholders;
+  SkeletonSerialization skeleton;
+  skeleton.keys = &keys;
+  for (const auto& chunk : chunks) {
+    keys.push_back(chunk.key);
+    placeholders.push_back(SkPicture::MakePlaceholder(chunk.bounds));
+    skeleton.placeholders.emplace(placeholders.back().get(),
+                                  placeholders.size() - 1);
+  }
+  cc::PlaybackCallbacks skeleton_callbacks;
+  skeleton_callbacks.custom_callback = base::BindRepeating(
+      [](const std::vector<sk_sp<SkPicture>>* placeholders,
+         PaintSerialization* state, SkCanvas* canvas, uint32_t id) {
+        if (id >= placeholders->size()) {
+          state->error = "Unknown paint chunk marker";
+          return;
+        }
+        canvas->drawPicture((*placeholders)[id]);
+      }, base::Unretained(&placeholders), base::Unretained(&state));
+  auto picture = skeleton_record.ToSkPicture(
+      SkRect::MakeWH(bounds.width(), bounds.height()), nullptr,
+      skeleton_callbacks);
+  if (!state.error.empty() || !picture) {
+    result.error =
+        state.error.empty() ? "Skia skeleton recording failed" : state.error;
+    return result;
+  }
+  SkPictureRecorder media_recorder;
+  auto* media_canvas = media_recorder.beginRecording(picture->cullRect());
+  for (const auto& [id, data] : media_states) {
+    media_canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.MediaState.v1",
+                                 data.get());
+  }
+  // Replaying into a recorder keeps placeholder references intact.
+  picture->playback(media_canvas);
+  picture = media_recorder.finishRecordingAsPicture();
+  SkSerialProcs procs;
+  procs.fImageProc = &SerializeOriginalImage;
+  procs.fImageCtx = &state;
+  procs.fTypefaceProc = &SerializeOriginalTypeface;
+  procs.fTypefaceCtx = &state;
+  procs.fPictureProc = &SerializeChunkReference;
+  procs.fPictureCtx = &skeleton;
+  BoundedPaintStream skeleton_stream(kMaxPictureBytes);
+  picture->serialize(&skeleton_stream, &procs);
+  if (!state.error.empty() || skeleton_stream.failed()) {
+    result.error = state.error.empty() ? "Serialized skeleton budget exceeded"
+                                       : state.error;
+    return result;
+  }
+  result.picture = skeleton_stream.TakeBytes();
+  if (result.picture.empty()) {
+    result.error = "Skia produced an empty skeleton";
+    return result;
+  }
+  // Chunk pictures compose child frames and media markers like the full
+  // picture. Child frames outside the capture viewport have no picture; they
+  // are omitted, and their chunk changes once they become visible.
+  cc::PlaybackCallbacks chunk_callbacks;
+  chunk_callbacks.custom_callback = base::BindRepeating(
+      [](const std::map<uint32_t, sk_sp<SkData>>* states,
+         const std::map<uint32_t, sk_sp<SkPicture>>* frames,
+         const std::set<uint32_t>* frame_ids, PaintSerialization* state,
+         SkCanvas* canvas, uint32_t id) {
+        const auto child = frames->find(id);
+        if (child != frames->end()) {
+          SkAutoCanvasRestore restore(canvas, true);
+          const auto bounds = child->second->cullRect();
+          canvas->scale(1 / bounds.width(), 1 / bounds.height());
+          child->second->playback(canvas);
+          return;
+        }
+        if (frame_ids->contains(id))
+          return;
+        if (!states->contains(id)) {
+          state->error = "Unknown media paint identity";
+          return;
+        }
+        const auto text = base::NumberToString(id);
+        auto data = SkData::MakeWithCopy(text.data(), text.size());
+        canvas->drawAnnotation(SkRect::MakeWH(1, 1), "Reach.Video.v1",
+                               data.get());
+      }, base::Unretained(&media_states), base::Unretained(&frame_pictures),
+      base::Unretained(&frame_ids), base::Unretained(&state));
+  SkSerialProcs chunk_procs;
+  chunk_procs.fImageProc = &SerializeOriginalImage;
+  chunk_procs.fImageCtx = &state;
+  chunk_procs.fTypefaceProc = &SerializeOriginalTypeface;
+  chunk_procs.fTypefaceCtx = &state;
+  size_t new_bytes = 0;
+  for (const auto index : skeleton.referenced) {
+    const auto& chunk = chunks[index];
+    auto chunk_picture =
+        chunk.record.ToSkPicture(chunk.bounds, nullptr, chunk_callbacks);
+    if (!state.error.empty() || !chunk_picture) {
+      result.error =
+          state.error.empty() ? "Skia chunk recording failed" : state.error;
+      return result;
+    }
+    BoundedPaintStream stream(kMaxPictureBytes);
+    chunk_picture->serialize(&stream, &chunk_procs);
+    if (!state.error.empty() || stream.failed() || !stream.bytesWritten()) {
+      result.error = state.error.empty() ? "Serialized chunk budget exceeded"
+                                         : state.error;
+      return result;
+    }
+    auto bytes = stream.TakeBytes();
+    const auto hash = crypto::hash::Sha256(bytes);
+    result.refs.insert(result.refs.end(), chunk.key.begin(), chunk.key.end());
+    result.refs.insert(result.refs.end(), hash.begin(), hash.end());
+    const auto found = known.find(chunk.key);
+    if (found != known.end() && found->second == hash)
+      continue;
+    new_bytes += bytes.size();
+    if (new_bytes > kMaxPaintBytes) {
+      result.error = "Aggregate new paint chunk budget exceeded";
+      return result;
+    }
+    result.chunks.insert(result.chunks.end(), chunk.key.begin(),
+                         chunk.key.end());
+    AppendLE(&result.chunks, bytes.size(), 4);
+    result.chunks.insert(result.chunks.end(), bytes.begin(), bytes.end());
+  }
+  if (result.picture.size() + new_bytes + state.bytes + state.font_bytes +
+          state.identity_bytes > kMaxPaintBytes) {
+    result.error = "Aggregate picture and original resource budget exceeded";
+    return result;
+  }
+  result.resources = std::move(state.originals);
+  result.width = bounds.width();
+  result.height = bounds.height();
+  return result;
+}
+
+CefDrawingCommands CaptureDrawingCommandsImpl(
     blink::WebLocalFrame* web_frame, const std::string& expected_document,
     const std::map<std::string, std::vector<uint8_t>>& children,
     const std::map<std::string, std::vector<uint8_t>>& resources,
-    const std::function<void(const std::string&, const void*, size_t)>& sink) {
+    const std::function<void(const std::string&, const void*, size_t)>& sink,
+    const std::vector<uint8_t>* known) {
   CefDrawingCommands result;
   blink::Persistent<blink::LocalFrame> frame =
       blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
@@ -1246,6 +1531,7 @@ CefDrawingCommands CaptureDrawingCommands(
   OriginalTypefaceCache frame_fonts;
   frame_fonts.originals = &resources;
   std::map<uint32_t, sk_sp<SkPicture>> frame_pictures;
+  std::set<uint32_t> frame_ids;
   for (blink::Frame* tree_frame = frame.Get(); tree_frame;
        tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
     if (!IsInlinePaintFrame(frame.Get(), tree_frame)) {
@@ -1259,6 +1545,8 @@ CefDrawingCommands CaptureDrawingCommands(
       auto* node = object->GetNode();
       if (object->IsLayoutEmbeddedContent()) {
         auto* owner = blink::DynamicTo<blink::HTMLFrameOwnerElement>(node);
+        if (owner)
+          frame_ids.insert(owner->GetDomNodeId());
         if (!owner || !dependencies.media_ids.contains(owner->GetDomNodeId()))
           continue;
         auto* child = owner ? owner->ContentFrame() : nullptr;
@@ -1356,6 +1644,11 @@ CefDrawingCommands CaptureDrawingCommands(
                            SkData::MakeWithCopy(json->data(), json->size()));
     }
   }
+  if (known) {
+    return CaptureIncrementalPicture(frame.Get(), bounds, frame_ids,
+                                     frame_pictures, media_states, *known,
+                                     sink);
+  }
   PaintSerialization state;
   state.sink = sink;
   state.media_ids = dependencies.culled_paint_ids;
@@ -1442,6 +1735,32 @@ CefDrawingCommands CaptureDrawingCommands(
   result.width = bounds.width();
   result.height = bounds.height();
   return result;
+}
+
+}  // namespace
+
+CefDrawingCommands CaptureDrawingCommands(
+    blink::WebLocalFrame* web_frame, const std::string& expected_document,
+    const std::map<std::string, std::vector<uint8_t>>& children,
+    const std::map<std::string, std::vector<uint8_t>>& resources,
+    const std::function<void(const std::string&, const void*, size_t)>& sink) {
+  return CaptureDrawingCommandsImpl(web_frame, expected_document, children,
+                                    resources, sink, nullptr);
+}
+
+CefDrawingCommands CaptureIncrementalDrawingCommands(
+    blink::WebLocalFrame* web_frame, const std::string& expected_document,
+    const std::map<std::string, std::vector<uint8_t>>& children,
+    const std::map<std::string, std::vector<uint8_t>>& resources,
+    const std::vector<uint8_t>& known,
+    const std::function<void(const std::string&, const void*, size_t)>& sink) {
+  if (web_frame->Parent()) {
+    CefDrawingCommands result;
+    result.error = "Incremental capture requires the root frame";
+    return result;
+  }
+  return CaptureDrawingCommandsImpl(web_frame, expected_document, children,
+                                    resources, sink, &known);
 }
 
 CefDrawingCommands CaptureRasterFallback(
