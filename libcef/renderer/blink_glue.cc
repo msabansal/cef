@@ -1291,6 +1291,48 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame,
 
 namespace {
 
+// Opt-in (REACH_DRAWING_TIMING=1, inherited by renderers) per-stage timing of
+// drawing-command captures. Main thread only.
+class CaptureTimer {
+ public:
+  static CaptureTimer& Get() {
+    static base::NoDestructor<CaptureTimer> timer;
+    return *timer;
+  }
+  void Start() {
+    if (!Enabled()) return;
+    start_ = last_ = base::TimeTicks::Now();
+    stages_.clear();
+  }
+  void Mark(const char* stage) {
+    if (start_.is_null()) return;
+    const auto now = base::TimeTicks::Now();
+    stages_ += std::string(" ") + stage + "=" +
+               base::NumberToString((now - last_).InMilliseconds());
+    last_ = now;
+  }
+  void Finish(const std::string& detail) {
+    if (start_.is_null()) return;
+    const std::string line = "reach drawing timing:" + stages_ + " total=" +
+        base::NumberToString((base::TimeTicks::Now() - start_).InMilliseconds()) +
+        " " + detail + "\n";
+    fputs(line.c_str(), stderr);
+    start_ = base::TimeTicks();
+  }
+
+ private:
+  static bool Enabled() {
+    static const bool enabled = [] {
+      const char* value = getenv("REACH_DRAWING_TIMING");
+      return value && std::string_view(value) == "1";
+    }();
+    return enabled;
+  }
+  base::TimeTicks start_;
+  base::TimeTicks last_;
+  std::string stages_;
+};
+
 constexpr size_t kChunkKeyBytes = 16;
 constexpr size_t kChunkRefBytes = 48;
 constexpr size_t kMaxChunkRefs = 4096;
@@ -1400,6 +1442,7 @@ CefDrawingCommands CaptureIncrementalPicture(
                           gfx::RectToSkRect(chunk.drawable_bounds)});
         return marker.ReleaseAsRecord();
       });
+  CaptureTimer::Get().Mark("convert");
   if (overflow) {
     result.error = "Paint chunk reference budget exceeded";
     return result;
@@ -1477,6 +1520,7 @@ CefDrawingCommands CaptureIncrementalPicture(
   procs.fPictureCtx = &skeleton;
   BoundedPaintStream skeleton_stream(kMaxPictureBytes);
   picture->serialize(&skeleton_stream, &procs);
+  CaptureTimer::Get().Mark("skeleton");
   if (!state.error.empty() || skeleton_stream.failed()) {
     result.error = state.error.empty() ? "Serialized skeleton budget exceeded"
                                        : state.error;
@@ -1522,24 +1566,33 @@ CefDrawingCommands CaptureIncrementalPicture(
   chunk_procs.fTypefaceProc = &SerializeOriginalTypeface;
   chunk_procs.fTypefaceCtx = &state;
   size_t new_bytes = 0;
+  size_t all_bytes = 0;
+  base::TimeDelta recording, serializing, hashing;
   for (const auto index : skeleton.referenced) {
     const auto& chunk = chunks[index];
+    auto mark = base::TimeTicks::Now();
     auto chunk_picture =
         chunk.record.ToSkPicture(chunk.bounds, nullptr, chunk_callbacks);
+    recording += base::TimeTicks::Now() - mark;
     if (!state.error.empty() || !chunk_picture) {
       result.error =
           state.error.empty() ? "Skia chunk recording failed" : state.error;
       return result;
     }
     BoundedPaintStream stream(kMaxPictureBytes);
+    mark = base::TimeTicks::Now();
     chunk_picture->serialize(&stream, &chunk_procs);
+    serializing += base::TimeTicks::Now() - mark;
     if (!state.error.empty() || stream.failed() || !stream.bytesWritten()) {
       result.error = state.error.empty() ? "Serialized chunk budget exceeded"
                                          : state.error;
       return result;
     }
     auto bytes = stream.TakeBytes();
+    all_bytes += bytes.size();
+    mark = base::TimeTicks::Now();
     const auto hash = crypto::hash::Sha256(bytes);
+    hashing += base::TimeTicks::Now() - mark;
     result.refs.insert(result.refs.end(), chunk.key.begin(), chunk.key.end());
     result.refs.insert(result.refs.end(), hash.begin(), hash.end());
     const auto found = known.find(chunk.key);
@@ -1555,6 +1608,14 @@ CefDrawingCommands CaptureIncrementalPicture(
     AppendLE(&result.chunks, bytes.size(), 4);
     result.chunks.insert(result.chunks.end(), bytes.begin(), bytes.end());
   }
+  CaptureTimer::Get().Mark("chunks");
+  CaptureTimer::Get().Finish("chunks=" + base::NumberToString(chunks.size()) +
+                             " referenced=" + base::NumberToString(skeleton.referenced.size()) +
+                             " new_bytes=" + base::NumberToString(new_bytes) +
+                             " all_bytes=" + base::NumberToString(all_bytes) +
+                             " record=" + base::NumberToString(recording.InMilliseconds()) +
+                             " serialize=" + base::NumberToString(serializing.InMilliseconds()) +
+                             " hash=" + base::NumberToString(hashing.InMilliseconds()));
   if (result.picture.size() + new_bytes + state.bytes + state.font_bytes +
           state.identity_bytes > kMaxPaintBytes) {
     result.error = "Aggregate picture and original resource budget exceeded";
@@ -1591,12 +1652,14 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   // Visual update requests made from here on (including by this capture's own
   // animation and lifecycle steps) are reported again for the next capture.
   RequestedFrameRoots().erase(&frame->LocalFrameRoot());
+  CaptureTimer::Get().Start();
   // Held begin frames also suppress the compositor's idle-period signal.
   // Let Blink schedule idle work normally between command captures.
   static_cast<blink::scheduler::MainThreadSchedulerImpl&>(
       blink::scheduler::WebThreadScheduler::MainThreadScheduler())
       .BeginFrameNotExpectedSoon();
   page->Animator().ServiceScriptedAnimations(base::TimeTicks::Now());
+  CaptureTimer::Get().Mark("raf");
   if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
       frame->GetPage() != page.Get() || !frame->View()) {
     result.error = "Frame changed during animation";
@@ -1604,6 +1667,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   }
   page->Animator().UpdateAllLifecyclePhasesExceptPaint(
       *frame, blink::DocumentUpdateReason::kInspector);
+  CaptureTimer::Get().Mark("layout");
   if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
       frame->GetPage() != page.Get() || !frame->View()) {
     result.error = "Frame changed during layout";
@@ -1627,14 +1691,17 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   // means BeginMainFrame never runs. Perform its main-thread steps here: the
   // paint-clean lifecycle delivers ResizeObservers and the post-lifecycle
   // steps compute IntersectionObservers (including loading=lazy).
+  CaptureTimer::Get().Mark("animations");
   page->Animator().UpdateAllLifecyclePhases(
       *frame, blink::DocumentUpdateReason::kInspector);
+  CaptureTimer::Get().Mark("paint");
   if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
       frame->GetPage() != page.Get() || !frame->View()) {
     result.error = "Frame changed during animation start";
     return result;
   }
   frame->LocalFrameRoot().View()->RunPostLifecycleSteps();
+  CaptureTimer::Get().Mark("post");
   if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
       frame->GetPage() != page.Get() || !frame->View()) {
     result.error = "Frame changed during post-lifecycle steps";
@@ -1796,6 +1863,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
                            SkData::MakeWithCopy(json->data(), json->size()));
     }
   }
+  CaptureTimer::Get().Mark("collect");
   if (known) {
     return CaptureIncrementalPicture(frame.Get(), bounds, frame_ids,
                                      frame_pictures, media_states, *known,
