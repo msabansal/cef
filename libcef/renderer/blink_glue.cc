@@ -1247,8 +1247,26 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame,
   info.Set("height", bounds.height());
   PaintSerialization dependencies;
   dependencies.raster = raster;
-  if (!bounds.IsEmpty() &&
-      !CaptureRequiredPaint(web_frame, bounds, &dependencies)) {
+  // Only composed (remote) child frames need the paint dependency proof; with
+  // none, |children| is empty whatever paints, and the capture itself records
+  // and validates the paint. Skip that full paint and replay.
+  bool composed_children = false;
+  for (auto* child = frame->Tree().TraverseNext(frame); child;
+       child = child->Tree().TraverseNext(frame)) {
+    if (IsComposedChildFrame(frame, child)) {
+      composed_children = true;
+      break;
+    }
+  }
+  if (!composed_children && !raster) {
+    if (bounds.width() > 4096 || bounds.height() > 4096 ||
+        static_cast<uint64_t>(bounds.width()) * bounds.height() >
+            kMaxViewportPixels) {
+      result.error = "Capture viewport is empty or exceeds budget";
+      return result;
+    }
+  } else if (!bounds.IsEmpty() &&
+             !CaptureRequiredPaint(web_frame, bounds, &dependencies)) {
     result.error = dependencies.error;
     return result;
   }
