@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cmath>
+#include <deque>
 #include <map>
 #include <set>
 #include <tuple>
@@ -14,6 +15,7 @@
 #include "base/functional/bind.h"
 #include "base/functional/callback_helpers.h"
 #include "base/json/json_writer.h"
+#include "base/no_destructor.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/time/time.h"
 #include "base/values.h"
@@ -157,6 +159,9 @@ struct PaintSerialization {
   std::string error;
   bool raster = false;
   std::function<void(const std::string&, const void*, size_t)> sink;
+  // Originals the consumer already holds (streaming root captures only): they
+  // are announced by identity, without bytes.
+  const std::set<std::string>* known_originals = nullptr;
   std::set<std::string> original_ids;
   size_t identity_bytes = 0;
   size_t resources = 0;
@@ -174,22 +179,21 @@ struct PaintSerialization {
   size_t fonts = 0;
   size_t typefaces = 0;
 
-  bool Export(uint8_t kind, const sk_sp<const SkData>& data, sk_reach::Hash* hash) {
-    if (!data || !data->size()) return false;
-    *hash = crypto::hash::Sha256(std::string_view(
-        static_cast<const char*>(data->data()), data->size()));
+  bool Export(uint8_t kind, const sk_reach::Hash& hash, size_t size,
+              const std::function<sk_sp<const SkData>()>& load) {
+    if (!size) return false;
     const std::string key = (kind == sk_reach::kImage ? "image:" : "font:") +
-                            sk_reach::Hex(*hash);
+                            sk_reach::Hex(hash);
     if (original_ids.contains(key)) return true;
     if (kind == sk_reach::kImage) {
-      if (!AddResource(data->size())) return false;
+      if (!AddResource(size)) return false;
     } else {
-      if (data->size() > sk_reach::kFontBytes - font_bytes) {
+      if (size > sk_reach::kFontBytes - font_bytes) {
         error = "Original font resource byte budget exceeded";
         return false;
       }
       ++fonts;
-      font_bytes += data->size();
+      font_bytes += size;
     }
     identity_bytes += key.size() + 64;
     if (bytes + font_bytes + identity_bytes > kMaxPaintBytes) {
@@ -197,6 +201,15 @@ struct PaintSerialization {
       return false;
     }
     original_ids.insert(key);
+    if (sink && known_originals && known_originals->contains(key)) {
+      sink(key, nullptr, 0);
+      return true;
+    }
+    const auto data = load();
+    if (!data || data->size() != size) {
+      error = "Original resource changed during serialization";
+      return false;
+    }
     if (sink) {
       sink(key, data->data(), data->size());
     } else {
@@ -220,6 +233,50 @@ struct PaintSerialization {
   }
 };
 
+// Original digests by Skia identity. Image and typeface unique IDs are never
+// reused within the renderer and their bytes are immutable, so repeated
+// captures neither re-read nor re-hash unchanged originals. Bounded, FIFO.
+struct OriginalDigest {
+  sk_reach::Hash hash;
+  size_t size = 0;
+  int collection_index = 0;
+};
+
+class OriginalDigests {
+ public:
+  const OriginalDigest* Find(uint32_t id) const {
+    const auto found = entries_.find(id);
+    return found == entries_.end() ? nullptr : &found->second;
+  }
+  void Insert(uint32_t id, const OriginalDigest& digest) {
+    if (!entries_.insert_or_assign(id, digest).second) return;
+    order_.push_back(id);
+    if (order_.size() > 2048) {
+      entries_.erase(order_.front());
+      order_.pop_front();
+    }
+  }
+
+ private:
+  std::map<uint32_t, OriginalDigest> entries_;
+  std::deque<uint32_t> order_;
+};
+
+OriginalDigests& ImageDigests() {
+  static base::NoDestructor<OriginalDigests> digests;
+  return *digests;
+}
+
+OriginalDigests& TypefaceDigests() {
+  static base::NoDestructor<OriginalDigests> digests;
+  return *digests;
+}
+
+sk_reach::Hash Digest(const SkData& data) {
+  return crypto::hash::Sha256(std::string_view(
+      static_cast<const char*>(data.data()), data.size()));
+}
+
 SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
   auto* state = static_cast<PaintSerialization*>(context);
   if (state->error.empty() &&
@@ -236,10 +293,20 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
   }
   if (state->error.empty()) {
     auto encoded = image->refEncodedData();
-    sk_reach::Hash hash;
-    if (encoded && state->Export(sk_reach::kImage, encoded, &hash)) {
-      state->image_pixels += pixels;
-      return sk_reach::Write(sk_reach::kImage, hash, encoded->size());
+    if (encoded && encoded->size()) {
+      const auto* known = ImageDigests().Find(image->uniqueID());
+      OriginalDigest digest;
+      if (known && known->size == encoded->size()) {
+        digest = *known;
+      } else {
+        digest = {Digest(*encoded), encoded->size()};
+        ImageDigests().Insert(image->uniqueID(), digest);
+      }
+      if (state->Export(sk_reach::kImage, digest.hash, digest.size,
+                        [&] { return sk_sp<const SkData>(encoded); })) {
+        state->image_pixels += pixels;
+        return sk_reach::Write(sk_reach::kImage, digest.hash, digest.size);
+      }
     }
     if (state->error.empty()) {
       state->error =
@@ -254,16 +321,41 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
 SkSerialReturnType SerializeOriginalTypeface(SkTypeface* face, void* context) {
   auto* state = static_cast<PaintSerialization*>(context);
   if (state->error.empty()) {
-    int collection_index = 0;
-    auto original = face->openStream(&collection_index);
-    if (!original || original->getLength() == 0) {
-      state->error = "Original font stream unavailable";
-    } else if (original->getLength() > sk_reach::kFontBytes) {
-      state->error = "Original font resource byte budget exceeded";
+    sk_sp<SkData> data;
+    OriginalDigest digest;
+    if (const auto* known = TypefaceDigests().Find(face->uniqueID())) {
+      digest = *known;
     } else {
-      auto data = SkData::MakeFromStream(original.get(), original->getLength());
-      sk_reach::Hash hash;
-      if (state->Export(sk_reach::kFont, data, &hash)) {
+      int collection_index = 0;
+      auto original = face->openStream(&collection_index);
+      if (!original || original->getLength() == 0) {
+        state->error = "Original font stream unavailable";
+      } else if (original->getLength() > sk_reach::kFontBytes) {
+        state->error = "Original font resource byte budget exceeded";
+      } else {
+        data = SkData::MakeFromStream(original.get(), original->getLength());
+        if (data && data->size()) {
+          digest = {Digest(*data), data->size(), collection_index};
+          TypefaceDigests().Insert(face->uniqueID(), digest);
+        }
+      }
+    }
+    const int collection_index = digest.collection_index;
+    const auto load = [&]() -> sk_sp<const SkData> {
+      if (!data) {
+        int index = 0;
+        auto original = face->openStream(&index);
+        if (original && index == collection_index &&
+            original->getLength() == digest.size) {
+          data = SkData::MakeFromStream(original.get(), original->getLength());
+        }
+      }
+      return data;
+    };
+    if (state->error.empty() && digest.size &&
+        state->Export(sk_reach::kFont, digest.hash, digest.size, load)) {
+      const auto& hash = digest.hash;
+      {
         SkFontDescriptor descriptor;
         bool local = false;
         face->getFontDescriptor(&descriptor, &local);
@@ -283,7 +375,7 @@ SkSerialReturnType SerializeOriginalTypeface(SkTypeface* face, void* context) {
         if (descriptor.serialize(&stream) && !stream.failed()) {
           const auto bytes = stream.TakeBytes();
           auto meta = SkData::MakeWithCopy(bytes.data(), bytes.size());
-          return sk_reach::Write(sk_reach::kFont, hash, data->size(), meta.get());
+          return sk_reach::Write(sk_reach::kFont, hash, digest.size, meta.get());
         }
       }
     }
@@ -1219,7 +1311,8 @@ CefDrawingCommands CaptureIncrementalPicture(
     const std::map<uint32_t, sk_sp<SkPicture>>& frame_pictures,
     const std::map<uint32_t, sk_sp<SkData>>& media_states,
     const std::vector<uint8_t>& known_bytes,
-    const std::function<void(const std::string&, const void*, size_t)>& sink) {
+    const std::function<void(const std::string&, const void*, size_t)>& sink,
+    const std::set<std::string>* known_originals) {
   CefDrawingCommands result;
   if (known_bytes.size() % kChunkRefBytes ||
       known_bytes.size() / kChunkRefBytes > kMaxChunkRefs) {
@@ -1278,6 +1371,7 @@ CefDrawingCommands CaptureIncrementalPicture(
   }
   PaintSerialization state;
   state.sink = sink;
+  state.known_originals = known_originals;
   // The skeleton holds only property-state operations and chunk markers.
   state.collect_paint_ids = true;
   if (!CheckPaintRecord(&state, skeleton_record, 0)) {
@@ -1442,7 +1536,8 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
     const std::map<std::string, std::vector<uint8_t>>& children,
     const std::map<std::string, std::vector<uint8_t>>& resources,
     const std::function<void(const std::string&, const void*, size_t)>& sink,
-    const std::vector<uint8_t>* known) {
+    const std::vector<uint8_t>* known,
+    const std::set<std::string>* known_originals = nullptr) {
   CefDrawingCommands result;
   blink::Persistent<blink::LocalFrame> frame =
       blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
@@ -1666,7 +1761,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   if (known) {
     return CaptureIncrementalPicture(frame.Get(), bounds, frame_ids,
                                      frame_pictures, media_states, *known,
-                                     sink);
+                                     sink, known_originals);
   }
   PaintSerialization state;
   state.sink = sink;
@@ -1772,14 +1867,15 @@ CefDrawingCommands CaptureIncrementalDrawingCommands(
     const std::map<std::string, std::vector<uint8_t>>& children,
     const std::map<std::string, std::vector<uint8_t>>& resources,
     const std::vector<uint8_t>& known,
-    const std::function<void(const std::string&, const void*, size_t)>& sink) {
+    const std::function<void(const std::string&, const void*, size_t)>& sink,
+    const std::set<std::string>* known_originals) {
   if (web_frame->Parent()) {
     CefDrawingCommands result;
     result.error = "Incremental capture requires the root frame";
     return result;
   }
   return CaptureDrawingCommandsImpl(web_frame, expected_document, children,
-                                    resources, sink, &known);
+                                    resources, sink, &known, known_originals);
 }
 
 CefDrawingCommands CaptureRasterFallback(

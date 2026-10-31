@@ -18,6 +18,7 @@
 #endif
 
 #include "base/strings/string_number_conversions.h"
+#include "base/strings/string_util.h"
 #include "base/strings/stringprintf.h"
 #include "base/strings/utf_string_conversions.h"
 #include "cef/include/cef_urlrequest.h"
@@ -901,8 +902,9 @@ void CefFrameImpl::SendMessage(const std::string& name,
     blink_glue::CefDrawingCommands capture;
     // Optional argument 6 requests an incremental root-frame picture. It is
     // the known chunk set: null when empty, else [key 16][hash 32] entries.
-    const bool incremental = arguments.size() == 7;
-    const bool valid = arguments.size() >= 5 && arguments.size() <= 7 &&
+    // Optional argument 7 (incremental only) is the known original set.
+    const bool incremental = arguments.size() >= 7;
+    const bool valid = arguments.size() >= 5 && arguments.size() <= 8 &&
         arguments[0].is_int() && arguments[0].GetInt() > 0 &&
         arguments[1].is_bool() && arguments[2].is_string() &&
         arguments[2].GetString().size() <= 128 &&
@@ -917,7 +919,8 @@ void CefFrameImpl::SendMessage(const std::string& name,
           (arguments[6].is_none() ||
            (arguments[6].is_blob() && !arguments[6].GetBlob().empty() &&
             arguments[6].GetBlob().size() % 48 == 0 &&
-            arguments[6].GetBlob().size() <= 4096 * 48))));
+            arguments[6].GetBlob().size() <= 4096 * 48)) &&
+          (arguments.size() == 7 || arguments[7].is_blob())));
     const int mode = valid && arguments.size() >= 6
         ? arguments[5].GetInt() : 0;
     values->SetInt(0, valid ? arguments[0].GetInt() : 0);
@@ -964,17 +967,44 @@ void CefFrameImpl::SendMessage(const std::string& name,
               auto values = event->GetArgumentList();
               values->SetInt(0, request);
               values->SetString(1, id);
-              values->SetBinary(2, CefBinaryValue::Create(bytes, size));
+              // NULL bytes announce an original the consumer already holds.
+              if (bytes)
+                values->SetBinary(2, CefBinaryValue::Create(bytes, size));
+              else
+                values->SetNull(2);
               SendProcessMessage(PID_BROWSER, event);
             };
           }
-          if (incremental) {
+          // Optional eighth argument: [kind 1][sha256 32] entries of
+          // originals the consumer already holds (streaming root only).
+          std::set<std::string> known_originals;
+          if (incremental && mode == 1 && arguments.size() >= 8 &&
+              arguments[7].is_blob()) {
+            const auto& blob = arguments[7].GetBlob();
+            if (blob.size() % 33 || blob.size() / 33 > 4096) {
+              capture.error = "Invalid known original set";
+            }
+            for (size_t offset = 0; capture.error.empty() &&
+                                    offset < blob.size(); offset += 33) {
+              if (blob[offset] > 1) {
+                capture.error = "Invalid known original kind";
+                break;
+              }
+              known_originals.insert(
+                  (blob[offset] ? "font:" : "image:") +
+                  base::ToLowerASCII(base::HexEncode(
+                      base::span(blob).subspan(offset + 1, 32u))));
+            }
+          }
+          if (!capture.error.empty()) {
+            // Rejected known original set.
+          } else if (incremental) {
             static const std::vector<uint8_t> kNoKnownChunks;
             capture = blink_glue::CaptureIncrementalDrawingCommands(
                 frame_, arguments[2].GetString(), children, resources,
                 arguments[6].is_blob() ? arguments[6].GetBlob()
                                        : kNoKnownChunks,
-                sink);
+                sink, &known_originals);
           } else {
             capture = blink_glue::CaptureDrawingCommands(
                 frame_, arguments[2].GetString(), children, resources, sink);

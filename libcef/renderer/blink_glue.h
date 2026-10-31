@@ -11,6 +11,7 @@
 #include <memory>
 #include <map>
 #include <functional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -76,7 +77,9 @@ BLINK_EXPORT CefDrawingCommands CaptureIncrementalDrawingCommands(
     const std::map<std::string, std::vector<uint8_t>>& children,
     const std::map<std::string, std::vector<uint8_t>>& resources,
     const std::vector<uint8_t>& known,
-    const std::function<void(const std::string&, const void*, size_t)>& sink);
+    const std::function<void(const std::string&, const void*, size_t)>& sink,
+    // Originals the consumer holds: announced by identity without bytes.
+    const std::set<std::string>* known_originals = nullptr);
 
 BLINK_EXPORT CefDrawingCommands
 CaptureRasterFallback(
