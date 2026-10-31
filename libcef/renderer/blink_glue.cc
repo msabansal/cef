@@ -216,10 +216,21 @@ struct PaintSerialization {
   size_t font_bytes = 0;
   size_t fonts = 0;
   size_t typefaces = 0;
+  // Incremented whenever a child-frame or media marker is played back.
+  size_t markers = 0;
+  // When set, every original export, in order, including repeats.
+  struct Exported {
+    uint8_t kind;
+    sk_reach::Hash hash;
+    size_t size;
+    uint64_t pixels;
+  };
+  std::vector<Exported>* exports = nullptr;
 
   bool Export(uint8_t kind, const sk_reach::Hash& hash, size_t size,
               const std::function<sk_sp<const SkData>()>& load) {
     if (!size) return false;
+    if (exports) exports->push_back({kind, hash, size, 0});
     const std::string key = (kind == sk_reach::kImage ? "image:" : "font:") +
                             sk_reach::Hex(hash);
     if (original_ids.contains(key)) return true;
@@ -343,6 +354,7 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
       if (state->Export(sk_reach::kImage, digest.hash, digest.size,
                         [&] { return sk_sp<const SkData>(encoded); })) {
         state->image_pixels += pixels;
+        if (state->exports) state->exports->back().pixels = pixels;
         return sk_reach::Write(sk_reach::kImage, digest.hash, digest.size);
       }
     }
@@ -1381,6 +1393,131 @@ ChunkKey MakeChunkKey(const blink::PaintChunk::Id& id, uint32_t occurrence) {
   return key;
 }
 
+// Serialized incremental chunks, reused while a chunk's display items still
+// share their recorded paint buffers. Blink keeps an unchanged display item's
+// buffer when it reuses cached paint, and the entry holds references to every
+// buffer, so an address match means identical content. Chunks that play back
+// child-frame or media markers depend on per-capture state and are never
+// cached.
+class ChunkSerializationCache {
+ public:
+  struct Entry {
+    std::vector<cc::PaintRecord> items;
+    SkRect bounds;
+    ChunkHash hash;
+    std::vector<uint8_t> bytes;
+    std::vector<PaintSerialization::Exported> exports;
+    uint64_t used = 0;
+  };
+
+  static ChunkSerializationCache& Get() {
+    static base::NoDestructor<ChunkSerializationCache> cache;
+    return *cache;
+  }
+
+  // Opt-in (REACH_DRAWING_VERIFY_CHUNK_CACHE=1): also serialize every hit and
+  // log a mismatch with the cached bytes.
+  static bool Verify() {
+    static const bool enabled = [] {
+      const char* value = getenv("REACH_DRAWING_VERIFY_CHUNK_CACHE");
+      return value && std::string_view(value) == "1";
+    }();
+    return enabled;
+  }
+
+  // The display item records of a chunk, or false when it holds anything else.
+  static bool Items(const cc::PaintRecord& record,
+                    std::vector<cc::PaintRecord>* items) {
+    for (const cc::PaintOp& op : record.buffer()) {
+      if (op.GetType() != cc::PaintOpType::kDrawRecord) return false;
+      items->push_back(static_cast<const cc::DrawRecordOp&>(op).record);
+    }
+    return true;
+  }
+
+  const Entry* Find(const ChunkKey& key,
+                    const std::vector<cc::PaintRecord>& items,
+                    const SkRect& bounds) {
+    auto found = entries_.find(key);
+    if (found == entries_.end() || found->second.bounds != bounds ||
+        found->second.items.size() != items.size()) {
+      return nullptr;
+    }
+    for (size_t i = 0; i < items.size(); ++i) {
+      if (&found->second.items[i].buffer() != &items[i].buffer())
+        return nullptr;
+    }
+    found->second.used = capture_;
+    return &found->second;
+  }
+
+  void Store(const ChunkKey& key, Entry entry) {
+    entry.used = capture_;
+    if (auto found = entries_.find(key); found != entries_.end()) {
+      bytes_ -= found->second.bytes.size();
+      entries_.erase(found);
+    }
+    if (entry.bytes.size() > kMaxBytes / 4) return;
+    bytes_ += entry.bytes.size();
+    entries_.emplace(key, std::move(entry));
+  }
+
+  // Drops entries no capture has used recently, and everything over budget.
+  void EndCapture() {
+    ++capture_;
+    for (auto it = entries_.begin(); it != entries_.end();) {
+      if (capture_ - it->second.used > kRetainedCaptures) {
+        bytes_ -= it->second.bytes.size();
+        it = entries_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (bytes_ > kMaxBytes || entries_.size() > kMaxChunkRefs * 2) {
+      entries_.clear();
+      bytes_ = 0;
+    }
+  }
+
+ private:
+  static constexpr uint64_t kRetainedCaptures = 16;
+  static constexpr size_t kMaxBytes = 32 * 1024 * 1024;
+  std::map<ChunkKey, Entry> entries_;
+  size_t bytes_ = 0;
+  uint64_t capture_ = 0;
+};
+
+// Repeats a cached chunk's original exports with the same budget checks. Returns
+// false, without exporting, when any original would need its bytes sent.
+bool ReplayChunkExports(PaintSerialization* state,
+                        const ChunkSerializationCache::Entry& entry) {
+  for (const auto& exported : entry.exports) {
+    const std::string key =
+        (exported.kind == sk_reach::kImage ? "image:" : "font:") +
+        sk_reach::Hex(exported.hash);
+    if (!state->original_ids.contains(key) &&
+        !(state->sink && state->known_originals &&
+          state->known_originals->contains(key))) {
+      return false;
+    }
+  }
+  for (const auto& exported : entry.exports) {
+    if (exported.kind == sk_reach::kImage &&
+        exported.pixels > kMaxDecodedImagePixels - state->image_pixels) {
+      state->error = "Decoded image pixel budget exceeded";
+      return true;
+    }
+    if (!state->Export(exported.kind, exported.hash, exported.size,
+                       [] { return sk_sp<const SkData>(); })) {
+      if (state->error.empty())
+        state->error = "Cached chunk original export failed";
+      return true;
+    }
+    state->image_pixels += exported.pixels;
+  }
+  return true;
+}
+
 struct SkeletonSerialization {
   std::map<const SkPicture*, size_t> placeholders;
   const std::vector<ChunkKey>* keys = nullptr;
@@ -1732,6 +1869,7 @@ CefDrawingCommands CaptureIncrementalPicture(
          const std::map<uint32_t, sk_sp<SkPicture>>* frames,
          const std::set<uint32_t>* frame_ids, PaintSerialization* state,
          SkCanvas* canvas, uint32_t id) {
+        ++state->markers;
         const auto child = frames->find(id);
         if (child != frames->end()) {
           SkAutoCanvasRestore restore(canvas, true);
@@ -1759,9 +1897,57 @@ CefDrawingCommands CaptureIncrementalPicture(
   chunk_procs.fTypefaceCtx = &state;
   size_t new_bytes = 0;
   size_t all_bytes = 0;
+  size_t cached = 0;
+  auto& cache = ChunkSerializationCache::Get();
   base::TimeDelta recording, serializing, hashing;
   for (const auto index : skeleton.referenced) {
     const auto& chunk = chunks[index];
+    std::vector<cc::PaintRecord> items;
+    const bool cacheable = ChunkSerializationCache::Items(chunk.record, &items);
+    const ChunkSerializationCache::Entry* hit =
+        cacheable ? cache.Find(chunk.key, items, chunk.bounds) : nullptr;
+    if (hit && ReplayChunkExports(&state, *hit)) {
+      if (!state.error.empty()) {
+        result.error = state.error;
+        return result;
+      }
+      if (ChunkSerializationCache::Verify()) {
+        PaintSerialization scratch;
+        SkSerialProcs scratch_procs = chunk_procs;
+        scratch_procs.fImageCtx = &scratch;
+        scratch_procs.fTypefaceCtx = &scratch;
+        BoundedPaintStream stream(kMaxPictureBytes);
+        if (auto picture = chunk.record.ToSkPicture(chunk.bounds, nullptr,
+                                                    chunk_callbacks)) {
+          picture->serialize(&stream, &scratch_procs);
+        }
+        if (stream.failed() ||
+            crypto::hash::Sha256(stream.TakeBytes()) != hit->hash) {
+          fputs("reach drawing chunk cache mismatch\n", stderr);
+        }
+      }
+      ++cached;
+      all_bytes += hit->bytes.size();
+      result.refs.insert(result.refs.end(), chunk.key.begin(), chunk.key.end());
+      result.refs.insert(result.refs.end(), hit->hash.begin(), hit->hash.end());
+      const auto found = known.find(chunk.key);
+      if (found != known.end() && found->second == hit->hash)
+        continue;
+      new_bytes += hit->bytes.size();
+      if (new_bytes > kMaxPaintBytes) {
+        result.error = "Aggregate new paint chunk budget exceeded";
+        return result;
+      }
+      result.chunks.insert(result.chunks.end(), chunk.key.begin(),
+                           chunk.key.end());
+      AppendLE(&result.chunks, hit->bytes.size(), 4);
+      result.chunks.insert(result.chunks.end(), hit->bytes.begin(),
+                           hit->bytes.end());
+      continue;
+    }
+    std::vector<PaintSerialization::Exported> exports;
+    state.exports = &exports;
+    const size_t markers = state.markers;
     auto mark = base::TimeTicks::Now();
     auto chunk_picture =
         chunk.record.ToSkPicture(chunk.bounds, nullptr, chunk_callbacks);
@@ -1775,6 +1961,7 @@ CefDrawingCommands CaptureIncrementalPicture(
     mark = base::TimeTicks::Now();
     chunk_picture->serialize(&stream, &chunk_procs);
     serializing += base::TimeTicks::Now() - mark;
+    state.exports = nullptr;
     if (!state.error.empty() || stream.failed() || !stream.bytesWritten()) {
       result.error = state.error.empty() ? "Serialized chunk budget exceeded"
                                          : state.error;
@@ -1788,21 +1975,28 @@ CefDrawingCommands CaptureIncrementalPicture(
     result.refs.insert(result.refs.end(), chunk.key.begin(), chunk.key.end());
     result.refs.insert(result.refs.end(), hash.begin(), hash.end());
     const auto found = known.find(chunk.key);
-    if (found != known.end() && found->second == hash)
-      continue;
-    new_bytes += bytes.size();
-    if (new_bytes > kMaxPaintBytes) {
-      result.error = "Aggregate new paint chunk budget exceeded";
-      return result;
+    const bool held = found != known.end() && found->second == hash;
+    if (!held) {
+      new_bytes += bytes.size();
+      if (new_bytes > kMaxPaintBytes) {
+        result.error = "Aggregate new paint chunk budget exceeded";
+        return result;
+      }
+      result.chunks.insert(result.chunks.end(), chunk.key.begin(),
+                           chunk.key.end());
+      AppendLE(&result.chunks, bytes.size(), 4);
+      result.chunks.insert(result.chunks.end(), bytes.begin(), bytes.end());
     }
-    result.chunks.insert(result.chunks.end(), chunk.key.begin(),
-                         chunk.key.end());
-    AppendLE(&result.chunks, bytes.size(), 4);
-    result.chunks.insert(result.chunks.end(), bytes.begin(), bytes.end());
+    if (cacheable && state.markers == markers) {
+      cache.Store(chunk.key, {std::move(items), chunk.bounds, hash,
+                              std::move(bytes), std::move(exports)});
+    }
   }
+  cache.EndCapture();
   CaptureTimer::Get().Mark("chunks");
   CaptureTimer::Get().Finish("chunks=" + base::NumberToString(chunks.size()) +
                              " referenced=" + base::NumberToString(skeleton.referenced.size()) +
+                             " cached=" + base::NumberToString(cached) +
                              " new_bytes=" + base::NumberToString(new_bytes) +
                              " all_bytes=" + base::NumberToString(all_bytes) +
                              " record=" + base::NumberToString(recording.InMilliseconds()) +
