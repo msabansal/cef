@@ -55,6 +55,9 @@ struct CefDrawingCommands {
   // [key 16][length u32 LE][SKP] for chunks absent from the known set.
   std::vector<uint8_t> refs;
   std::vector<uint8_t> chunks;
+  // Incremental captures only, optional: the root scroller's segments and
+  // geometry for client-side scroll prediction ("RSL1", see blink_glue.cc).
+  std::vector<uint8_t> scroll;
   int width = 0;
   int height = 0;
 };

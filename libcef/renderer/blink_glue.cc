@@ -56,6 +56,9 @@
 #include "third_party/blink/renderer/core/frame/local_dom_window.h"
 #include "third_party/blink/renderer/core/frame/local_frame.h"
 #include "third_party/blink/renderer/core/frame/local_frame_view.h"
+#include "third_party/blink/renderer/core/frame/event_handler_registry.h"
+#include "third_party/blink/renderer/core/paint/object_paint_properties.h"
+#include "third_party/blink/renderer/platform/graphics/paint/geometry_mapper.h"
 #include "third_party/blink/renderer/core/frame/settings.h"
 #include "third_party/blink/renderer/core/frame/web_local_frame_impl.h"
 #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
@@ -1378,6 +1381,172 @@ SkSerialReturnType SerializeChunkReference(SkPicture* picture, void* context) {
   return SkData::MakeWithCopy(key.data(), key.size());
 }
 
+void AppendF32(std::vector<uint8_t>* out, float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  AppendLE(out, bits, 4);
+}
+
+// Lets the client scroll the root scroller locally before the next capture
+// arrives. The kept chunks are re-emitted in paint order as segments: runs
+// under the root scroll translation (and its overflow clip) are converted into
+// the scroller's content space, all others into root space. The client
+// translates content segments by its predicted offset. Empty when the root
+// scroller cannot be expressed this way.
+//
+// "RSL1", f32 offset/min/max x,y, f32 root-from-content translation x,y,
+// f32 root-space scroll clip x,y,w,h, u8 flags (1 = no blocking wheel
+// listeners), u16 count + f32 x,y,w,h viewport rects where a wheel may scroll
+// something else, u16 count + per segment [u8 kind (0 root, 1 content)]
+// [u32 length][SKP]. Little-endian.
+std::vector<uint8_t> CaptureScrollLayout(
+    blink::LocalFrame* frame, const gfx::Rect& bounds, const gfx::Rect& cull,
+    const std::map<const blink::PaintChunk*, uint32_t>& chunk_index,
+    const cc::PlaybackCallbacks& callbacks, const SkSerialProcs& procs) {
+  std::vector<uint8_t> out;
+  auto* layout_view = frame->ContentLayoutObject();
+  const auto* properties =
+      layout_view ? layout_view->FirstFragment().PaintProperties() : nullptr;
+  const auto* scroll = properties ? properties->ScrollTranslation() : nullptr;
+  const auto* overflow = properties ? properties->OverflowClip() : nullptr;
+  auto* viewport = frame->View()->LayoutViewport();
+  if (!scroll || !overflow || !viewport)
+    return out;
+  const auto& root = blink::TransformPaintPropertyNode::Root();
+  const auto content =
+      blink::GeometryMapper::SourceToDestinationProjection(*scroll, root);
+  const auto clip_space = blink::GeometryMapper::SourceToDestinationProjection(
+      overflow->LocalTransformSpace(), root);
+  if (!content.IsIdentityOr2dTranslation() ||
+      !clip_space.IsIdentityOr2dTranslation())
+    return out;
+  const auto scrolled = [&](const blink::PaintChunk& chunk) {
+    const auto chunk_state = chunk.properties.Unalias();
+    if (!scroll->IsAncestorOf(chunk_state.Transform()) ||
+        !overflow->IsAncestorOf(chunk_state.Clip()))
+      return false;
+    for (const blink::EffectPaintPropertyNode* effect = &chunk_state.Effect();
+         effect->Parent(); effect = &effect->Parent()->Unalias()) {
+      if (!scroll->IsAncestorOf(effect->LocalTransformSpace()))
+        return false;
+      if (const auto* output = effect->OutputClip();
+          output && !overflow->IsAncestorOf(*output))
+        return false;
+    }
+    return true;
+  };
+  const auto& artifact = frame->View()->GetPaintArtifact();
+  std::vector<std::pair<bool, std::vector<const blink::PaintChunk*>>> runs;
+  for (const auto& chunk : artifact.GetPaintChunks()) {
+    if (!chunk_index.contains(&chunk))
+      continue;
+    const bool in_content = scrolled(chunk);
+    if (runs.empty() || runs.back().first != in_content) {
+      if (runs.size() >= 64)
+        return {};
+      runs.emplace_back(in_content, std::vector<const blink::PaintChunk*>());
+    }
+    runs.back().second.push_back(&chunk);
+  }
+  if (std::none_of(runs.begin(), runs.end(),
+                   [](const auto& run) { return run.first; }))
+    return out;
+  const auto translation = content.To2dTranslation();
+  gfx::Rect content_cull = cull;
+  content_cull.Offset(-std::lround(translation.x()),
+                      -std::lround(translation.y()));
+  const blink::PropertyTreeState content_state(
+      *scroll, *overflow, blink::EffectPaintPropertyNode::Root());
+  std::vector<std::pair<bool, std::vector<uint8_t>>> segments;
+  for (const auto& [in_content, members] : runs) {
+    blink::PaintChunkSubset subset(artifact, *members.front());
+    for (size_t i = 1; i < members.size(); ++i)
+      subset.Merge(blink::PaintChunkSubset(artifact, *members[i]));
+    bool missing = false;
+    auto record = blink::PaintChunksToCcLayer::Convert(
+        subset,
+        in_content ? content_state : blink::PropertyTreeState::Root(),
+        in_content ? &content_cull : &cull,
+        [&](const blink::PaintChunk& chunk, cc::PaintRecord) {
+          const auto found = chunk_index.find(&chunk);
+          if (found == chunk_index.end()) {
+            missing = true;
+            return cc::PaintRecord();
+          }
+          cc::PaintOpBuffer marker;
+          marker.push<cc::CustomDataOp>(found->second);
+          return marker.ReleaseAsRecord();
+        });
+    PaintSerialization check;
+    check.collect_paint_ids = true;
+    if (missing || !CheckPaintRecord(&check, record, 0))
+      return {};
+    const auto picture_bounds =
+        in_content ? gfx::RectToSkRect(content_cull)
+                   : SkRect::MakeWH(bounds.width(), bounds.height());
+    auto picture = record.ToSkPicture(picture_bounds, nullptr, callbacks);
+    if (!picture)
+      return {};
+    BoundedPaintStream stream(kMaxPictureBytes);
+    picture->serialize(&stream, &procs);
+    if (stream.failed() || !stream.bytesWritten())
+      return {};
+    segments.emplace_back(in_content, stream.TakeBytes());
+  }
+  out.insert(out.end(), {'R', 'S', 'L', '1'});
+  const auto offset = viewport->GetScrollOffset();
+  const auto minimum = viewport->MinimumScrollOffset();
+  const auto maximum = viewport->MaximumScrollOffset();
+  const bool horizontal =
+      viewport->UserInputScrollable(blink::kHorizontalScrollbar);
+  const bool vertical = viewport->UserInputScrollable(blink::kVerticalScrollbar);
+  for (const float value :
+       {offset.x(), offset.y(), horizontal ? minimum.x() : offset.x(),
+        vertical ? minimum.y() : offset.y(),
+        horizontal ? maximum.x() : offset.x(),
+        vertical ? maximum.y() : offset.y(), translation.x(), translation.y()})
+    AppendF32(&out, value);
+  auto clip = overflow->PaintClipRect().Rect();
+  clip.Offset(clip_space.To2dTranslation());
+  for (const float value : {clip.x(), clip.y(), clip.width(), clip.height()})
+    AppendF32(&out, value);
+  std::vector<gfx::Rect> others;
+  for (const auto& entry : frame->View()->ScrollableAreas()) {
+    const auto* area = entry.value.Get();
+    if (static_cast<const blink::ScrollableArea*>(area) == viewport ||
+        !area->ScrollsOverflow() || !area->GetLayoutBox())
+      continue;
+    others.push_back(area->GetLayoutBox()->AbsoluteBoundingBoxRect());
+  }
+  for (blink::Frame* child = frame->Tree().FirstChild(); child;
+       child = child->Tree().NextSibling()) {
+    if (const auto* owner = child->OwnerLayoutObject())
+      others.push_back(owner->AbsoluteBoundingBoxRect());
+  }
+  std::erase_if(others,
+                [&](const gfx::Rect& rect) { return !rect.Intersects(bounds); });
+  const bool predictable =
+      others.size() <= 64 &&
+      !frame->GetEventHandlerRegistry().HasEventHandlers(
+          blink::EventHandlerRegistry::kWheelEventBlocking);
+  out.push_back(predictable ? 1 : 0);
+  if (!predictable)
+    others.clear();
+  AppendLE(&out, others.size(), 2);
+  for (const auto& rect : others)
+    for (const int value : {rect.x(), rect.y(), rect.width(), rect.height()})
+      AppendF32(&out, value);
+  AppendLE(&out, segments.size(), 2);
+  for (const auto& [in_content, bytes] : segments) {
+    out.push_back(in_content ? 1 : 0);
+    AppendLE(&out, bytes.size(), 4);
+    out.insert(out.end(), bytes.begin(), bytes.end());
+  }
+  if (out.size() > kMaxPictureBytes)
+    return {};
+  return out;
+}
+
 // The skeleton is the normal lifecycle conversion of the local root's paint
 // artifact, with each kept chunk's drawings replaced by a placeholder picture
 // that serializes as its 16-byte key. Chunks are culled as a whole against the
@@ -1421,6 +1590,7 @@ CefDrawingCommands CaptureIncrementalPicture(
     SkRect bounds;
   };
   std::vector<Chunk> chunks;
+  std::map<const blink::PaintChunk*, uint32_t> chunk_index;
   std::map<std::tuple<uint64_t, uint32_t, uint32_t>, uint32_t> occurrences;
   bool overflow = false;
   const gfx::Rect cull(0, -bounds.height(), bounds.width(),
@@ -1438,6 +1608,7 @@ CefDrawingCommands CaptureIncrementalPicture(
             static_cast<uint32_t>(chunk.id.type), chunk.id.fragment}]++;
         cc::PaintOpBuffer marker;
         marker.push<cc::CustomDataOp>(static_cast<uint32_t>(chunks.size()));
+        chunk_index.emplace(&chunk, static_cast<uint32_t>(chunks.size()));
         chunks.push_back({MakeChunkKey(chunk.id, occurrence), std::move(items),
                           gfx::RectToSkRect(chunk.drawable_bounds)});
         return marker.ReleaseAsRecord();
@@ -1531,6 +1702,9 @@ CefDrawingCommands CaptureIncrementalPicture(
     result.error = "Skia produced an empty skeleton";
     return result;
   }
+  result.scroll = CaptureScrollLayout(frame, bounds, cull, chunk_index,
+                                      skeleton_callbacks, procs);
+  CaptureTimer::Get().Mark("scroll");
   // Chunk pictures compose child frames and media markers like the full
   // picture. Child frames outside the capture viewport have no picture; they
   // are omitted, and their chunk changes once they become visible.

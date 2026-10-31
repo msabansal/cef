@@ -1050,6 +1050,10 @@ void CefFrameImpl::SendMessage(const std::string& name,
               values->SetBinary(index, CefBinaryValue::Create(
                   bytes->data(), bytes->size()));
           }
+          // Optional argument 8: the scroll layout (absent when unavailable).
+          if (!capture.scroll.empty())
+            values->SetBinary(8, CefBinaryValue::Create(
+                capture.scroll.data(), capture.scroll.size()));
         }
       }
     }
