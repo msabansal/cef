@@ -354,8 +354,9 @@ void CefRenderWidgetHostViewOSR::SetSize(const gfx::Size& size) {}
 void CefRenderWidgetHostViewOSR::SetBounds(const gfx::Rect& rect) {}
 
 gfx::NativeView CefRenderWidgetHostViewOSR::GetNativeView() {
-  // TODO(osr): Fix all calling code paths and convert to DCHECK.
-  NOTIMPLEMENTED();
+  // A windowless view has no native view. Callers must already handle a null
+  // view (e.g. AdjustWindowRectForDisplay() falls back to the primary display
+  // when sizing a window.open() popup), so this is not an error.
   return gfx::NativeView();
 }
 
