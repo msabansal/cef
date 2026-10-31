@@ -1181,7 +1181,8 @@ std::string DrawingFrameIdentity(blink::Frame* frame) {
 }
 
 CefDrawingCommands GetDrawingInputRoute(blink::WebLocalFrame* web_frame,
-                                        bool keyboard, int x, int y) {
+                                        bool keyboard, int x, int y,
+                                        const std::function<std::string()>& apply) {
   CefDrawingCommands result;
   auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
   if (!frame || !frame->IsAttached() || !frame->View() ||
@@ -1230,6 +1231,11 @@ CefDrawingCommands GetDrawingInputRoute(blink::WebLocalFrame* web_frame,
   route.Set("embedding", child ? DrawingFrameIdentity(child) : "");
   route.Set("x", route_x);
   route.Set("y", route_y);
+  if (!child && apply) {
+    route.Set("applied", true);
+    if (const auto error = apply(); !error.empty())
+      route.Set("inputError", error);
+  }
   auto json = base::WriteJson(route);
   if (!json) {
     result.error = "Input route serialization failed";
@@ -1917,9 +1923,9 @@ CefDrawingCommands CaptureIncrementalPicture(
         scratch_procs.fImageCtx = &scratch;
         scratch_procs.fTypefaceCtx = &scratch;
         BoundedPaintStream stream(kMaxPictureBytes);
-        if (auto picture = chunk.record.ToSkPicture(chunk.bounds, nullptr,
-                                                    chunk_callbacks)) {
-          picture->serialize(&stream, &scratch_procs);
+        if (auto verified = chunk.record.ToSkPicture(chunk.bounds, nullptr,
+                                                     chunk_callbacks)) {
+          verified->serialize(&stream, &scratch_procs);
         }
         if (stream.failed() ||
             crypto::hash::Sha256(stream.TakeBytes()) != hit->hash) {

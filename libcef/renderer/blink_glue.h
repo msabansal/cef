@@ -97,8 +97,12 @@ GetDrawingFrameInfo(blink::WebLocalFrame* frame, bool raster = false);
 BLINK_EXPORT void SetDrawingFrameRequestCallback(
     std::function<void(blink::WebLocalFrame*)> callback);
 
+// Resolves where input at (x, y) (or keyboard input) lands. When it lands in
+// |frame| itself and |apply| is set, |apply| dispatches the input in the same
+// task and the route reports "applied" (and "inputError" if it failed).
 BLINK_EXPORT CefDrawingCommands
-GetDrawingInputRoute(blink::WebLocalFrame* frame, bool keyboard, int x, int y);
+GetDrawingInputRoute(blink::WebLocalFrame* frame, bool keyboard, int x, int y,
+                     const std::function<std::string()>& apply = nullptr);
 BLINK_EXPORT bool IsDrawingDocument(blink::WebLocalFrame* frame,
                                     const std::string& document);
 

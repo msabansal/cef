@@ -839,68 +839,88 @@ void CefFrameImpl::SendMessage(const std::string& name,
     const bool route = name == "Reach.DrawingRoute.v1";
     bool valid = !arguments.empty() && arguments[0].is_int() &&
                  arguments[0].GetInt() > 0;
+    const auto valid_input = [](const auto& input) {
+      bool ok = input.size() >= 5 && input.size() <= 7;
+      for (const auto& value : input)
+        ok = ok && value.is_int() &&
+            value.GetInt() >= -4096 && value.GetInt() <= 65535;
+      if (!ok) return false;
+      const auto bounded = [&](size_t index, int minimum, int maximum) {
+        return input[index].GetInt() >= minimum &&
+               input[index].GetInt() <= maximum;
+      };
+      if (input.size() == 5) {
+        return bounded(0, 0, 4095) && bounded(1, 0, 4095) &&
+               bounded(2, 0, 8191) && bounded(3, -4096, 4096) &&
+               bounded(4, -4096, 4096);
+      }
+      if (input.size() == 6) {
+        return bounded(0, 0, 2) && bounded(1, 0, 255) &&
+               bounded(2, 0, 255) && bounded(3, 0, 8191) &&
+               bounded(4, 0, 65535) && bounded(5, 0, 65535);
+      }
+      return bounded(0, 0, 2) && bounded(1, 0, 4095) &&
+             bounded(2, 0, 4095) && bounded(3, 0, 8191) &&
+             bounded(4, 0, 2) && bounded(5, 0, 1) && bounded(6, 0, 3);
+    };
+    const auto apply_input = [this](const auto& input) -> std::string {
+      if (input.size() == 5)
+        return blink_glue::ApplyDrawingWheel(
+            frame_, input[0].GetInt(), input[1].GetInt(), input[2].GetInt(),
+            input[3].GetInt(), input[4].GetInt());
+      if (input.size() == 6)
+        return blink_glue::ApplyDrawingKey(
+            frame_, input[0].GetInt(), input[1].GetInt(), input[2].GetInt(),
+            input[3].GetInt(), input[4].GetInt(), input[5].GetInt());
+      return blink_glue::ApplyDrawingMouse(
+          frame_, input[0].GetInt(), input[1].GetInt(), input[2].GetInt(),
+          input[3].GetInt(), input[4].GetInt(), input[5].GetInt(),
+          input[6].GetInt());
+    };
     if (route) {
-      valid = valid && arguments.size() == 4 && arguments[1].is_bool() &&
+      valid = valid && (arguments.size() == 4 || arguments.size() == 5) &&
+          arguments[1].is_bool() &&
           arguments[2].is_int() && arguments[3].is_int() &&
           arguments[2].GetInt() >= 0 && arguments[2].GetInt() < 4096 &&
           arguments[3].GetInt() >= 0 && arguments[3].GetInt() < 4096;
+      // Optional fifth argument: input to apply if the route ends in this
+      // frame. Pointer input must sit at the routed point.
+      if (valid && arguments.size() == 5) {
+        valid = arguments[4].is_list() && valid_input(arguments[4].GetList());
+        if (valid) {
+          const auto& input = arguments[4].GetList();
+          const bool keyboard = arguments[1].GetBool();
+          const size_t offset = input.size() == 7 ? 1 : 0;
+          valid = keyboard ? input.size() == 6
+                           : input.size() != 6 &&
+                                 input[offset].GetInt() == arguments[2].GetInt() &&
+                                 input[offset + 1].GetInt() == arguments[3].GetInt();
+        }
+      }
     } else {
       valid = valid && arguments.size() == 3 && arguments[1].is_string() &&
           !arguments[1].GetString().empty() &&
-          arguments[1].GetString().size() <= 128 && arguments[2].is_list();
-      if (valid) {
-        const auto& input = arguments[2].GetList();
-        valid = input.size() >= 5 && input.size() <= 7;
-        for (const auto& value : input)
-          valid = valid && value.is_int() &&
-              value.GetInt() >= -4096 && value.GetInt() <= 65535;
-        if (valid) {
-          const auto bounded = [&](size_t index, int minimum, int maximum) {
-            return input[index].GetInt() >= minimum &&
-                   input[index].GetInt() <= maximum;
-          };
-          if (input.size() == 5) {
-            valid = bounded(0, 0, 4095) && bounded(1, 0, 4095) &&
-                    bounded(2, 0, 8191) && bounded(3, -4096, 4096) &&
-                    bounded(4, -4096, 4096);
-          } else if (input.size() == 6) {
-            valid = bounded(0, 0, 2) && bounded(1, 0, 255) &&
-                    bounded(2, 0, 255) && bounded(3, 0, 8191) &&
-                    bounded(4, 0, 65535) && bounded(5, 0, 65535);
-          } else {
-            valid = bounded(0, 0, 2) && bounded(1, 0, 4095) &&
-                    bounded(2, 0, 4095) && bounded(3, 0, 8191) &&
-                    bounded(4, 0, 2) && bounded(5, 0, 1) &&
-                    bounded(6, 0, 3);
-          }
-        }
-      }
+          arguments[1].GetString().size() <= 128 && arguments[2].is_list() &&
+          valid_input(arguments[2].GetList());
     }
     values->SetInt(0, valid ? arguments[0].GetInt() : 0);
     if (!valid || !frame_) {
       capture.error = "Invalid or detached drawing input request";
     } else if (route) {
+      std::function<std::string()> apply;
+      if (arguments.size() == 5) {
+        apply = [&apply_input, &arguments] {
+          return apply_input(arguments[4].GetList());
+        };
+      }
       capture = blink_glue::GetDrawingInputRoute(
           frame_, arguments[1].GetBool(), arguments[2].GetInt(),
-          arguments[3].GetInt());
+          arguments[3].GetInt(), apply);
     } else if (!blink_glue::IsDrawingDocument(
                    frame_, arguments[1].GetString())) {
       capture.error = "Input frame document changed";
     } else {
-      const auto& input = arguments[2].GetList();
-      if (input.size() == 5)
-        capture.error = blink_glue::ApplyDrawingWheel(
-            frame_, input[0].GetInt(), input[1].GetInt(), input[2].GetInt(),
-            input[3].GetInt(), input[4].GetInt());
-      else if (input.size() == 6)
-        capture.error = blink_glue::ApplyDrawingKey(
-            frame_, input[0].GetInt(), input[1].GetInt(), input[2].GetInt(),
-            input[3].GetInt(), input[4].GetInt(), input[5].GetInt());
-      else
-        capture.error = blink_glue::ApplyDrawingMouse(
-            frame_, input[0].GetInt(), input[1].GetInt(), input[2].GetInt(),
-            input[3].GetInt(), input[4].GetInt(), input[5].GetInt(),
-            input[6].GetInt());
+      capture.error = apply_input(arguments[2].GetList());
     }
     values->SetString(1, capture.error);
     values->SetInt(2, 0);
