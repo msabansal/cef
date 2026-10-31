@@ -1,0 +1,35 @@
+diff --git third_party/blink/renderer/core/page/chrome_client_impl.cc third_party/blink/renderer/core/page/chrome_client_impl.cc
+index 8a9acc6dc7e9330243cd976d8ba128121b327b9a..e4c739efdb3e0c8bbc320ddd9f1c42b130dc9a60 100644
+--- third_party/blink/renderer/core/page/chrome_client_impl.cc
++++ third_party/blink/renderer/core/page/chrome_client_impl.cc
+@@ -130,6 +130,20 @@ namespace blink {
+ 
+ namespace {
+ 
++// Reach command mode holds begin frames, so the compositor never asks for a
++// main frame. A registered hook instead learns that a local root needs a
++// visual update, letting the embedder schedule its next drawing capture.
++void (*g_reach_frame_request_hook)(LocalFrame&) = nullptr;
++
++}  // namespace
++
++CORE_EXPORT void SetReachFrameRequestHook(void (*hook)(LocalFrame&));
++void SetReachFrameRequestHook(void (*hook)(LocalFrame&)) {
++  g_reach_frame_request_hook = hook;
++}
++
++namespace {
++
+ const char* UIElementTypeToString(ChromeClient::UIElementType ui_element_type) {
+   switch (ui_element_type) {
+     case ChromeClient::UIElementType::kAlertDialog:
+@@ -595,6 +609,9 @@ void ChromeClientImpl::ScheduleAnimation(const LocalFrameView* frame_view,
+                                          base::TimeDelta delay,
+                                          bool urgent) {
+   LocalFrame& frame = frame_view->GetFrame();
++  if (g_reach_frame_request_hook) {
++    g_reach_frame_request_hook(frame.LocalFrameRoot());
++  }
+   // If the frame is still being created, it might not yet have a WebWidget.
+   // TODO(dcheng): Is this the right thing to do? Is there a way to avoid having
+   // a local frame root that doesn't have a WebWidget? During initialization

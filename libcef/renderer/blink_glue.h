@@ -89,6 +89,11 @@ CaptureRasterFallback(
 BLINK_EXPORT CefDrawingCommands
 GetDrawingFrameInfo(blink::WebLocalFrame* frame, bool raster = false);
 
+// Command mode only: |callback| runs once for a local root that needs a visual
+// update, then again only after that root's next drawing-command capture.
+BLINK_EXPORT void SetDrawingFrameRequestCallback(
+    std::function<void(blink::WebLocalFrame*)> callback);
+
 BLINK_EXPORT CefDrawingCommands
 GetDrawingInputRoute(blink::WebLocalFrame* frame, bool keyboard, int x, int y);
 BLINK_EXPORT bool IsDrawingDocument(blink::WebLocalFrame* frame,

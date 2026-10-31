@@ -113,7 +113,42 @@
 
 #include "base/logging.h"
 
+namespace blink {
+// Defined by the reach_frame_requests patch in chrome_client_impl.cc.
+CORE_EXPORT void SetReachFrameRequestHook(void (*hook)(LocalFrame&));
+}  // namespace blink
+
 namespace blink_glue {
+
+namespace {
+
+// Local roots already reported as needing a visual update since their last
+// drawing-command capture. Pointers are only compared, never dereferenced.
+std::set<const blink::LocalFrame*>& RequestedFrameRoots() {
+  static base::NoDestructor<std::set<const blink::LocalFrame*>> roots;
+  return *roots;
+}
+
+std::function<void(blink::WebLocalFrame*)>& FrameRequestCallback() {
+  static base::NoDestructor<std::function<void(blink::WebLocalFrame*)>> callback;
+  return *callback;
+}
+
+void OnFrameRequested(blink::LocalFrame& root) {
+  if (!FrameRequestCallback() || !RequestedFrameRoots().insert(&root).second)
+    return;
+  if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
+    FrameRequestCallback()(web_frame);
+}
+
+}  // namespace
+
+void SetDrawingFrameRequestCallback(
+    std::function<void(blink::WebLocalFrame*)> callback) {
+  if (!blink::Canvas2DBitmapProvider::IsReachCommandMode()) return;
+  FrameRequestCallback() = std::move(callback);
+  blink::SetReachFrameRequestHook(&OnFrameRequested);
+}
 
 namespace {
 
@@ -1553,6 +1588,9 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
     return result;
   }
   blink::Persistent<blink::Page> page = frame->GetPage();
+  // Visual update requests made from here on (including by this capture's own
+  // animation and lifecycle steps) are reported again for the next capture.
+  RequestedFrameRoots().erase(&frame->LocalFrameRoot());
   // Held begin frames also suppress the compositor's idle-period signal.
   // Let Blink schedule idle work normally between command captures.
   static_cast<blink::scheduler::MainThreadSchedulerImpl&>(

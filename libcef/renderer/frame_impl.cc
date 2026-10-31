@@ -78,7 +78,22 @@ v8::Isolate* GetFrameIsolate(blink::WebLocalFrame* frame) {
 CefFrameImpl::CefFrameImpl(CefBrowserImpl* browser, blink::WebLocalFrame* frame)
     : browser_(browser),
       frame_(frame),
-      frame_debug_str_(GetDebugString(frame)) {}
+      frame_debug_str_(GetDebugString(frame)) {
+  // Drawing-command mode holds begin frames; tell the browser when a page
+  // needs a visual update so it captures on demand instead of polling.
+  static const bool registered = [] {
+    blink_glue::SetDrawingFrameRequestCallback([](blink::WebLocalFrame* root) {
+      auto browser = CefBrowserImpl::GetBrowserForMainFrame(root->Top());
+      if (!browser) return;
+      if (auto impl = browser->GetWebFrameImpl(root)) {
+        impl->SendProcessMessage(
+            PID_BROWSER, CefProcessMessage::Create("Reach.FrameRequested.v1"));
+      }
+    });
+    return true;
+  }();
+  (void)registered;
+}
 
 CefFrameImpl::~CefFrameImpl() = default;
 
