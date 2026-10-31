@@ -1647,6 +1647,13 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       state.Set("volume", media->volume());
       state.Set("muted", media->muted());
       state.Set("loop", media->Loop());
+      // Like image sources, an exact HTTPS URL lets the client stream the
+      // original through the identity-free, cacheable /server route.
+      if (url.ProtocolIs("https") && !url.HasFragmentIdentifier() &&
+          url.User().empty() && url.Pass().empty() &&
+          url.GetString().length() <= 512) {
+        state.Set("source", url.GetString().Utf8());
+      }
       auto json = base::WriteJson(state);
       if (!json || json->size() > 4096) {
         result.error = "Media state serialization failed";
