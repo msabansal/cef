@@ -155,7 +155,14 @@ diff --git content/browser/devtools/protocol/network_handler.cc content/browser/
 index 7a9d60a1e3bf3cf217cf88ab760dfcb7e37b25ed..3713c107d8623df0793d696b771e931111ec8fa6 100644
 --- content/browser/devtools/protocol/network_handler.cc
 +++ content/browser/devtools/protocol/network_handler.cc
-@@ -4097,9 +4097,11 @@ void NetworkHandler::OnLoadNetworkResourceFinished(
+@@ -115,5 +115,6 @@
+ #include "third_party/abseil-cpp/absl/container/flat_hash_map.h"
+ #include "third_party/abseil-cpp/absl/functional/overload.h"
++#include "third_party/blink/public/common/loader/network_utils.h"
+ #include "third_party/blink/public/common/loader/referrer_utils.h"
+ #include "third_party/blink/public/mojom/navigation/navigation_params.mojom.h"
+ #include "third_party/blink/public/platform/resource_request_blocked_reason.h"
+@@ -4097,9 +4098,11 @@ void NetworkHandler::OnLoadNetworkResourceFinished(
    auto it = loaders_.find(loader);
    CHECK(it != loaders_.end());
    auto callback = std::move(it->second);
@@ -167,7 +174,7 @@ index 7a9d60a1e3bf3cf217cf88ab760dfcb7e37b25ed..3713c107d8623df0793d696b771e9311
  
    if (net_error != net::OK) {
      result->SetNetError(net_error);
-@@ -4180,6 +4182,45 @@ void NetworkHandler::LoadNetworkResource(
+@@ -4180,6 +4183,55 @@ void NetworkHandler::LoadNetworkResource(
      std::unique_ptr<LoadNetworkResourceCallback> callback) {
    GURL gurl(url);
    const bool is_gurl_valid = gurl.is_valid();
@@ -209,11 +216,21 @@ index 7a9d60a1e3bf3cf217cf88ab760dfcb7e37b25ed..3713c107d8623df0793d696b771e9311
 +        wire_headers.SetHeader(entry.first, entry.second);
 +      }
 +    }
++    // Images are negotiated (Vary: Accept): ask with the image request Accept
++    // so the browser cache selects the representation the page loaded.
++    const std::string destination = options->GetDestination("");
++    if (destination == "image") {
++      wire_headers.SetHeader(net::HttpRequestHeaders::kAccept,
++                             blink::network_utils::ImageAcceptHeader());
++    } else if (!destination.empty()) {
++      callback->sendFailure(Response::InvalidParams("Invalid wire destination"));
++      return;
++    }
 +  }
    if (!is_gurl_valid) {
      callback->sendFailure(Response::InvalidParams("The url must be valid"));
      return;
-@@ -4234,7 +4275,9 @@ void NetworkHandler::LoadNetworkResource(
+@@ -4234,7 +4286,9 @@ void NetworkHandler::LoadNetworkResource(
  
      network::CSPCheckResult result = csp_context.IsAllowedByCsp(
          frame->policy_container_host()->policies().content_security_policies,
@@ -224,7 +241,7 @@ index 7a9d60a1e3bf3cf217cf88ab760dfcb7e37b25ed..3713c107d8623df0793d696b771e9311
          /*has_followed_redirect=*/false, /*source_location=*/nullptr,
          network::CSPContext::CHECK_ENFORCED_CSP,
          /*is_opaque_fenced_frame=*/false);
-@@ -4290,10 +4333,16 @@ void NetworkHandler::LoadNetworkResource(
+@@ -4290,10 +4344,16 @@ void NetworkHandler::LoadNetworkResource(
          std::move(url_loader_factory), std::move(gurl),
          frame->GetLastCommittedOrigin(), frame->ComputeSiteForCookies(),
          caching, include_credentials, std::move(complete_callback),
@@ -242,7 +259,7 @@ index 7a9d60a1e3bf3cf217cf88ab760dfcb7e37b25ed..3713c107d8623df0793d696b771e9311
    scoped_refptr<DevToolsAgentHostImpl> host =
        DevToolsAgentHostImpl::GetForId(host_id_);
    if (host) {
-@@ -4316,6 +4365,22 @@ void NetworkHandler::LoadNetworkResource(
+@@ -4316,6 +4376,22 @@ void NetworkHandler::LoadNetworkResource(
    callback->sendFailure(Response::ServerError("Target not supported"));
  }
  
@@ -324,7 +341,7 @@ index 0161e0583b8ff7baedf8626a36a87b07c8ca17db..a137904b64875252589038d8f74bd3ab
  
    # An options object that may be extended later to better support CORS,
    # CORB and streaming.
-@@ -2240,6 +2242,14 @@ domain Network
+@@ -2240,6 +2242,16 @@ domain Network
      properties
        boolean disableCache
        boolean includeCredentials
@@ -336,10 +353,12 @@ index 0161e0583b8ff7baedf8626a36a87b07c8ca17db..a137904b64875252589038d8f74bd3ab
 +      optional string ifRange
 +      optional string ifNoneMatch
 +      optional string ifModifiedSince
++      # Reach: request destination; only "image" (sends the image Accept).
++      optional string destination
  
    # Fetches the resource and returns the content.
    experimental command loadNetworkResource
-@@ -2254,6 +2264,11 @@ domain Network
+@@ -2254,6 +2266,11 @@ domain Network
      returns
        LoadNetworkResourcePageResult resource
  
