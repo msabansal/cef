@@ -1,0 +1,16 @@
+diff --git content/browser/web_contents/web_contents_impl.cc content/browser/web_contents/web_contents_impl.cc
+--- content/browser/web_contents/web_contents_impl.cc
++++ content/browser/web_contents/web_contents_impl.cc
+@@ -5862,7 +5862,11 @@
+ 
+   if (!new_contents) {
+     if (!is_guest) {
+-      create_params.context = view_->GetNativeView();
++      // The context only parents a default (windowed) view. An embedder view
++      // (e.g. a windowless CEF popup) ignores it, and a windowless opener has
++      // no native view to give, so don't ask it for one.
++      if (!create_params.view)
++        create_params.context = view_->GetNativeView();
+       new_contents = WebContentsImpl::Create(create_params);
+     } else {
+       new_contents =
