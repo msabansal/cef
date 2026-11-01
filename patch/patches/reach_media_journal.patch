@@ -13,10 +13,10 @@ index 1d7cd61..1d0f316 100644
    "media/remote_playback_observer.h",
 diff --git third_party/blink/renderer/core/html/media/reach_media_journal.cc third_party/blink/renderer/core/html/media/reach_media_journal.cc
 new file mode 100644
-index 0000000..d070387
+index 0000000..7b3823c
 --- /dev/null
 +++ third_party/blink/renderer/core/html/media/reach_media_journal.cc
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,300 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -24,8 +24,10 @@ index 0000000..d070387
 +#include "third_party/blink/renderer/core/html/media/reach_media_journal.h"
 +
 +#include <algorithm>
++#include <bit>
 +#include <map>
 +#include <string_view>
++#include <type_traits>
 +#include <utility>
 +
 +#include "base/no_destructor.h"
@@ -72,8 +74,13 @@ index 0000000..d070387
 +
 +template <typename T>
 +void Put(std::vector<uint8_t>& out, T value) {
-+  const auto bytes = base::byte_span_from_ref(value);
-+  out.insert(out.end(), bytes.begin(), bytes.end());
++  if constexpr (std::is_floating_point_v<T>) {
++    static_assert(sizeof(T) == sizeof(uint64_t));
++    Put<uint64_t>(out, std::bit_cast<uint64_t>(value));
++  } else {
++    const auto bytes = base::byte_span_from_ref(value);
++    out.insert(out.end(), bytes.begin(), bytes.end());
++  }
 +}
 +
 +template <typename T>
