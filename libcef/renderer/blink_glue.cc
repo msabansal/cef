@@ -5,15 +5,19 @@
 
 #include "cef/libcef/renderer/blink_glue.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <deque>
 #include <map>
+#include <optional>
 #include <set>
+#include <string_view>
 #include <tuple>
 
 #include "base/functional/bind.h"
 #include "base/functional/callback_helpers.h"
+#include "base/hash/hash.h"
 #include "base/json/json_writer.h"
 #include "base/no_destructor.h"
 #include "base/strings/string_number_conversions.h"
@@ -99,9 +103,14 @@
 #include "third_party/blink/renderer/platform/loader/fetch/script_fetch_options.h"
 #include "third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.h"
 #include "third_party/blink/renderer/platform/weborigin/scheme_registry.h"
+#include "third_party/skia/include/core/SkBlendMode.h"
+#include "third_party/skia/include/core/SkColorFilter.h"
 #include "third_party/skia/include/core/SkData.h"
 #include "third_party/skia/include/core/SkFontMgr.h"
 #include "third_party/skia/include/core/SkImage.h"
+#include "third_party/skia/include/core/SkImageFilter.h"
+#include "third_party/skia/include/core/SkMatrix.h"
+#include "third_party/skia/include/core/SkPaint.h"
 #include "third_party/skia/include/core/SkPicture.h"
 #include "third_party/skia/include/core/SkPictureRecorder.h"
 #include "third_party/skia/include/core/SkSerialProcs.h"
@@ -109,6 +118,7 @@
 #include "third_party/skia/include/core/SkSurface.h"
 #include "third_party/skia/include/core/SkTypeface.h"
 #include "third_party/skia/include/encode/SkPngRustEncoder.h"
+#include "third_party/skia/include/utils/SkNoDrawCanvas.h"
 #include "third_party/skia/src/core/SkFontDescriptor.h"
 #include "third_party/skia/src/core/SkReachResource.h"
 #include "ui/events/keycodes/dom/dom_key.h"
@@ -1770,6 +1780,312 @@ std::vector<uint8_t> CaptureScrollLayout(
   return out;
 }
 
+// Plays back a skeleton and reports, for every chunk placeholder drawn, the
+// viewport pixels its drawing can affect and a hash of the transform, clip and
+// enclosing layer effects applied to it. Clips are tracked conservatively
+// (bounds only), and layer effects that may touch pixels outside the drawn
+// content expand the rect to the clip at the layer's save.
+class DamageCanvas final : public SkNoDrawCanvas {
+ public:
+  struct Entry {
+    size_t index;
+    SkIRect rect;
+    uint32_t state;
+  };
+
+  DamageCanvas(int width, int height,
+               const std::map<const SkPicture*, size_t>* placeholders)
+      : SkNoDrawCanvas(width, height),
+        viewport_(SkIRect::MakeWH(width, height)),
+        placeholders_(placeholders) {}
+
+  const std::vector<Entry>& entries() const { return entries_; }
+  bool overflowed() const { return overflowed_; }
+
+ protected:
+  void willSave() override { frames_.emplace_back(); }
+
+  bool onDoSaveBehind(const SkRect*) override {
+    frames_.emplace_back();
+    return false;
+  }
+
+  SaveLayerStrategy getSaveLayerStrategy(const SaveLayerRec& rec) override {
+    Frame frame;
+    frame.layer = true;
+    frame.ctm = getTotalMatrix();
+    frame.clip = getDeviceClipBounds();
+    frame.backdrop = rec.fBackdrop;
+    if (rec.fPaint) {
+      frame.alpha = rec.fPaint->getAlphaf();
+      const auto mode = rec.fPaint->asBlendMode();
+      frame.blend = mode ? static_cast<int>(*mode) : -1;
+      frame.filter = rec.fPaint->getImageFilter();
+      frame.color_filter = rec.fPaint->getColorFilter();
+    }
+    // Several filters, or effects applied over the prior contents, are not
+    // bounded by the drawn content.
+    frame.fills_clip =
+        frame.backdrop || frame.color_filter || !rec.fFilters.empty() ||
+        ((rec.fSaveLayerFlags & kInitWithPrevious_SaveLayerFlag) &&
+         (frame.filter || frame.alpha < 1.f || frame.blend != kSrcOverMode));
+    switch (frame.blend) {
+      case -1:
+      case static_cast<int>(SkBlendMode::kClear):
+      case static_cast<int>(SkBlendMode::kSrc):
+      case static_cast<int>(SkBlendMode::kSrcIn):
+      case static_cast<int>(SkBlendMode::kDstIn):
+      case static_cast<int>(SkBlendMode::kSrcOut):
+      case static_cast<int>(SkBlendMode::kDstATop):
+      case static_cast<int>(SkBlendMode::kModulate):
+        // Transparent layer pixels change the destination.
+        frame.fills_clip = true;
+        break;
+      default:
+        break;
+    }
+    frame.effects = FlattenableHash(frame.filter) ^
+                    (FlattenableHash(frame.backdrop) * 31u) ^
+                    (FlattenableHash(frame.color_filter) * 961u);
+    for (const auto& filter : rec.fFilters)
+      frame.effects = frame.effects * 31u + FlattenableHash(filter.get());
+    frames_.push_back(frame);
+    return kNoLayer_SaveLayerStrategy;
+  }
+
+  void willRestore() override {
+    if (!frames_.empty())
+      frames_.pop_back();
+  }
+
+  void onDrawPicture(const SkPicture* picture, const SkMatrix* matrix,
+                     const SkPaint* paint) override {
+    const auto found = placeholders_->find(picture);
+    if (found == placeholders_->end()) {
+      SkCanvas::onDrawPicture(picture, matrix, paint);
+      return;
+    }
+    if (!matrix && !paint) {
+      Record(found->second, picture->cullRect());
+      return;
+    }
+    // Same state as SkCanvas::drawPicture applies before playback.
+    const int count = getSaveCount();
+    if (paint) {
+      SkRect layer_bounds = picture->cullRect();
+      if (matrix)
+        layer_bounds = matrix->mapRect(layer_bounds);
+      saveLayer(&layer_bounds, paint);
+    } else {
+      save();
+    }
+    if (matrix)
+      concat(*matrix);
+    Record(found->second, picture->cullRect());
+    restoreToCount(count);
+  }
+
+ private:
+  static constexpr int kSrcOverMode = static_cast<int>(SkBlendMode::kSrcOver);
+  static constexpr size_t kMaxEntries = 65536;
+
+  struct Frame {
+    bool layer = false;
+    SkMatrix ctm;
+    SkIRect clip = SkIRect::MakeEmpty();
+    float alpha = 1.f;
+    int blend = kSrcOverMode;
+    const SkImageFilter* filter = nullptr;
+    const SkImageFilter* backdrop = nullptr;
+    const SkColorFilter* color_filter = nullptr;
+    bool fills_clip = false;
+    uint32_t effects = 0;
+  };
+
+  // Hash of an effect's serialized form; nested images, pictures and
+  // typefaces contribute their identity only.
+  uint32_t FlattenableHash(const SkFlattenable* flattenable) {
+    if (!flattenable)
+      return 0;
+    const auto [cached, inserted] = flattenables_.try_emplace(flattenable, 1u);
+    if (inserted) {
+      SkSerialProcs procs;
+      procs.fImageProc = [](SkImage* image, void*) -> SkSerialReturnType {
+        const uint32_t id = image->uniqueID();
+        return SkData::MakeWithCopy(&id, sizeof(id));
+      };
+      procs.fPictureProc = [](SkPicture* nested, void*) -> SkSerialReturnType {
+        const uint32_t id = nested->uniqueID();
+        return SkData::MakeWithCopy(&id, sizeof(id));
+      };
+      procs.fTypefaceProc = [](SkTypeface* typeface,
+                               void*) -> SkSerialReturnType {
+        const uint32_t id = typeface->uniqueID();
+        return SkData::MakeWithCopy(&id, sizeof(id));
+      };
+      if (const auto data = flattenable->serialize(&procs)) {
+        cached->second = static_cast<uint32_t>(base::FastHash(std::string_view(
+            static_cast<const char*>(data->data()), data->size())));
+      }
+    }
+    return cached->second;
+  }
+
+  template <typename T>
+  void Mix(const T& value) {
+    scratch_.append(reinterpret_cast<const char*>(&value), sizeof(value));
+  }
+
+  void MixRect(const SkIRect& rect) {
+    for (const int32_t value : {rect.fLeft, rect.fTop, rect.fRight,
+                                rect.fBottom}) {
+      Mix(value);
+    }
+  }
+
+  void Record(size_t index, const SkRect& cull) {
+    if (entries_.size() >= kMaxEntries) {
+      overflowed_ = true;
+      return;
+    }
+    const SkMatrix total = getTotalMatrix();
+    const SkIRect clip = getDeviceClipBounds();
+    scratch_.clear();
+    std::array<SkScalar, 9> values;
+    total.get9(values.data());
+    Mix(values);
+    MixRect(clip);
+
+    SkRect rect = SkRect::Make(clip);
+    if (!total.hasPerspective()) {
+      const SkRect mapped = total.mapRect(cull);
+      if (mapped.isFinite() && !rect.intersect(mapped))
+        rect.setEmpty();
+    }
+    // Innermost layer first: a filter spreads its (clipped) input, and its
+    // output is clipped by the clip in effect when the layer was saved.
+    for (auto frame = frames_.rbegin(); frame != frames_.rend(); ++frame) {
+      if (!frame->layer)
+        continue;
+      const SkRect layer_clip = SkRect::Make(frame->clip);
+      if (frame->fills_clip) {
+        rect = layer_clip;
+      } else if (frame->filter) {
+        SkMatrix inverse;
+        if (!frame->filter->canComputeFastBounds() ||
+            frame->ctm.hasPerspective() || !frame->ctm.invert(&inverse)) {
+          rect = layer_clip;
+        } else if (!rect.isEmpty()) {
+          SkRect spread = frame->ctm.mapRect(
+              frame->filter->computeFastBounds(inverse.mapRect(rect)));
+          if (!spread.isFinite())
+            spread = layer_clip;
+          if (!spread.intersect(layer_clip))
+            spread.setEmpty();
+          rect = spread;
+        }
+      }
+    }
+    for (const auto& frame : frames_) {
+      if (!frame.layer)
+        continue;
+      Mix(frame.alpha);
+      Mix(frame.blend);
+      Mix(frame.effects);
+      MixRect(frame.clip);
+      std::array<SkScalar, 9> layer_values;
+      frame.ctm.get9(layer_values.data());
+      Mix(layer_values);
+    }
+
+    SkIRect device = SkIRect::MakeEmpty();
+    if (!rect.isEmpty() && rect.isFinite()) {
+      device = rect.roundOut();
+      device.outset(1, 1);
+      if (!device.intersect(viewport_))
+        device.setEmpty();
+    }
+    if (device.isEmpty())
+      device.setEmpty();
+    entries_.push_back(
+        {index, device, static_cast<uint32_t>(base::FastHash(scratch_))});
+  }
+
+  const SkIRect viewport_;
+  const std::map<const SkPicture*, size_t>* const placeholders_;
+  std::vector<Frame> frames_;
+  std::vector<Entry> entries_;
+  std::map<const SkFlattenable*, uint32_t> flattenables_;
+  std::string scratch_;
+  bool overflowed_ = false;
+};
+
+void AppendHex(std::string* out, base::span<const uint8_t> bytes) {
+  static constexpr std::string_view kDigits = "0123456789abcdef";
+  for (const uint8_t byte : bytes) {
+    out->push_back(kDigits[byte >> 4]);
+    out->push_back(kDigits[byte & 15]);
+  }
+}
+
+// Damage annotations: compact JSON, split into parts of at most 4000 bytes,
+// {"damage":1,"part":P,"parts":N,"w":W,"h":H,"e":[[key,x,y,r,b,state],...]}
+// with entries in placeholder paint order. Empty when they do not fit in
+// `max_parts` annotations.
+std::vector<std::string> FormatDamage(const DamageCanvas& canvas,
+                                      const std::vector<ChunkKey>& keys,
+                                      int width, int height,
+                                      size_t max_parts) {
+  constexpr size_t kMaxAnnotationBytes = 4000;
+  // Upper bound of the per-part JSON envelope.
+  constexpr size_t kEnvelopeBytes = 96;
+  if (canvas.overflowed() || !max_parts)
+    return {};
+  std::vector<std::string> bodies(1);
+  std::string entry;
+  for (const auto& damage : canvas.entries()) {
+    if (damage.index >= keys.size())
+      return {};
+    entry = "[\"";
+    AppendHex(&entry, keys[damage.index]);
+    entry += "\",";
+    for (const int32_t value : {damage.rect.fLeft, damage.rect.fTop,
+                                damage.rect.fRight, damage.rect.fBottom}) {
+      entry += base::NumberToString(value);
+      entry += ',';
+    }
+    entry += '"';
+    const uint32_t state = damage.state;
+    const std::array<uint8_t, 4> state_bytes = {
+        static_cast<uint8_t>(state >> 24), static_cast<uint8_t>(state >> 16),
+        static_cast<uint8_t>(state >> 8), static_cast<uint8_t>(state)};
+    AppendHex(&entry, state_bytes);
+    entry += "\"]";
+    if (!bodies.back().empty() &&
+        bodies.back().size() + 1 + entry.size() >
+            kMaxAnnotationBytes - kEnvelopeBytes) {
+      if (bodies.size() >= max_parts)
+        return {};
+      bodies.emplace_back();
+    }
+    if (!bodies.back().empty())
+      bodies.back() += ',';
+    bodies.back() += entry;
+  }
+  std::vector<std::string> parts;
+  for (size_t part = 0; part < bodies.size(); ++part) {
+    std::string text = "{\"damage\":1,\"part\":" + base::NumberToString(part) +
+                       ",\"parts\":" + base::NumberToString(bodies.size()) +
+                       ",\"w\":" + base::NumberToString(width) +
+                       ",\"h\":" + base::NumberToString(height) +
+                       ",\"e\":[" + bodies[part] + "]}";
+    if (text.size() > kMaxAnnotationBytes)
+      return {};
+    parts.push_back(std::move(text));
+  }
+  return parts;
+}
+
 // The skeleton is the normal lifecycle conversion of the local root's paint
 // artifact, with each kept chunk's drawings replaced by a placeholder picture
 // that serializes as its 16-byte key. Chunks are culled as a whole against the
@@ -1896,15 +2212,23 @@ CefDrawingCommands CaptureIncrementalPicture(
         state.error.empty() ? "Skia skeleton recording failed" : state.error;
     return result;
   }
-  SkPictureRecorder media_recorder;
-  auto* media_canvas = media_recorder.beginRecording(picture->cullRect());
-  for (const auto& [id, data] : media_states) {
-    media_canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.MediaState.v1",
-                                 data.get());
+  // Where each kept chunk lands in the viewport, so the client can limit
+  // rasterization to changed regions. Optional: clients redraw everything
+  // when a skeleton carries no damage annotations.
+  std::vector<std::string> damage;
+  {
+    constexpr size_t kMaxAnnotations = 1024;
+    constexpr size_t kMaxDamageParts = 1000;
+    DamageCanvas damage_canvas(bounds.width(), bounds.height(),
+                               &skeleton.placeholders);
+    picture->playback(&damage_canvas);
+    if (media_states.size() < kMaxAnnotations) {
+      damage = FormatDamage(
+          damage_canvas, keys, bounds.width(), bounds.height(),
+          std::min(kMaxDamageParts, kMaxAnnotations - media_states.size()));
+    }
   }
-  // Replaying into a recorder keeps placeholder references intact.
-  picture->playback(media_canvas);
-  picture = media_recorder.finishRecordingAsPicture();
+  CaptureTimer::Get().Mark("damage");
   SkSerialProcs procs;
   procs.fImageProc = &SerializeOriginalImage;
   procs.fImageCtx = &state;
@@ -1912,15 +2236,45 @@ CefDrawingCommands CaptureIncrementalPicture(
   procs.fTypefaceCtx = &state;
   procs.fPictureProc = &SerializeChunkReference;
   procs.fPictureCtx = &skeleton;
-  BoundedPaintStream skeleton_stream(kMaxPictureBytes);
-  picture->serialize(&skeleton_stream, &procs);
+  const uint64_t skeleton_image_pixels = state.image_pixels;
+  const auto serialize_skeleton =
+      [&](bool with_damage) -> std::optional<std::vector<uint8_t>> {
+    state.image_pixels = skeleton_image_pixels;
+    skeleton.referenced.clear();
+    skeleton.seen.clear();
+    SkPictureRecorder media_recorder;
+    auto* media_canvas = media_recorder.beginRecording(picture->cullRect());
+    for (const auto& [id, data] : media_states) {
+      media_canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.MediaState.v1",
+                                   data.get());
+    }
+    if (with_damage) {
+      for (const auto& text : damage) {
+        const auto data = SkData::MakeWithCopy(text.data(), text.size());
+        media_canvas->drawAnnotation(SkRect::MakeEmpty(),
+                                     "Reach.MediaState.v1", data.get());
+      }
+    }
+    // Replaying into a recorder keeps placeholder references intact.
+    picture->playback(media_canvas);
+    BoundedPaintStream stream(kMaxPictureBytes);
+    media_recorder.finishRecordingAsPicture()->serialize(&stream, &procs);
+    if (stream.failed())
+      return std::nullopt;
+    return stream.TakeBytes();
+  };
+  auto skeleton_bytes = serialize_skeleton(!damage.empty());
+  if (!skeleton_bytes && state.error.empty() && !damage.empty()) {
+    damage.clear();
+    skeleton_bytes = serialize_skeleton(false);
+  }
   CaptureTimer::Get().Mark("skeleton");
-  if (!state.error.empty() || skeleton_stream.failed()) {
+  if (!state.error.empty() || !skeleton_bytes) {
     result.error = state.error.empty() ? "Serialized skeleton budget exceeded"
                                        : state.error;
     return result;
   }
-  result.picture = skeleton_stream.TakeBytes();
+  result.picture = std::move(*skeleton_bytes);
   if (result.picture.empty()) {
     result.error = "Skia produced an empty skeleton";
     return result;
@@ -2070,8 +2424,14 @@ CefDrawingCommands CaptureIncrementalPicture(
                              " record=" + base::NumberToString(recording.InMilliseconds()) +
                              " serialize=" + base::NumberToString(serializing.InMilliseconds()) +
                              " hash=" + base::NumberToString(hashing.InMilliseconds()));
-  if (result.picture.size() + new_bytes + state.bytes + state.font_bytes +
-          state.identity_bytes > kMaxPaintBytes) {
+  const size_t paint_bytes =
+      new_bytes + state.bytes + state.font_bytes + state.identity_bytes;
+  if (result.picture.size() + paint_bytes > kMaxPaintBytes &&
+      !damage.empty()) {
+    if (auto plain = serialize_skeleton(false); plain && state.error.empty())
+      result.picture = std::move(*plain);
+  }
+  if (result.picture.size() + paint_bytes > kMaxPaintBytes) {
     result.error = "Aggregate picture and original resource budget exceeded";
     return result;
   }
