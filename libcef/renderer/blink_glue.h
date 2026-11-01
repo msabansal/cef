@@ -103,6 +103,14 @@ BLINK_EXPORT void SetDrawingFrameRequestCallback(
 BLINK_EXPORT CefDrawingCommands
 GetDrawingInputRoute(blink::WebLocalFrame* frame, bool keyboard, int x, int y,
                      const std::function<std::string()>& apply = nullptr);
+// Command mode only: serialized MediaSource operations of journal |journal|
+// from |cursor|, at most |max_bytes|. The journaled element must belong to
+// |frame|'s local root. Returns an error, or empty and fills |out|.
+BLINK_EXPORT std::string ReadDrawingMediaJournal(blink::WebLocalFrame* frame,
+                                                 const std::string& journal,
+                                                 const std::string& cursor,
+                                                 int max_bytes,
+                                                 std::vector<uint8_t>* out);
 BLINK_EXPORT bool IsDrawingDocument(blink::WebLocalFrame* frame,
                                     const std::string& document);
 

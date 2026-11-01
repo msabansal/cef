@@ -930,6 +930,36 @@ void CefFrameImpl::SendMessage(const std::string& name,
     SendProcessMessage(PID_BROWSER, response);
     return;
   }
+  if (name == "Reach.DrawingMedia.v1") {
+    // [request, journal, cursor, max bytes] -> Reach.DrawingMediaJournal.v1
+    // [request, error, operations].
+    CefRefPtr<CefFrameImpl> retain(this);
+    auto response = CefProcessMessage::Create("Reach.DrawingMediaJournal.v1");
+    auto values = response->GetArgumentList();
+    const bool valid = arguments.size() == 4 && arguments[0].is_int() &&
+                       arguments[0].GetInt() > 0 && arguments[1].is_string() &&
+                       arguments[1].GetString().size() <= 20 &&
+                       arguments[2].is_string() &&
+                       arguments[2].GetString().size() <= 20 &&
+                       arguments[3].is_int() && arguments[3].GetInt() > 0 &&
+                       arguments[3].GetInt() <= 32 * 1024 * 1024;
+    values->SetInt(0, valid ? arguments[0].GetInt() : 0);
+    std::vector<uint8_t> operations;
+    std::string error = !valid || !frame_
+        ? "Invalid or detached media journal request"
+        : blink_glue::ReadDrawingMediaJournal(
+              frame_, arguments[1].GetString(), arguments[2].GetString(),
+              arguments[3].GetInt(), &operations);
+    values->SetString(1, error);
+    if (error.empty()) {
+      values->SetBinary(2, CefBinaryValue::Create(operations.data(),
+                                                  operations.size()));
+    } else {
+      values->SetNull(2);
+    }
+    SendProcessMessage(PID_BROWSER, response);
+    return;
+  }
   if (name == "Reach.DrawingFrame.v1") {
     CefRefPtr<CefFrameImpl> retain(this);
     auto response = CefProcessMessage::Create("Reach.DrawingCommands.v1");

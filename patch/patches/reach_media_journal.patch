@@ -1,0 +1,685 @@
+diff --git third_party/blink/renderer/core/html/build.gni third_party/blink/renderer/core/html/build.gni
+index 1d7cd61..1d0f316 100644
+--- third_party/blink/renderer/core/html/build.gni
++++ third_party/blink/renderer/core/html/build.gni
+@@ -531,6 +531,8 @@ blink_core_sources_html = [
+   "media/media_video_visibility_tracker.h",
+   "media/picture_in_picture_interstitial.cc",
+   "media/picture_in_picture_interstitial.h",
++  "media/reach_media_journal.cc",
++  "media/reach_media_journal.h",
+   "media/remote_playback_controller.cc",
+   "media/remote_playback_controller.h",
+   "media/remote_playback_observer.h",
+diff --git third_party/blink/renderer/core/html/media/reach_media_journal.cc third_party/blink/renderer/core/html/media/reach_media_journal.cc
+new file mode 100644
+index 0000000..d070387
+--- /dev/null
++++ third_party/blink/renderer/core/html/media/reach_media_journal.cc
+@@ -0,0 +1,293 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/core/html/media/reach_media_journal.h"
++
++#include <algorithm>
++#include <map>
++#include <string_view>
++#include <utility>
++
++#include "base/no_destructor.h"
++#include "third_party/blink/renderer/core/frame/local_frame.h"
++#include "third_party/blink/renderer/core/html/media/html_media_element.h"
++
++namespace blink {
++
++namespace {
++
++// One append larger than this disables the journal (the page still plays).
++constexpr size_t kMaxOperationBytes = 16 * 1024 * 1024;
++// Older media appends are compacted away beyond these budgets; the latest
++// initialization segment of every buffer is always kept.
++constexpr size_t kMaxJournalBytes = 64 * 1024 * 1024;
++constexpr size_t kMaxTotalBytes = 192 * 1024 * 1024;
++constexpr size_t kMaxEntries = 65536;
++constexpr size_t kMaxTextBytes = 256;
++constexpr size_t kEntryOverhead = 64;
++
++void (*g_changed)(LocalFrame&) = nullptr;
++size_t g_total_bytes = 0;
++uint64_t g_next_id = 1;
++
++std::map<uint64_t, ReachMediaJournal*>& Journals() {
++  static base::NoDestructor<std::map<uint64_t, ReachMediaJournal*>> journals;
++  return *journals;
++}
++
++// WebM EBML header, or an ISO BMFF ftyp/moov box.
++bool IsInitializationSegment(base::span<const uint8_t> data) {
++  if (data.size() >= 4 && data[0] == 0x1A && data[1] == 0x45 &&
++      data[2] == 0xDF && data[3] == 0xA3) {
++    return true;
++  }
++  if (data.size() < 8) {
++    return false;
++  }
++  const auto box = data.subspan(4u, 4u);
++  const std::string_view type(reinterpret_cast<const char*>(box.data()),
++                              box.size());
++  return type == "ftyp" || type == "moov";
++}
++
++template <typename T>
++void Put(std::vector<uint8_t>& out, T value) {
++  const auto bytes = base::byte_span_from_ref(value);
++  out.insert(out.end(), bytes.begin(), bytes.end());
++}
++
++template <typename T>
++void PutAt(std::vector<uint8_t>& out, size_t offset, T value) {
++  base::span(out).subspan(offset, sizeof(T)).copy_from(
++      base::byte_span_from_ref(value));
++}
++
++}  // namespace
++
++void ReachMediaJournal::Enable(void (*changed)(LocalFrame&)) {
++  g_changed = changed;
++}
++
++scoped_refptr<ReachMediaJournal> ReachMediaJournal::Start(
++    HTMLMediaElement& element) {
++  if (!g_changed) {
++    return nullptr;
++  }
++  if (auto* previous = ForElement(element)) {
++    previous->Close();
++  }
++  return base::WrapRefCounted(new ReachMediaJournal(element));
++}
++
++ReachMediaJournal* ReachMediaJournal::ForElement(
++    const HTMLMediaElement& element) {
++  for (const auto& [id, journal] : Journals()) {
++    if (journal->element_.Get() == &element) {
++      return journal;
++    }
++  }
++  return nullptr;
++}
++
++ReachMediaJournal* ReachMediaJournal::Find(uint64_t id) {
++  const auto found = Journals().find(id);
++  return found == Journals().end() ? nullptr : found->second;
++}
++
++ReachMediaJournal::ReachMediaJournal(HTMLMediaElement& element)
++    : id_(g_next_id++), element_(&element) {
++  Journals()[id_] = this;
++}
++
++ReachMediaJournal::~ReachMediaJournal() {
++  Journals().erase(id_);
++  g_total_bytes -= bytes_;
++}
++
++HTMLMediaElement* ReachMediaJournal::element() const {
++  return element_.Get();
++}
++
++int ReachMediaJournal::AddBuffer(const String& type) {
++  if (!usable()) {
++    return 0;
++  }
++  const int buffer = next_buffer_++;
++  Record(Kind::kAddBuffer, buffer, 0, 0, type);
++  return usable() ? buffer : 0;
++}
++
++void ReachMediaJournal::Record(Kind kind,
++                               int buffer,
++                               double a,
++                               double b,
++                               const String& text) {
++  RecordUtf8(kind, buffer, a, b, text.IsNull() ? std::string() : text.Utf8());
++}
++
++void ReachMediaJournal::RecordUtf8(Kind kind,
++                                   int buffer,
++                                   double a,
++                                   double b,
++                                   std::string_view text) {
++  const bool buffered = kind != Kind::kDuration && kind != Kind::kEndOfStream;
++  if (!usable() || (buffered && buffer <= 0)) {
++    return;
++  }
++  if (text.size() > kMaxTextBytes) {
++    Unsupported();
++    return;
++  }
++  if (kind == Kind::kAddBuffer || kind == Kind::kChangeType) {
++    expects_init_.push_back(buffer);
++  }
++  Push({0, kind, buffer, a, b, std::string(text), {}, false});
++}
++
++void ReachMediaJournal::Append(int buffer, base::span<const uint8_t> data) {
++  if (!usable() || buffer <= 0) {
++    return;
++  }
++  if (data.size() > kMaxOperationBytes) {
++    Unsupported();
++    return;
++  }
++  bool init = IsInitializationSegment(data);
++  const auto expected =
++      std::find(expects_init_.begin(), expects_init_.end(), buffer);
++  if (expected != expects_init_.end()) {
++    init = true;
++    expects_init_.erase(expected);
++  }
++  Push({0, Kind::kAppend, buffer, 0, 0, std::string(),
++        std::vector<uint8_t>(data.begin(), data.end()), init});
++}
++
++void ReachMediaJournal::Unsupported() {
++  if (unsupported_) {
++    return;
++  }
++  unsupported_ = true;
++  g_total_bytes -= bytes_;
++  bytes_ = 0;
++  entries_.clear();
++  Changed();
++}
++
++void ReachMediaJournal::Close() {
++  if (closed_) {
++    return;
++  }
++  closed_ = true;
++  g_total_bytes -= bytes_;
++  bytes_ = 0;
++  entries_.clear();
++  Journals().erase(id_);
++}
++
++void ReachMediaJournal::Push(Entry entry) {
++  entry.seq = next_++;
++  const size_t size = entry.data.size() + entry.text.size() + kEntryOverhead;
++  bytes_ += size;
++  g_total_bytes += size;
++  entries_.push_back(std::move(entry));
++  Compact();
++  Changed();
++}
++
++void ReachMediaJournal::Compact() {
++  while (bytes_ > kMaxJournalBytes || entries_.size() > kMaxEntries ||
++         g_total_bytes > kMaxTotalBytes) {
++    std::map<int, uint64_t> latest_init;
++    for (const auto& entry : entries_) {
++      if (entry.kind == Kind::kAppend && entry.init) {
++        latest_init[entry.buffer] = entry.seq;
++      }
++    }
++    auto victim = std::find_if(
++        entries_.begin(), entries_.end(), [&](const Entry& entry) {
++          if (entry.kind != Kind::kAppend) {
++            return false;
++          }
++          const auto init = latest_init.find(entry.buffer);
++          return init == latest_init.end() || init->second != entry.seq;
++        });
++    if (victim == entries_.end()) {
++      if (bytes_ > kMaxJournalBytes || entries_.size() > kMaxEntries) {
++        Unsupported();
++      }
++      return;
++    }
++    const size_t size =
++        victim->data.size() + victim->text.size() + kEntryOverhead;
++    bytes_ -= size;
++    g_total_bytes -= size;
++    dropped_ = std::max(dropped_, victim->seq);
++    entries_.erase(victim);
++  }
++}
++
++void ReachMediaJournal::Changed() {
++  if (!g_changed) {
++    return;
++  }
++  HTMLMediaElement* element = element_.Get();
++  if (!element) {
++    return;
++  }
++  if (LocalFrame* frame = element->GetDocument().GetFrame()) {
++    g_changed(frame->LocalFrameRoot());
++  }
++}
++
++// Little endian:
++//   "RMJ1" | id u64 | next cursor u64 | flags u8 (1 reset, 2 closed,
++//   4 unsupported) | count u32 | operations
++// Operation:
++//   seq u64 | kind u8 | buffer i32 | a f64 | b f64 | text u16 + UTF-8 |
++//   data u32 + bytes
++std::vector<uint8_t> ReachMediaJournal::Read(uint64_t cursor,
++                                             size_t max_bytes) const {
++  const bool reset = cursor > 0 && cursor <= dropped_;
++  const uint64_t from = reset ? 0 : cursor;
++  std::vector<uint8_t> out = {'R', 'M', 'J', '1'};
++  Put<uint64_t>(out, id_);
++  const size_t next_offset = out.size();
++  Put<uint64_t>(out, from);
++  Put<uint8_t>(out, (reset ? 1 : 0) | (closed_ ? 2 : 0) |
++                        (unsupported_ ? 4 : 0));
++  const size_t count_offset = out.size();
++  Put<uint32_t>(out, 0);
++  uint64_t next = from;
++  uint32_t count = 0;
++  for (const auto& entry : entries_) {
++    if (entry.seq < from) {
++      continue;
++    }
++    const size_t size =
++        41 + entry.text.size() + entry.data.size();
++    if (count && out.size() + size > max_bytes) {
++      break;
++    }
++    Put<uint64_t>(out, entry.seq);
++    Put<uint8_t>(out, static_cast<uint8_t>(entry.kind));
++    Put<int32_t>(out, entry.buffer);
++    Put<double>(out, entry.a);
++    Put<double>(out, entry.b);
++    Put<uint16_t>(out, static_cast<uint16_t>(entry.text.size()));
++    out.insert(out.end(), entry.text.begin(), entry.text.end());
++    Put<uint32_t>(out, static_cast<uint32_t>(entry.data.size()));
++    out.insert(out.end(), entry.data.begin(), entry.data.end());
++    next = entry.seq + 1;
++    ++count;
++  }
++  if (count == 0 && from == 0) {
++    next = next_;
++  }
++  PutAt<uint64_t>(out, next_offset, next);
++  PutAt<uint32_t>(out, count_offset, count);
++  return out;
++}
++
++}  // namespace blink
+diff --git third_party/blink/renderer/core/html/media/reach_media_journal.h third_party/blink/renderer/core/html/media/reach_media_journal.h
+new file mode 100644
+index 0000000..a3e3900
+--- /dev/null
++++ third_party/blink/renderer/core/html/media/reach_media_journal.h
+@@ -0,0 +1,123 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_CORE_HTML_MEDIA_REACH_MEDIA_JOURNAL_H_
++#define THIRD_PARTY_BLINK_RENDERER_CORE_HTML_MEDIA_REACH_MEDIA_JOURNAL_H_
++
++#include <cstdint>
++#include <deque>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/scoped_refptr.h"
++#include "third_party/blink/renderer/core/core_export.h"
++#include "third_party/blink/renderer/platform/heap/persistent.h"
++#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++
++namespace blink {
++
++class HTMLMediaElement;
++class LocalFrame;
++
++// Reach drawing mode: a bounded record of the MediaSource operations a page
++// performs for a same-thread media element, so a remote client can replay them
++// into its own MediaSource. Main thread only; inactive unless enabled.
++class CORE_EXPORT ReachMediaJournal final
++    : public base::RefCounted<ReachMediaJournal> {
++ public:
++  enum class Kind : uint8_t {
++    kAddBuffer = 1,
++    kRemoveBuffer = 2,
++    kAppend = 3,
++    kRemove = 4,
++    kAbort = 5,
++    kTimestampOffset = 6,
++    kAppendWindowStart = 7,
++    kAppendWindowEnd = 8,
++    kMode = 9,
++    kChangeType = 10,
++    kDuration = 11,
++    kEndOfStream = 12,
++  };
++
++  // Enables journaling in this renderer. |changed| learns of every recorded
++  // operation, with the journaled element's local frame root.
++  static void Enable(void (*changed)(LocalFrame&));
++  // Null unless enabled. Replaces any journal of |element|.
++  static scoped_refptr<ReachMediaJournal> Start(HTMLMediaElement& element);
++  static ReachMediaJournal* ForElement(const HTMLMediaElement& element);
++  static ReachMediaJournal* Find(uint64_t id);
++
++  ReachMediaJournal(const ReachMediaJournal&) = delete;
++  ReachMediaJournal& operator=(const ReachMediaJournal&) = delete;
++
++  uint64_t id() const { return id_; }
++  // Sequence number the next operation will receive.
++  uint64_t next() const { return next_; }
++  // False after unsupported operations (e.g. encoded chunks) or closing.
++  bool usable() const { return !unsupported_ && !closed_; }
++  HTMLMediaElement* element() const;
++
++  // Returns the buffer identity used by later operations.
++  int AddBuffer(const String& type);
++  void Record(Kind kind,
++              int buffer,
++              double a = 0,
++              double b = 0,
++              const String& text = String());
++  // As Record, with |text| already UTF-8 (e.g. a literal).
++  void RecordUtf8(Kind kind,
++                  int buffer,
++                  double a,
++                  double b,
++                  std::string_view text);
++  void Append(int buffer, base::span<const uint8_t> data);
++  void Unsupported();
++  void Close();
++
++  // Serialized operations from |cursor| (0 = from the start), at most
++  // |max_bytes| but always at least one when any remain. A cursor whose
++  // operations were compacted away is answered from the start, flagged reset.
++  std::vector<uint8_t> Read(uint64_t cursor, size_t max_bytes) const;
++
++ private:
++  friend class base::RefCounted<ReachMediaJournal>;
++
++  explicit ReachMediaJournal(HTMLMediaElement& element);
++  ~ReachMediaJournal();
++
++  struct Entry {
++    uint64_t seq;
++    Kind kind;
++    int buffer;
++    double a;
++    double b;
++    std::string text;
++    std::vector<uint8_t> data;
++    bool init;
++  };
++
++  void Push(Entry entry);
++  void Compact();
++  void Changed();
++
++  const uint64_t id_;
++  WeakPersistent<HTMLMediaElement> element_;
++  std::deque<Entry> entries_;
++  std::vector<int> expects_init_;
++  uint64_t next_ = 1;
++  // Highest sequence number removed by compaction.
++  uint64_t dropped_ = 0;
++  size_t bytes_ = 0;
++  int next_buffer_ = 1;
++  bool unsupported_ = false;
++  bool closed_ = false;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_CORE_HTML_MEDIA_REACH_MEDIA_JOURNAL_H_
+diff --git third_party/blink/renderer/modules/mediasource/media_source.cc third_party/blink/renderer/modules/mediasource/media_source.cc
+index d87d072..4e7942a 100644
+--- third_party/blink/renderer/modules/mediasource/media_source.cc
++++ third_party/blink/renderer/modules/mediasource/media_source.cc
+@@ -373,6 +373,8 @@ void MediaSource::AddSourceBuffer_Locked(
+     SourceBuffer** created_buffer,
+     MediaSourceAttachmentSupplement::ExclusiveKey pass_key) {
+   AssertAttachmentsMutexHeldIfCrossThreadForDebugging();
++  // WebCodecs configurations append encoded chunks, which Reach cannot replay.
++  const bool reach_configured = audio_config || video_config;
+ 
+   // 5. Create a new SourceBuffer object and associated resources.
+   // TODO(crbug.com/1144908): Plumb the configs through into a new logic in
+@@ -419,6 +421,13 @@ void MediaSource::AddSourceBuffer_Locked(
+   // 9. Return the new object to the caller.
+   DVLOG(3) << __func__ << " this=" << this << " type=" << type << " -> "
+            << buffer;
++  if (reach_journal_) {
++    if (reach_configured) {
++      reach_journal_->Unsupported();
++    } else {
++      buffer->SetReachJournalBuffer(reach_journal_->AddBuffer(type));
++    }
++  }
+   *created_buffer = buffer;
+   return;
+ }
+@@ -1019,6 +1028,10 @@ void MediaSource::DurationChangeAlgorithm(
+   // Done for step 1 above, already.
+   // 4. Update duration to new duration.
+   web_media_source_->SetDuration(new_duration);
++  if (reach_journal_) {
++    reach_journal_->Record(ReachMediaJournal::Kind::kDuration, 0,
++                           new_duration);
++  }
+ 
+   // 5. If a user agent is unable to partially render audio frames or text cues
+   //    that start before and end after the duration, then run the following
+@@ -1044,6 +1057,10 @@ void MediaSource::SetReadyState(const ReadyState state) {
+ 
+   if (state == ReadyState::kClosed) {
+     web_media_source_.reset();
++    if (reach_journal_) {
++      reach_journal_->Close();
++      reach_journal_ = nullptr;
++    }
+   }
+ 
+   if (old_state == state)
+@@ -1296,6 +1313,15 @@ void MediaSource::EndOfStreamAlgorithm(
+     MediaSourceAttachmentSupplement::ExclusiveKey pass_key) {
+   AssertAttachmentsMutexHeldIfCrossThreadForDebugging();
+ 
++  if (reach_journal_) {
++    reach_journal_->RecordUtf8(
++        ReachMediaJournal::Kind::kEndOfStream, 0, 0, 0,
++        eos_status == WebMediaSource::kEndOfStreamStatusNetworkError ? "network"
++        : eos_status == WebMediaSource::kEndOfStreamStatusDecodeError
++            ? "decode"
++            : "");
++  }
++
+   // https://www.w3.org/TR/media-source/#end-of-stream-algorithm
+   // 1. Change the readyState attribute value to "ended".
+   // 2. Queue a task to fire a simple event named sourceended at the
+@@ -1363,6 +1389,7 @@ MediaSourceTracer* MediaSource::StartAttachingToMediaElement(
+   media_source_attachment_ = attachment;
+   attachment_tracer_ =
+       MakeGarbageCollected<SameThreadMediaSourceTracer>(element, this);
++  reach_journal_ = element ? ReachMediaJournal::Start(*element) : nullptr;
+   return attachment_tracer_.Get();
+ }
+ 
+diff --git third_party/blink/renderer/modules/mediasource/media_source.h third_party/blink/renderer/modules/mediasource/media_source.h
+index 088140c..116ee9f 100644
+--- third_party/blink/renderer/modules/mediasource/media_source.h
++++ third_party/blink/renderer/modules/mediasource/media_source.h
+@@ -15,6 +15,7 @@
+ #include "third_party/blink/renderer/bindings/core/v8/active_script_wrappable.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_observer.h"
+ #include "third_party/blink/renderer/core/html/media/media_source_tracer.h"
++#include "third_party/blink/renderer/core/html/media/reach_media_journal.h"
+ #include "third_party/blink/renderer/core/html/time_ranges.h"
+ #include "third_party/blink/renderer/modules/event_target_modules.h"
+ #include "third_party/blink/renderer/modules/mediasource/media_source_attachment_supplement.h"
+@@ -128,6 +129,9 @@ class MediaSource final : public EventTarget,
+   bool StartWorkerAttachingToMainThreadMediaElement(
+       scoped_refptr<CrossThreadMediaSourceAttachment> attachment)
+       LOCKS_EXCLUDED(attachment_link_lock_);
++
++  // Reach drawing mode: the operation record of a same-thread attachment.
++  ReachMediaJournal* ReachJournal() const { return reach_journal_.get(); }
+   // Completing the attachment always occurs on the thread/context that owns
+   // this MediaSource.
+   void CompleteAttachingToMediaElement(std::unique_ptr<WebMediaSource>)
+@@ -283,6 +287,9 @@ class MediaSource final : public EventTarget,
+ 
+   Member<MediaSourceHandleImpl> worker_media_source_handle_;
+ 
++  // Main thread only; never set for MSE-in-Workers.
++  scoped_refptr<ReachMediaJournal> reach_journal_;
++
+   // |attachment_link_lock_| protects read/write of |media_source_attachment_|,
+   // |attachment_tracer_|, |context_already_destroyed_|, and execution of
+   // handle().
+diff --git third_party/blink/renderer/modules/mediasource/source_buffer.cc third_party/blink/renderer/modules/mediasource/source_buffer.cc
+index e7ac669..98e4bb1 100644
+--- third_party/blink/renderer/modules/mediasource/source_buffer.cc
++++ third_party/blink/renderer/modules/mediasource/source_buffer.cc
+@@ -338,6 +338,11 @@ void SourceBuffer::SetMode_Locked(
+ 
+   // 8. Update the attribute to new mode.
+   mode_ = new_mode;
++  if (auto* journal = ReachJournal()) {
++    journal->RecordUtf8(ReachMediaJournal::Kind::kMode, reach_journal_buffer_, 0,
++                        0, new_mode == V8AppendMode::Enum::kSequence ? "sequence"
++                                                              : "segments");
++  }
+ }
+ 
+ TimeRanges* SourceBuffer::buffered(ExceptionState& exception_state) const {
+@@ -448,6 +453,9 @@ void SourceBuffer::SetTimestampOffset_Locked(
+ 
+   // 7. Update the attribute to new timestamp offset.
+   timestamp_offset_ = offset;
++  if (auto* journal = ReachJournal()) {
++    journal->Record(ReachMediaJournal::Kind::kTimestampOffset, reach_journal_buffer_, offset);
++  }
+ }
+ 
+ AudioTrackList& SourceBuffer::audioTracks() {
+@@ -521,6 +529,9 @@ void SourceBuffer::SetAppendWindowStart_Locked(
+   // 4. Update the attribute to the new value.
+   web_source_buffer_->SetAppendWindowStart(start);
+   append_window_start_ = start;
++  if (auto* journal = ReachJournal()) {
++    journal->Record(ReachMediaJournal::Kind::kAppendWindowStart, reach_journal_buffer_, start);
++  }
+ }
+ 
+ double SourceBuffer::appendWindowEnd() const {
+@@ -583,6 +594,9 @@ void SourceBuffer::SetAppendWindowEnd_Locked(
+   // 5. Update the attribute to the new value.
+   web_source_buffer_->SetAppendWindowEnd(end);
+   append_window_end_ = end;
++  if (auto* journal = ReachJournal()) {
++    journal->Record(ReachMediaJournal::Kind::kAppendWindowEnd, reach_journal_buffer_, end);
++  }
+ }
+ 
+ void SourceBuffer::appendBuffer(DOMArrayBuffer* data,
+@@ -728,6 +742,9 @@ void SourceBuffer::AppendEncodedChunks_Locked(
+   source_->AssertAttachmentsMutexHeldIfCrossThreadForDebugging();
+   DCHECK(append_encoded_chunks_resolver_);
+   DCHECK(buffer_queue);
++  if (auto* journal = ReachJournal()) {
++    journal->Unsupported();
++  }
+   DCHECK(!pending_chunks_to_buffer_);
+ 
+   double media_time = GetMediaTime();
+@@ -813,6 +830,9 @@ void SourceBuffer::Abort_Locked(
+   DCHECK(source_);
+   DCHECK(!updating_);
+   source_->AssertAttachmentsMutexHeldIfCrossThreadForDebugging();
++  if (auto* journal = ReachJournal()) {
++    journal->Record(ReachMediaJournal::Kind::kAbort, reach_journal_buffer_);
++  }
+ 
+   // 5. Run the reset parser state algorithm.
+   web_source_buffer_->ResetParserState();
+@@ -905,6 +925,9 @@ void SourceBuffer::Remove_Locked(
+   // 6.2. Queue a task to fire a simple event named sourceopen at the parent
+   //      media source .
+   source_->OpenIfInEndedState();
++  if (auto* journal = ReachJournal()) {
++    journal->Record(ReachMediaJournal::Kind::kRemove, reach_journal_buffer_, start, end);
++  }
+ 
+   // 7. Run the range removal algorithm with start and end as the start and end
+   //    of the removal range.
+@@ -1046,6 +1069,9 @@ void SourceBuffer::ChangeType_Locked(
+   //    registry entry that is associated with type.
+   // This call also updates the pipeline to switch bytestream parser and codecs.
+   web_source_buffer_->ChangeType(content_type.GetType(), codecs);
++  if (auto* journal = ReachJournal()) {
++    journal->Record(ReachMediaJournal::Kind::kChangeType, reach_journal_buffer_, 0, 0, type);
++  }
+ 
+   // 8. If the generate timestamps flag equals true: Set the mode attribute on
+   //    this SourceBuffer object to "sequence", including running the associated
+@@ -1144,7 +1170,15 @@ void SourceBuffer::AbortIfUpdating() {
+   TRACE_EVENT_END("media", /*SourceBuffer::appendBuffer*/ trace_track_);
+ }
+ 
++ReachMediaJournal* SourceBuffer::ReachJournal() const {
++  return reach_journal_buffer_ && source_ ? source_->ReachJournal() : nullptr;
++}
++
+ void SourceBuffer::RemovedFromMediaSource() {
++  if (auto* journal = ReachJournal()) {
++    journal->Record(ReachMediaJournal::Kind::kRemoveBuffer, reach_journal_buffer_);
++  }
++  reach_journal_buffer_ = 0;
+   if (IsRemoved())
+     return;
+ 
+@@ -1972,6 +2006,9 @@ void SourceBuffer::AppendBufferInternal_Locked(
+     TRACE_EVENT_END("media", /*prepareAsyncAppend*/ trace_track_);
+     return;
+   }
++  if (auto* journal = ReachJournal()) {
++    journal->Append(reach_journal_buffer_, data);
++  }
+ 
+   // 3. Set the updating attribute to true.
+   updating_ = true;
+diff --git third_party/blink/renderer/modules/mediasource/source_buffer.h third_party/blink/renderer/modules/mediasource/source_buffer.h
+index 5338a7f..5062562 100644
+--- third_party/blink/renderer/modules/mediasource/source_buffer.h
++++ third_party/blink/renderer/modules/mediasource/source_buffer.h
+@@ -42,6 +42,7 @@
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_append_mode.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_typedefs.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_observer.h"
++#include "third_party/blink/renderer/core/html/media/reach_media_journal.h"
+ #include "third_party/blink/renderer/core/typed_arrays/array_buffer_view_helpers.h"
+ #include "third_party/blink/renderer/modules/event_target_modules.h"
+ #include "third_party/blink/renderer/modules/mediasource/media_source_attachment_supplement.h"
+@@ -149,7 +150,14 @@ class SourceBuffer final : public EventTarget,
+ 
+   void Trace(Visitor*) const override;
+ 
++  // Reach drawing mode: this buffer's identity in its source's journal.
++  void SetReachJournalBuffer(int buffer) { reach_journal_buffer_ = buffer; }
++
+  private:
++  // The source's journal while this buffer has an identity in it.
++  ReachMediaJournal* ReachJournal() const;
++  int reach_journal_buffer_ = 0;
++
+   void Dispose();
+ 
+   bool IsRemoved() const;

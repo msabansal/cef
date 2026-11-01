@@ -66,6 +66,7 @@
 #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
 #include "third_party/blink/renderer/core/html/html_frame_owner_element.h"
 #include "third_party/blink/renderer/core/html/media/html_media_element.h"
+#include "third_party/blink/renderer/core/html/media/reach_media_journal.h"
 #include "third_party/blink/renderer/core/input/event_handler.h"
 #include "third_party/blink/renderer/core/layout/hit_test_location.h"
 #include "third_party/blink/renderer/core/layout/hit_test_result.h"
@@ -183,6 +184,35 @@ void SetDrawingFrameRequestCallback(
   if (!blink::Canvas2DBitmapProvider::IsReachCommandMode()) return;
   FrameRequestCallback() = std::move(callback);
   blink::SetReachFrameRequestHook(&OnFrameRequested);
+  // MediaSource operations are journaled for client replay, and each one
+  // requests a frame so the client learns the journal's new position.
+  blink::ReachMediaJournal::Enable(&OnFrameRequested);
+}
+
+std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
+                                    const std::string& journal_id,
+                                    const std::string& cursor_text,
+                                    int max_bytes,
+                                    std::vector<uint8_t>* out) {
+  auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
+  if (!frame || !frame->IsAttached()) {
+    return "Media journal frame is detached";
+  }
+  uint64_t id = 0;
+  uint64_t cursor = 0;
+  if (!base::StringToUint64(journal_id, &id) ||
+      !base::StringToUint64(cursor_text, &cursor) || max_bytes <= 0) {
+    return "Invalid media journal request";
+  }
+  auto* journal = blink::ReachMediaJournal::Find(id);
+  auto* element = journal ? journal->element() : nullptr;
+  auto* element_frame = element ? element->GetDocument().GetFrame() : nullptr;
+  // Journals of other tabs sharing this renderer are not readable.
+  if (!element_frame || &element_frame->LocalFrameRoot() != frame) {
+    return "Media journal unavailable";
+  }
+  *out = journal->Read(cursor, static_cast<size_t>(max_bytes));
+  return {};
 }
 
 namespace {
@@ -2229,28 +2259,36 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
         continue;
       }
       const auto& url = media->currentSrc();
-      if (media->HasMediaSource() ||
-          blink::HTMLMediaElementEncryptedMedia::mediaKeys(*media) ||
+      // Replayable media is a same-frame http(s)/data URL, or a same-thread
+      // MediaSource whose operations are journaled. Anything else (encrypted
+      // media, MediaStream, MediaSource in workers or out-of-process frames,
+      // other URL schemes, child-frame URLs) paints as an empty video
+      // rather than blocking the page.
+      const bool inline_frame = !web_frame->Parent() && tree_frame == frame.Get();
+      blink::ReachMediaJournal* journal = nullptr;
+      bool blank = false;
+      if (blink::HTMLMediaElementEncryptedMedia::mediaKeys(*media) ||
           std::visit([](auto* object) { return object != nullptr; },
-                     media->GetSrcObjectVariant()) ||
-          (!url.IsEmpty() && !url.ProtocolIs("http") &&
-           !url.ProtocolIs("https") && !url.ProtocolIsData())) {
-        result.error =
-            "MediaSource, MediaStream or encrypted media requires transport "
-            "support";
-        return result;
+                     media->GetSrcObjectVariant())) {
+        blank = true;
+      } else if (media->HasMediaSource()) {
+        journal = blink::ReachMediaJournal::ForElement(*media);
+        blank = !journal || !journal->usable() || web_frame->Parent();
+      } else if (!url.IsEmpty() &&
+                 ((!url.ProtocolIs("http") && !url.ProtocolIs("https") &&
+                   !url.ProtocolIsData()) ||
+                  !inline_frame)) {
+        blank = true;
+      }
+      if (blank) {
+        journal = nullptr;
       }
       // A painted video without a source (e.g. lazily loaded) still needs its
       // state so the client can match the marker; it has no resource to route.
-      // Unpainted audio without a source has nothing to replay.
-      if (url.IsEmpty() && !media->IsHTMLVideoElement())
+      // Audio without a replayable source has nothing to replay.
+      if ((blank || (url.IsEmpty() && !journal)) &&
+          !media->IsHTMLVideoElement())
         continue;
-      if (!url.IsEmpty() &&
-          (web_frame->Parent() || tree_frame != frame.Get())) {
-        result.error =
-            "Child-frame media requires frame-scoped resource routing";
-        return result;
-      }
       if (++media_count > 16 || !std::isfinite(media->currentTime()) ||
           !std::isfinite(media->playbackRate()) ||
           media->playbackRate() < 0.25 || media->playbackRate() > 4) {
@@ -2260,11 +2298,14 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       base::DictValue state;
       state.Set("id", media->GetDomNodeId());
       state.Set("kind", media->IsHTMLVideoElement() ? "video" : "audio");
-      state.Set(
-          "resource",
-          url.IsEmpty()
-              ? ""
-              : base::HexEncode(crypto::hash::Sha256(url.GetString().Utf8())));
+      std::string resource;
+      if (journal) {
+        resource = base::HexEncode(crypto::hash::Sha256(
+            "mse:" + base::NumberToString(journal->id())));
+      } else if (!blank && !url.IsEmpty()) {
+        resource = base::HexEncode(crypto::hash::Sha256(url.GetString().Utf8()));
+      }
+      state.Set("resource", resource);
       state.Set("time", media->currentTime());
       state.Set("paused", media->paused());
       state.Set("ended", media->ended());
@@ -2272,11 +2313,16 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       state.Set("volume", media->volume());
       state.Set("muted", media->muted());
       state.Set("loop", media->Loop());
-      // Like image sources, an exact HTTPS URL lets the client stream the
-      // original through the identity-free, cacheable /server route.
-      if (url.ProtocolIs("https") && !url.HasFragmentIdentifier() &&
-          url.User().empty() && url.Pass().empty() &&
-          url.GetString().length() <= 512) {
+      if (journal) {
+        // The client replays the journal through its tab's /mse route up to
+        // this position.
+        state.Set("mse", base::NumberToString(journal->id()));
+        state.Set("mseSeq", base::NumberToString(journal->next()));
+      } else if (!blank && url.ProtocolIs("https") &&
+                 !url.HasFragmentIdentifier() && url.User().empty() &&
+                 url.Pass().empty() && url.GetString().length() <= 512) {
+        // Like image sources, an exact HTTPS URL lets the client stream the
+        // original through the identity-free, cacheable /server route.
         state.Set("source", url.GetString().Utf8());
       }
       auto json = base::WriteJson(state);
