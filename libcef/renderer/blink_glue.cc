@@ -1121,16 +1121,30 @@ std::string ApplyDrawingMouse(blink::WebLocalFrame* web_frame,
   const auto point = frame->View()->ConvertToRootFrame(gfx::Point(x, y));
   x = point.x();
   y = point.y();
+  auto mouse_button = blink::WebPointerProperties::Button::kNoButton;
+  if (kind == 2) {
+    mouse_button = button == 0 ? blink::WebPointerProperties::Button::kLeft :
+        button == 1 ? blink::WebPointerProperties::Button::kMiddle :
+                      blink::WebPointerProperties::Button::kRight;
+    const int flag = button == 0 ? EVENTFLAG_LEFT_MOUSE_BUTTON :
+        button == 1 ? EVENTFLAG_MIDDLE_MOUSE_BUTTON : EVENTFLAG_RIGHT_MOUSE_BUTTON;
+    // CEF supplies pre-transition flags; Blink consumes post-transition flags.
+    modifiers = up ? (modifiers & ~flag) : (modifiers | flag);
+  } else if (kind == 0) {
+    if (modifiers & EVENTFLAG_LEFT_MOUSE_BUTTON)
+      mouse_button = blink::WebPointerProperties::Button::kLeft;
+    else if (modifiers & EVENTFLAG_MIDDLE_MOUSE_BUTTON)
+      mouse_button = blink::WebPointerProperties::Button::kMiddle;
+    else if (modifiers & EVENTFLAG_RIGHT_MOUSE_BUTTON)
+      mouse_button = blink::WebPointerProperties::Button::kRight;
+  }
   const auto type = kind == 0 ? blink::WebInputEvent::Type::kMouseMove :
       kind == 1 ? blink::WebInputEvent::Type::kMouseLeave :
       up ? blink::WebInputEvent::Type::kMouseUp : blink::WebInputEvent::Type::kMouseDown;
   blink::WebMouseEvent event(type, DrawingInputFlags(modifiers), base::TimeTicks::Now());
   event.SetPositionInWidget(x, y);
   event.SetPositionInScreen(x, y);
-  event.button = kind != 2 ? blink::WebPointerProperties::Button::kNoButton :
-      button == 0 ? blink::WebPointerProperties::Button::kLeft :
-      button == 1 ? blink::WebPointerProperties::Button::kMiddle :
-                    blink::WebPointerProperties::Button::kRight;
+  event.button = mouse_button;
   event.click_count = count;
   if (kind == 0) frame->GetEventHandler().HandleMouseMoveEvent(event, {}, {});
   else if (kind == 1) frame->GetEventHandler().HandleMouseLeaveEvent(event);
