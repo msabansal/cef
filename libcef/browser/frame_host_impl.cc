@@ -304,9 +304,16 @@ void CefFrameHostImpl::SendProcessMessage(
       SendMessage("Reach.DrawingCommands.v1", std::move(response));
       return;
     }
-    if (name == "Reach.DrawingInput.v1") {
+    auto route_input = name == "Reach.DrawingRoute.v1" && message->GetArgumentList() &&
+                               message->GetArgumentList()->GetSize() == 5
+                           ? message->GetArgumentList()->GetList(4)
+                           : nullptr;
+    if (name == "Reach.DrawingInput.v1" || route_input) {
       auto arguments = message->GetArgumentList();
-      auto input = arguments ? arguments->GetList(2) : nullptr;
+      // A route request carries the input it applies if the route ends in
+      // this frame; a child frame's later request repeats this for the child.
+      auto input = route_input ? route_input
+                               : arguments ? arguments->GetList(2) : nullptr;
       // Drawing dispatch bypasses the widget input router, so mirror its
       // user-interaction bookkeeping for key and button presses. Browser
       // policies such as clipboard paste require recent interaction.
