@@ -49,6 +49,8 @@
 #include "third_party/blink/renderer/core/dom/element.h"
 #include "third_party/blink/renderer/core/dom/flat_tree_traversal.h"
 #include "third_party/blink/renderer/core/dom/node.h"
+#include "third_party/blink/renderer/core/dom/events/native_event_listener.h"
+#include "third_party/blink/renderer/core/event_type_names.h"
 #include "third_party/blink/renderer/core/editing/serializers/serialization.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_state_observer.h"
@@ -142,6 +144,36 @@ void OnFrameRequested(blink::LocalFrame& root) {
     return;
   if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
     FrameRequestCallback()(web_frame);
+}
+
+// Media playback state is part of the captured picture, but changes such as
+// pause, seek or volume need not schedule a repaint. Captured windows request
+// a frame on every media state event, so no periodic capture is needed.
+class MediaStateFrameRequester final : public blink::NativeEventListener {
+ public:
+  void Invoke(blink::ExecutionContext* context, blink::Event*) override {
+    auto* window = blink::DynamicTo<blink::LocalDOMWindow>(context);
+    if (window && window->GetFrame())
+      OnFrameRequested(window->GetFrame()->LocalFrameRoot());
+  }
+};
+
+// Blink ignores a repeated (listener, capture) registration, so this is
+// idempotent per window.
+void ObserveMediaState(blink::LocalDOMWindow* window) {
+  static base::NoDestructor<blink::Persistent<MediaStateFrameRequester>>
+      listener(blink::MakeGarbageCollected<MediaStateFrameRequester>());
+  if (!window) return;
+  for (const auto* type :
+       {&blink::event_type_names::kPlay, &blink::event_type_names::kPause,
+        &blink::event_type_names::kPlaying, &blink::event_type_names::kSeeked,
+        &blink::event_type_names::kRatechange,
+        &blink::event_type_names::kVolumechange,
+        &blink::event_type_names::kEnded, &blink::event_type_names::kEmptied,
+        &blink::event_type_names::kLoadstart,
+        &blink::event_type_names::kLoadedmetadata}) {
+    window->addEventListener(*type, listener->Get(), /*use_capture=*/true);
+  }
 }
 
 }  // namespace
@@ -2182,6 +2214,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
     if (!media_document) {
       continue;
     }
+    ObserveMediaState(media_document->domWindow());
     for (auto& node :
          blink::FlatTreeTraversal::DescendantsOf(*media_document)) {
       auto* media = blink::DynamicTo<blink::HTMLMediaElement>(node);
