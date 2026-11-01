@@ -1630,8 +1630,8 @@ void AppendF32(std::vector<uint8_t>* out, float value) {
 // "RSL1", f32 offset/min/max x,y, f32 root-from-content translation x,y,
 // f32 root-space scroll clip x,y,w,h, u8 flags (1 = no blocking wheel
 // listeners), u16 count + f32 x,y,w,h viewport rects where a wheel may scroll
-// something else, u16 count + per segment [u8 kind (0 root, 1 content)]
-// [u32 length][SKP]. Little-endian.
+// something else, u16 count + per segment [u8 kind (0 root, 1 content,
+// 2 sticky content + constraint, see below)][u32 length][SKP]. Little-endian.
 std::vector<uint8_t> CaptureScrollLayout(
     blink::LocalFrame* frame, const gfx::Rect& bounds, const gfx::Rect& cull,
     const std::map<const blink::PaintChunk*, uint32_t>& chunk_index,
@@ -1653,45 +1653,104 @@ std::vector<uint8_t> CaptureScrollLayout(
   if (!content.IsIdentityOr2dTranslation() ||
       !clip_space.IsIdentityOr2dTranslation())
     return out;
-  const auto scrolled = [&](const blink::PaintChunk& chunk) {
+  // Segment kinds: 0 root (viewport-fixed), 1 content, 2 content under one
+  // position:sticky node whose constraint is relative to the root scroller.
+  // Sticky content is drawn by the client with the compositor's sticky offset
+  // recomputed at the predicted scroll position, so a stuck header stays put.
+  struct Kind {
+    uint8_t kind = 0;
+    const blink::CompositorStickyConstraint* sticky = nullptr;
+    bool operator==(const Kind&) const = default;
+  };
+  const auto& root_scroll_id = scroll->ScrollNode()
+                                   ? scroll->ScrollNode()->GetCompositorElementId()
+                                   : blink::CompositorElementId();
+  // Anchors (bit 0 left, 1 right, 2 top, 3 bottom) the root scroller moves.
+  const auto root_anchors = [&](const blink::CompositorStickyConstraint& c) {
+    uint8_t anchors = 0;
+    if (root_scroll_id && c.x_scroll_ancestor_element_id == root_scroll_id)
+      anchors |= (c.is_anchored_left ? 1 : 0) | (c.is_anchored_right ? 2 : 0);
+    if (root_scroll_id && c.y_scroll_ancestor_element_id == root_scroll_id)
+      anchors |= (c.is_anchored_top ? 4 : 0) | (c.is_anchored_bottom ? 8 : 0);
+    return anchors;
+  };
+  // nullopt: the chunk cannot be predicted (nested or shifted root stickies).
+  const auto classify =
+      [&](const blink::PaintChunk& chunk) -> std::optional<Kind> {
     const auto chunk_state = chunk.properties.Unalias();
     if (!scroll->IsAncestorOf(chunk_state.Transform()) ||
         !overflow->IsAncestorOf(chunk_state.Clip()))
-      return false;
+      return Kind{};
     for (const blink::EffectPaintPropertyNode* effect = &chunk_state.Effect();
          effect->Parent(); effect = &effect->Parent()->Unalias()) {
       if (!scroll->IsAncestorOf(effect->LocalTransformSpace()))
-        return false;
+        return Kind{};
       if (const auto* output = effect->OutputClip();
           output && !overflow->IsAncestorOf(*output))
-        return false;
+        return Kind{};
     }
-    return true;
+    Kind kind{1, nullptr};
+    for (const blink::TransformPaintPropertyNode* node =
+             &chunk_state.Transform();
+         node && node != scroll; node = node->UnaliasedParent()) {
+      const auto* constraint = node->GetStickyConstraint();
+      if (!constraint || !root_anchors(*constraint))
+        continue;
+      if (kind.sticky || constraint->nearest_element_shifting_sticky_box ||
+          constraint->nearest_element_shifting_containing_block)
+        return std::nullopt;
+      kind = Kind{2, constraint};
+    }
+    return kind;
   };
   const auto& artifact = frame->View()->GetPaintArtifact();
-  std::vector<std::pair<bool, std::vector<const blink::PaintChunk*>>> runs;
+  std::vector<std::pair<Kind, std::vector<const blink::PaintChunk*>>> runs;
   for (const auto& chunk : artifact.GetPaintChunks()) {
     if (!chunk_index.contains(&chunk))
       continue;
-    const bool in_content = scrolled(chunk);
-    if (runs.empty() || runs.back().first != in_content) {
+    const auto kind = classify(chunk);
+    if (!kind)
+      return out;
+    if (runs.empty() || !(runs.back().first == *kind)) {
       if (runs.size() >= 64)
         return {};
-      runs.emplace_back(in_content, std::vector<const blink::PaintChunk*>());
+      runs.emplace_back(*kind, std::vector<const blink::PaintChunk*>());
     }
     runs.back().second.push_back(&chunk);
   }
   if (std::none_of(runs.begin(), runs.end(),
-                   [](const auto& run) { return run.first; }))
+                   [](const auto& run) { return run.first.kind != 0; }))
     return out;
+  // The compositor's scroll position (cc TransformNode::scroll_offset).
+  const auto scroll_position = -scroll->Get2dTranslation();
   const auto translation = content.To2dTranslation();
   gfx::Rect content_cull = cull;
   content_cull.Offset(-std::lround(translation.x()),
                       -std::lround(translation.y()));
   const blink::PropertyTreeState content_state(
       *scroll, *overflow, blink::EffectPaintPropertyNode::Root());
-  std::vector<std::pair<bool, std::vector<uint8_t>>> segments;
-  for (const auto& [in_content, members] : runs) {
+  // [u8 kind] + for sticky: [u8 anchors][f32 left,right,top,bottom offsets]
+  // [f32 constraint box, sticky box, containing block rects (x,y,w,h)]
+  // [f32 pixel snap x,y][f32 scroll position x,y].
+  std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> segments;
+  for (const auto& [kind, members] : runs) {
+    const bool in_content = kind.kind != 0;
+    std::vector<uint8_t> header{kind.kind};
+    if (const auto* c = kind.sticky) {
+      header.push_back(root_anchors(*c));
+      for (const float value :
+           {c->left_offset, c->right_offset, c->top_offset, c->bottom_offset})
+        AppendF32(&header, value);
+      for (const auto& rect :
+           {c->constraint_box_rect, c->scroll_container_relative_sticky_box_rect,
+            c->scroll_container_relative_containing_block_rect})
+        for (const float value : {rect.x(), rect.y(), rect.width(), rect.height()})
+          AppendF32(&header, value);
+      for (const float value :
+           {c->pixel_snap_offset.x(), c->pixel_snap_offset.y(),
+            scroll_position.x(), scroll_position.y()})
+        AppendF32(&header, value);
+    }
     blink::PaintChunkSubset subset(artifact, *members.front());
     for (size_t i = 1; i < members.size(); ++i)
       subset.Merge(blink::PaintChunkSubset(artifact, *members[i]));
@@ -1724,7 +1783,7 @@ std::vector<uint8_t> CaptureScrollLayout(
     picture->serialize(&stream, &procs);
     if (stream.failed() || !stream.bytesWritten())
       return {};
-    segments.emplace_back(in_content, stream.TakeBytes());
+    segments.emplace_back(std::move(header), stream.TakeBytes());
   }
   out.insert(out.end(), {'R', 'S', 'L', '1'});
   const auto offset = viewport->GetScrollOffset();
@@ -1770,8 +1829,8 @@ std::vector<uint8_t> CaptureScrollLayout(
     for (const int value : {rect.x(), rect.y(), rect.width(), rect.height()})
       AppendF32(&out, value);
   AppendLE(&out, segments.size(), 2);
-  for (const auto& [in_content, bytes] : segments) {
-    out.push_back(in_content ? 1 : 0);
+  for (const auto& [header, bytes] : segments) {
+    out.insert(out.end(), header.begin(), header.end());
     AppendLE(&out, bytes.size(), 4);
     out.insert(out.end(), bytes.begin(), bytes.end());
   }
