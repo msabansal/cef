@@ -23,6 +23,7 @@
 #include "base/strings/string_number_conversions.h"
 #include "base/time/time.h"
 #include "base/values.h"
+#include "build/build_config.h"
 #include "cc/paint/paint_filter.h"
 #include "cc/paint/paint_op.h"
 #include "cc/paint/paint_op_buffer.h"
@@ -55,6 +56,7 @@
 #include "third_party/blink/renderer/core/dom/node.h"
 #include "third_party/blink/renderer/core/dom/events/native_event_listener.h"
 #include "third_party/blink/renderer/core/event_type_names.h"
+#include "third_party/blink/renderer/core/events/pointer_event_factory.h"
 #include "third_party/blink/renderer/core/editing/serializers/serialization.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_state_observer.h"
@@ -71,6 +73,7 @@
 #include "third_party/blink/renderer/core/html/html_frame_owner_element.h"
 #include "third_party/blink/renderer/core/html/media/html_media_element.h"
 #include "third_party/blink/renderer/core/html/media/reach_media_journal.h"
+#include "third_party/blink/renderer/core/input/context_menu_allowed_scope.h"
 #include "third_party/blink/renderer/core/input/event_handler.h"
 #include "third_party/blink/renderer/core/layout/hit_test_location.h"
 #include "third_party/blink/renderer/core/layout/hit_test_result.h"
@@ -79,6 +82,7 @@
 #include "third_party/blink/renderer/core/layout/layout_object.h"
 #include "third_party/blink/renderer/core/layout/layout_view.h"
 #include "third_party/blink/renderer/core/loader/frame_load_request.h"
+#include "third_party/blink/renderer/core/page/context_menu_controller.h"
 #include "third_party/blink/renderer/core/page/focus_controller.h"
 #include "third_party/blink/renderer/core/page/page.h"
 #include "third_party/blink/renderer/core/page/page_animator.h"
@@ -1375,10 +1379,65 @@ std::string ApplyDrawingMouse(blink::WebLocalFrame* web_frame,
   event.SetPositionInScreen(x, y);
   event.button = mouse_button;
   event.click_count = count;
+  blink::Persistent<blink::Page> page = frame->GetPage();
+  bool context_menu = kind == 2 &&
+      mouse_button == blink::WebPointerProperties::Button::kRight;
+#if BUILDFLAG(IS_MAC)
+  if (kind == 2 && !up &&
+      mouse_button == blink::WebPointerProperties::Button::kLeft &&
+      (event.GetModifiers() & blink::WebInputEvent::kControlKey)) {
+    context_menu = true;
+  }
+#endif
+  context_menu = context_menu &&
+      (static_cast<bool>(up) ==
+       page->GetSettings().GetShowContextMenuOnMouseUp());
+  const auto frame_unchanged = [&]() {
+    return frame->IsAttached() && frame->GetDocument() == document.Get() &&
+           frame->GetPage() == page.Get() && frame->View();
+  };
+  const auto menu_frame_at_point = [&]() -> blink::LocalFrame* {
+    blink::HitTestLocation location(blink::PhysicalOffset(
+        frame->View()->ConvertFromRootFrame(gfx::Point(x, y))));
+    const auto hit = frame->GetEventHandler().HitTestResultAtLocation(location);
+    blink::Frame* target = hit.InnerNodeOrImageMapImage()
+        ? hit.InnerNodeOrImageMapImage()->GetDocument().GetFrame()
+        : page->GetFocusController().FocusedOrMainFrame();
+    return blink::DynamicTo<blink::LocalFrame>(target);
+  };
+  // Mouse dispatch can replace a child document as well as the input frame.
+  blink::Persistent<blink::LocalFrame> menu_frame;
+  blink::Persistent<blink::Document> menu_document;
+  if (context_menu) {
+    menu_frame = menu_frame_at_point();
+    if (!frame_unchanged())
+      return "Frame changed during context menu hit test";
+    if (menu_frame)
+      menu_document = menu_frame->GetDocument();
+  }
   if (kind == 0) frame->GetEventHandler().HandleMouseMoveEvent(event, {}, {});
   else if (kind == 1) frame->GetEventHandler().HandleMouseLeaveEvent(event);
   else if (up) frame->GetEventHandler().HandleMouseReleaseEvent(event);
   else frame->GetEventHandler().HandleMousePressEvent(event);
+  if (context_menu) {
+    const auto menu_frame_unchanged = [&]() {
+      return frame_unchanged() && menu_frame && menu_frame->IsAttached() &&
+             menu_document && menu_frame->GetDocument() == menu_document.Get() &&
+             menu_frame->GetPage() == page.Get() && menu_frame->View();
+    };
+    if (!menu_frame_unchanged())
+      return "Frame changed during context menu mouse dispatch";
+    auto* target = menu_frame_at_point();
+    if (!menu_frame_unchanged() || target != menu_frame.Get())
+      return "Target changed during context menu mouse dispatch";
+    page->GetContextMenuController().ClearContextMenu();
+    if (!menu_frame_unchanged())
+      return "Frame changed during context menu clearing";
+    event.menu_source_type = ui::mojom::blink::MenuSourceType::kMouse;
+    event.id = blink::PointerEventFactory::kMouseId;
+    blink::ContextMenuAllowedScope scope;
+    menu_frame->GetEventHandler().SendContextMenuEvent(event);
+  }
   return {};
 }
 
