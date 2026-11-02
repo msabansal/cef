@@ -1,0 +1,115 @@
+diff --git third_party/blink/renderer/core/editing/finder/async_find_buffer.cc third_party/blink/renderer/core/editing/finder/async_find_buffer.cc
+index dedfb3c..0ef9d8f 100644
+--- third_party/blink/renderer/core/editing/finder/async_find_buffer.cc
++++ third_party/blink/renderer/core/editing/finder/async_find_buffer.cc
+@@ -6,6 +6,8 @@
+ #include "base/auto_reset.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "third_party/blink/renderer/core/display_lock/display_lock_document_state.h"
++#include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/editing/ephemeral_range.h"
+ #include "third_party/blink/renderer/core/editing/finder/find_buffer.h"
+ 
+@@ -49,8 +51,12 @@ void AsyncFindBuffer::Run(RangeInFlatTree* search_range,
+     std::move(completeCallback).Run(EphemeralRangeInFlatTree());
+     return;
+   }
+-  search_range->StartPosition().GetDocument()->UpdateStyleAndLayout(
+-      DocumentUpdateReason::kFindInPage);
++  Document& document = *search_range->StartPosition().GetDocument();
++  // Match synchronous find-in-page: a document-wide update alone skips dirty
++  // activatable subtrees. Each asynchronous slice must reacquire this scope.
++  auto forced_activatable_locks =
++      document.GetDisplayLockDocumentState().GetScopedForceActivatableLocks();
++  document.UpdateStyleAndLayout(DocumentUpdateReason::kFindInPage);
+ 
+   EphemeralRangeInFlatTree range =
+       FindBuffer::FindMatchInRange(search_range->ToEphemeralRange(),
+diff --git third_party/blink/renderer/core/editing/finder/find_buffer_test.cc third_party/blink/renderer/core/editing/finder/find_buffer_test.cc
+index dd15bbd..2e30922 100644
+--- third_party/blink/renderer/core/editing/finder/find_buffer_test.cc
++++ third_party/blink/renderer/core/editing/finder/find_buffer_test.cc
+@@ -4,15 +4,22 @@
+ 
+ #include "third_party/blink/renderer/core/editing/finder/find_buffer.h"
+ 
++#include "base/functional/bind.h"
+ #include "build/build_config.h"
++#include "third_party/blink/renderer/core/display_lock/display_lock_context.h"
++#include "third_party/blink/renderer/core/display_lock/display_lock_document_state.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/dom/text.h"
+ #include "third_party/blink/renderer/core/editing/ephemeral_range.h"
++#include "third_party/blink/renderer/core/editing/finder/async_find_buffer.h"
+ #include "third_party/blink/renderer/core/editing/finder/find_results.h"
+ #include "third_party/blink/renderer/core/editing/selection_template.h"
+ #include "third_party/blink/renderer/core/editing/testing/editing_test_base.h"
+ #include "third_party/blink/renderer/core/html/forms/html_select_element.h"
+ #include "third_party/blink/renderer/core/html/forms/text_control_element.h"
++#include "third_party/blink/renderer/core/html_names.h"
++#include "third_party/blink/renderer/platform/heap/persistent.h"
++#include "third_party/blink/renderer/platform/testing/unit_test_helpers.h"
+ 
+ namespace blink {
+ 
+@@ -973,6 +980,59 @@ TEST_F(FindBufferTest, ForwardVisibleTextNode) {
+   EXPECT_EQ(String("a"), To<Text>(text)->data());
+ }
+ 
++TEST_F(FindBufferTest, AsyncFindDirtyActivatableDisplayLocks) {
++  SetBodyContent(R"HTML(
++    <div style="content-visibility:hidden"><span>needle</span></div>
++    <div style="height:30000px"></div>
++    <div id="locked" style="content-visibility:auto">
++      <span id="target">needle</span>
++    </div>
++  )HTML");
++  Document& document = GetDocument();
++  auto* locked = GetElementById("locked");
++  auto* target = GetElementById("target");
++  {
++    auto forced_activatable_locks =
++        document.GetDisplayLockDocumentState().GetScopedForceActivatableLocks();
++    UpdateAllLifecyclePhasesForTest();
++  }
++  UpdateAllLifecyclePhasesForTest();
++  ASSERT_TRUE(locked->GetDisplayLockContext());
++  ASSERT_TRUE(locked->GetDisplayLockContext()->IsLocked());
++  ASSERT_TRUE(target->GetComputedStyle());
++  ASSERT_TRUE(target->firstChild()->GetLayoutObject());
++
++  Persistent<AsyncFindBuffer> finder = MakeGarbageCollected<AsyncFindBuffer>();
++  for (int iteration = 0; iteration < 3; ++iteration) {
++    target->setAttribute(html_names::kStyleAttr,
++                         AtomicString(iteration % 2 ? "color:blue" : "color:red"));
++    document.UpdateStyleAndLayout(DocumentUpdateReason::kFindInPage);
++    // Model a queued search after a document-wide update skipped this dirty
++    // activatable subtree. This is EnsureComputedStyle's actual precondition.
++    ASSERT_TRUE(
++        document.NeedsLayoutTreeUpdateForNodeIncludingDisplayLocked(*target));
++    const auto range = WholeDocumentRange();
++    Persistent<RangeInFlatTree> search_range =
++        MakeGarbageCollected<RangeInFlatTree>(range.StartPosition(),
++                                              range.EndPosition());
++    bool complete = false;
++    finder->FindMatchInRange(
++        search_range.Get(), "needle", FindOptions(),
++        base::BindOnce([&](const EphemeralRangeInFlatTree& match) {
++          complete = true;
++          // The non-activatable content-visibility:hidden match stays excluded.
++          EXPECT_EQ(EphemeralRangeInFlatTree(PositionFromParentId("target", 0),
++                                             PositionFromParentId("target", 6)),
++                    match);
++        }));
++    EXPECT_FALSE(complete);
++    test::RunPendingTasks();
++    ASSERT_TRUE(complete);
++    EXPECT_FALSE(finder->IsActive());
++    EXPECT_TRUE(locked->GetDisplayLockContext()->IsLocked());
++  }
++}
++
+ static String ReplaceZero(const String& chars) {
+   String result(chars);
+   result.Replace(0, '_');
