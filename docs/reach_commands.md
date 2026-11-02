@@ -82,6 +82,41 @@ currently supported. Empty media elements need no playback transport; original
 poster images retain ordinary image painting, including inside child frames.
 Active child-frame media still requires frame-scoped resource routing.
 
+### Scroll-prefetched child and video composition
+
+Command dependency discovery and incremental export use the same paint-chunk
+conversion: transformed drawable bounds select chunks within one viewport
+above and below the current viewport, without pruning items by viewport clips.
+The clips remain in the skeleton. Every retained video marker needs its
+playback state; every retained remote-frame marker needs a validated child
+picture, even when currently offscreen. A DOM iframe identity alone is not
+permission to omit its commands. Unknown markers, missing children, invalid
+state and the existing resource/frame budgets still reject the capture.
+Raster capture has no scroll-prefetched chunks and retains its separate
+viewport-based iframe culling proof.
+
+The Reach native test `drawing_prefetched_video_and_remote_child` places an
+independently transformed video below a 600-pixel viewport and a cross-site
+iframe further below it, then repeatedly scrolls both into and out of view.
+Run the ignored test in the qualified Linux runtime with an existing display,
+sandbox enabled, and `REACH_CEF_MEDIA_ORIGINAL` pointing to an authored, changing
+VP8 WebM (at most 4 MiB). It creates a fresh profile beneath the current
+directory's `.artifacts/drawing-prefetch-<pid>` and never reuses an existing
+directory. No fallback capture is requested.
+
+Its `frame-*.bin` packets, original resources, `original.webm` and
+`pixel-probes.json` are inputs to matched-CanvasKit replay qualification, not
+pixel-success evidence by themselves. Replay packets in order, retaining the
+chunk cache and supplying the original video through the authorized fixture
+resource route. For every in-viewport child probe, require RGB `[21,43,65]`
+(allowing small color-rounding tolerance); for the video probe, compare to an
+independently decoded original at the packet's media-state timestamp. Require
+changing video samples, correct clips and child pixels on repeated re-entry,
+and no disconnect or source-raster substitution. Repeat rapid wheel scrolling
+on the production MSN scenario with actual video/audio and input round-trips
+before release approval. Passing source contracts or inspecting annotations
+alone does not qualify that scenario.
+
 Command mode retains bounded Canvas2D histories without allocating source raster
 surfaces. Resets clear history; pixel readback, raw pixel writes, GPU and
 OffscreenCanvas contexts reject explicitly. Attached local and isolated remote
