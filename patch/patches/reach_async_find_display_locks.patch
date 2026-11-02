@@ -27,14 +27,14 @@ index dedfb3c..0ef9d8f 100644
    EphemeralRangeInFlatTree range =
        FindBuffer::FindMatchInRange(search_range->ToEphemeralRange(),
 diff --git third_party/blink/renderer/core/editing/finder/find_buffer_test.cc third_party/blink/renderer/core/editing/finder/find_buffer_test.cc
-index dd15bbd..2e30922 100644
+index dd15bbd..7cbdb9c 100644
 --- third_party/blink/renderer/core/editing/finder/find_buffer_test.cc
 +++ third_party/blink/renderer/core/editing/finder/find_buffer_test.cc
 @@ -4,15 +4,22 @@
  
  #include "third_party/blink/renderer/core/editing/finder/find_buffer.h"
  
-+#include "base/functional/bind.h"
++#include "base/test/bind.h"
  #include "build/build_config.h"
 +#include "third_party/blink/renderer/core/display_lock/display_lock_context.h"
 +#include "third_party/blink/renderer/core/display_lock/display_lock_document_state.h"
@@ -95,7 +95,7 @@ index dd15bbd..2e30922 100644
 +    bool complete = false;
 +    finder->FindMatchInRange(
 +        search_range.Get(), "needle", FindOptions(),
-+        base::BindOnce([&](const EphemeralRangeInFlatTree& match) {
++        base::BindLambdaForTesting([&](const EphemeralRangeInFlatTree& match) {
 +          complete = true;
 +          // The non-activatable content-visibility:hidden match stays excluded.
 +          EXPECT_EQ(EphemeralRangeInFlatTree(PositionFromParentId("target", 0),
