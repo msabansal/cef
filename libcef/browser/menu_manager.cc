@@ -66,6 +66,8 @@ class CefRunContextMenuCallbackImpl : public CefRunContextMenuCallback {
 
   void Continue(int command_id, cef_event_flags_t event_flags) override {
     if (CEF_CURRENTLY_ON_UIT()) {
+      // Dismissal may release the client's last reference synchronously.
+      CefRefPtr<CefRunContextMenuCallbackImpl> keep_alive(this);
       if (!callback_.is_null()) {
         RunNow(std::move(callback_), command_id, event_flags);
         callback_.Reset();
@@ -324,11 +326,12 @@ void CefMenuManager::ExecuteCommandCallback(int command_id,
                                             cef_event_flags_t event_flags) {
   DCHECK(IsShowingContextMenu());
   DCHECK(custom_menu_callback_);
+  // Commands and dismissal can synchronously release the callback.
+  custom_menu_callback_ = nullptr;
   if (command_id != kInvalidCommandId) {
     ExecuteCommand(model_, command_id, event_flags);
   }
   MenuClosed(model_);
-  custom_menu_callback_ = nullptr;
 }
 
 void CefMenuManager::CreateDefaultModel() {
