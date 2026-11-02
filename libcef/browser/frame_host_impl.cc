@@ -325,11 +325,10 @@ void CefFrameHostImpl::SendProcessMessage(
       LOG(WARNING) << "Reach drawing dispatch: frame=" << GetIdentifier().ToString()
                    << " request=" << request << " operation=" << name
                    << " metadata="
-                   << (name == "Reach.DrawingFrame.v1" &&
+                   << (name == "Reach.DrawingFrame.v1" && arguments &&
                        arguments->GetBool(1));
     }
     if (name == "Reach.DrawingInput.v1" || route_input) {
-      auto arguments = message->GetArgumentList();
       // A route request carries the input it applies if the route ends in
       // this frame; a child frame's later request repeats this for the child.
       auto input = route_input ? route_input
