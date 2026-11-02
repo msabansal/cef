@@ -1,0 +1,40 @@
+name: cef
+
+services:
+  builder:
+    image: cef-builder:ubuntu-26.10
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ubuntu:26.10}
+        BUILDER_UID: ${BUILDER_UID:-1000}
+        BUILDER_GID: ${BUILDER_GID:-1000}
+    init: true
+    shm_size: 2gb
+    environment:
+      CEF_SOURCE_DIRECTORY: ${CEF_SOURCE_DIRECTORY:-/source/cef}
+      GN_DEFINES: ${GN_DEFINES:-use_sysroot=true is_component_build=false symbol_level=1 is_cfi=false use_thin_lto=false use_remoteexec=false enable_remoting=false proprietary_codecs=true ffmpeg_branding="Chrome"}
+    volumes:
+      - type: bind
+        source: ..
+        target: ${CEF_SOURCE_DIRECTORY:-/source/cef}
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: .
+        target: /builder
+        read_only: true
+      - type: volume
+        source: cef-work
+        target: /work
+      - type: bind
+        source: ../artifacts
+        target: /artifacts
+        bind:
+          create_host_path: false
+
+volumes:
+  cef-work:
