@@ -267,7 +267,9 @@ class BoundedPaintStream final : public SkWStream {
 
 struct PaintSerialization {
   std::string error;
+  std::string unsupported_error;
   std::string filter_requires_raster;
+  bool uninspectable_filter = false;
   bool raster = false;
   std::function<void(const std::string&, const void*, size_t)> sink;
   // Originals the consumer already holds (streaming root captures only): they
@@ -584,13 +586,21 @@ sk_sp<SkTypeface> DeserializeOriginalTypeface(SkStream& stream, void* context) {
   return face;
 }
 
+void DeferUnsupportedPaint(PaintSerialization* state, std::string error) {
+  // Unsupported categories never render, but must not hide a later budget
+  // failure. Choose a stable rejection regardless of sibling/operation order.
+  if (state->unsupported_error.empty() || error < state->unsupported_error) {
+    state->unsupported_error = std::move(error);
+  }
+}
+
 bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
   if (state->raster) {
     const uint64_t pixels = uint64_t(std::max(0, image.width())) *
                             std::max(0, image.height());
     if (image.IsTextureBacked() || image.IsDeferredPaintRecord()) {
-      state->error = "Raster fallback cannot read texture-backed or deferred paint";
-      return false;
+      DeferUnsupportedPaint(
+          state, "Raster fallback cannot read texture-backed or deferred paint");
     }
     if (!pixels || image.width() > 4096 || image.height() > 4096 ||
         pixels > kMaxDecodedImagePixels - state->image_pixels) {
@@ -601,12 +611,11 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
     return true;
   }
   if (image.IsTextureBacked() || image.IsDeferredPaintRecord()) {
-    state->error = "Texture-backed or deferred image requires command support";
-    return false;
+    DeferUnsupportedPaint(
+        state, "Texture-backed or deferred image requires command support");
   }
   if (image.animation_type() == cc::PaintImage::AnimationType::kVideo) {
-    state->error = "Video image requires original media transport";
-    return false;
+    DeferUnsupportedPaint(state, "Video image requires original media transport");
   }
   // Animation decoding and color conversion belong to the client. Multipart
   // updates retain the current part's original bytes, checked by serialization.
@@ -617,9 +626,55 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
   return true;
 }
 
+bool CheckPaintRecord(PaintSerialization* state,
+                      const cc::PaintRecord& record,
+                      size_t depth);
+
+bool CheckPaintShader(PaintSerialization* state,
+                      const cc::PaintShader& shader,
+                      size_t depth) {
+  if (!shader.IsValid()) {
+    state->error = "Invalid paint shader";
+    return false;
+  }
+  if (state->raster) {
+    switch (shader.shader_type()) {
+      case cc::PaintShader::Type::kEmpty:
+      case cc::PaintShader::Type::kColor:
+      case cc::PaintShader::Type::kLinearGradient:
+      case cc::PaintShader::Type::kRadialGradient:
+      case cc::PaintShader::Type::kTwoPointConicalGradient:
+      case cc::PaintShader::Type::kSweepGradient:
+      case cc::PaintShader::Type::kImage:
+      case cc::PaintShader::Type::kPaintRecord:
+        break;
+      default:
+        DeferUnsupportedPaint(
+            state, "Raster fallback runtime shader is not resource-safe");
+        break;
+    }
+  }
+  if (shader.shader_type() == cc::PaintShader::Type::kPaintRecord) {
+    const auto* record = shader.paint_record();
+    const auto tile = shader.tile();
+    if (!record || !tile.isFinite() || tile.isEmpty() ||
+        tile.width() > 4096 || tile.height() > 4096 ||
+        ++state->record_shaders > kMaxRecordShaders) {
+      state->error = "Paint-record shader tile or count exceeds budget";
+      return false;
+    }
+    if (!CheckPaintRecord(state, *record, depth + 1)) {
+      return false;
+    }
+  }
+  return shader.shader_type() != cc::PaintShader::Type::kImage ||
+         CheckPaintImage(state, shader.paint_image());
+}
+
 bool CheckPaintFilter(PaintSerialization* state,
                       const cc::PaintFilter* filter,
-                      size_t depth = 0) {
+                      size_t depth = 0,
+                      size_t record_depth = 0) {
   if (!state->error.empty()) {
     return false;
   }
@@ -632,6 +687,13 @@ bool CheckPaintFilter(PaintSerialization* state,
   }
   const auto sigma_ok = [](float sigma) {
     return std::isfinite(sigma) && sigma >= 0 && sigma <= 128;
+  };
+  const auto unsupported = [&]() {
+    DeferUnsupportedPaint(
+        state, (state->raster ? "Raster fallback Image-filter " : "Image-filter ") +
+                   cc::PaintFilter::TypeToString(filter->type()) +
+                   (state->raster ? " is not resource-safe"
+                                  : " requires command support"));
   };
   if (const auto* crop = filter->GetCropRect();
       crop && (!crop->isFinite() || crop->width() > 4096 ||
@@ -701,7 +763,8 @@ bool CheckPaintFilter(PaintSerialization* state,
       }
       state->merge_inputs += merge->input_count();
       for (size_t i = 0; i < merge->input_count(); ++i) {
-        if (!CheckPaintFilter(state, merge->input_at(i), depth + 1)) {
+        if (!CheckPaintFilter(state, merge->input_at(i), depth + 1,
+                              record_depth)) {
           return false;
         }
       }
@@ -710,33 +773,76 @@ bool CheckPaintFilter(PaintSerialization* state,
     case cc::PaintFilter::Type::kXfermode: {
       const auto* blend =
           static_cast<const cc::XfermodePaintFilter*>(filter);
-      return CheckPaintFilter(state, blend->background().get(), depth + 1) &&
-             CheckPaintFilter(state, blend->foreground().get(), depth + 1);
+      return CheckPaintFilter(state, blend->background().get(), depth + 1,
+                              record_depth) &&
+             CheckPaintFilter(state, blend->foreground().get(), depth + 1,
+                              record_depth);
     }
     case cc::PaintFilter::Type::kCompose: {
       const auto* compose =
           static_cast<const cc::ComposePaintFilter*>(filter);
-      return CheckPaintFilter(state, compose->outer().get(), depth + 1) &&
-             CheckPaintFilter(state, compose->inner().get(), depth + 1);
+      return CheckPaintFilter(state, compose->outer().get(), depth + 1,
+                              record_depth) &&
+             CheckPaintFilter(state, compose->inner().get(), depth + 1,
+                              record_depth);
     }
+    // Inspect only the original cc inputs declared by these exact classes;
+    // traversal does not grant command or raster support for their effects.
+    case cc::PaintFilter::Type::kMagnifier:
+    case cc::PaintFilter::Type::kAlphaThreshold:
+    case cc::PaintFilter::Type::kMatrixConvolution:
+    case cc::PaintFilter::Type::kTile:
+    case cc::PaintFilter::Type::kMatrix:
+    case cc::PaintFilter::Type::kLightingDistant:
+    case cc::PaintFilter::Type::kLightingPoint:
+    case cc::PaintFilter::Type::kLightingSpot:
+      unsupported();
+      break;
+    case cc::PaintFilter::Type::kArithmetic: {
+      unsupported();
+      const auto* arithmetic =
+          static_cast<const cc::ArithmeticPaintFilter*>(filter);
+      return CheckPaintFilter(state, arithmetic->background().get(), depth + 1,
+                              record_depth) &&
+             CheckPaintFilter(state, arithmetic->foreground().get(), depth + 1,
+                              record_depth);
+    }
+    case cc::PaintFilter::Type::kDisplacementMapEffect: {
+      unsupported();
+      const auto* displacement =
+          static_cast<const cc::DisplacementMapEffectPaintFilter*>(filter);
+      return CheckPaintFilter(state, displacement->displacement().get(),
+                              depth + 1, record_depth) &&
+             CheckPaintFilter(state, displacement->color().get(), depth + 1,
+                              record_depth);
+    }
+    case cc::PaintFilter::Type::kImage:
+      unsupported();
+      return CheckPaintImage(
+          state, static_cast<const cc::ImagePaintFilter*>(filter)->image());
+    case cc::PaintFilter::Type::kPaintRecord:
+      unsupported();
+      return CheckPaintRecord(
+          state, static_cast<const cc::RecordPaintFilter*>(filter)->record(),
+          record_depth + 1);
+    case cc::PaintFilter::Type::kShader:
+      unsupported();
+      return CheckPaintShader(
+          state, static_cast<const cc::ShaderPaintFilter*>(filter)->shader(),
+          record_depth);
+    case cc::PaintFilter::Type::kTurbulence:
+      unsupported();
+      return true;
     default:
-      state->error = (state->raster ? "Raster fallback Image-filter "
-                                   : "Image-filter ") +
-                     cc::PaintFilter::TypeToString(filter->type()) +
-                     (state->raster ? " is not resource-safe"
-                                    : " requires command support");
-      return false;
+      // Unknown/non-null kNullFilter objects have no verified input API.
+      // Fail closed without a capability-only fallback error or guessed cast.
+      state->uninspectable_filter = true;
+      return true;
   }
-  // These filters only transform their input; they cannot hide image, shader
-  // or paint-record resources outside the original-resource serializer.
   return CheckPaintFilter(
       state, static_cast<const cc::OneInputPaintFilter*>(filter)->input().get(),
-      depth + 1);
+      depth + 1, record_depth);
 }
-
-bool CheckPaintRecord(PaintSerialization* state,
-                      const cc::PaintRecord& record,
-                      size_t depth);
 
 const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
                                       const cc::PaintOp& operation,
@@ -749,8 +855,8 @@ const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
     if (state->collect_paint_ids) {
       state->media_ids.insert(id);
     } else if (!state->media_ids.contains(id)) {
-      state->error = "Subframe/compositor transaction requires command support";
-      return nullptr;
+      DeferUnsupportedPaint(
+          state, "Subframe/compositor transaction requires command support");
     }
   }
   if (operation.GetType() == cc::PaintOpType::kDrawRecord &&
@@ -761,8 +867,7 @@ const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
   }
   if (operation.GetType() == cc::PaintOpType::kDrawSkottie ||
       operation.GetType() == cc::PaintOpType::kDrawSlug) {
-    state->error = "Skottie or GPU text requires command support";
-    return nullptr;
+    DeferUnsupportedPaint(state, "Skottie or GPU text requires command support");
   }
   if ((operation.GetType() == cc::PaintOpType::kDrawImage &&
        !CheckPaintImage(
@@ -774,11 +879,11 @@ const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
   }
   if (operation.GetType() == cc::PaintOpType::kSaveLayerFilters) {
     const auto& layer = static_cast<const cc::SaveLayerFiltersOp&>(operation);
-    if (!CheckPaintFilter(state, layer.backdrop_filter.get())) {
+    if (!CheckPaintFilter(state, layer.backdrop_filter.get(), 0, depth)) {
       return nullptr;
     }
     for (const auto& filter : layer.filters) {
-      if (!CheckPaintFilter(state, filter.get())) {
+      if (!CheckPaintFilter(state, filter.get(), 0, depth)) {
         return nullptr;
       }
     }
@@ -786,45 +891,11 @@ const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
   if (operation.IsPaintOpWithFlags()) {
     const auto& flags =
         static_cast<const cc::PaintOpWithFlags&>(operation).flags;
-    if (!CheckPaintFilter(state, flags.getImageFilter().get())) {
+    if (!CheckPaintFilter(state, flags.getImageFilter().get(), 0, depth)) {
       return nullptr;
     }
     if (const auto* shader = flags.getShader()) {
-      if (!shader->IsValid()) {
-        state->error = "Invalid paint shader";
-        return nullptr;
-      }
-      if (state->raster) {
-        switch (shader->shader_type()) {
-          case cc::PaintShader::Type::kEmpty:
-          case cc::PaintShader::Type::kColor:
-          case cc::PaintShader::Type::kLinearGradient:
-          case cc::PaintShader::Type::kRadialGradient:
-          case cc::PaintShader::Type::kTwoPointConicalGradient:
-          case cc::PaintShader::Type::kSweepGradient:
-          case cc::PaintShader::Type::kImage:
-          case cc::PaintShader::Type::kPaintRecord:
-            break;
-          default:
-            state->error = "Raster fallback runtime shader is not resource-safe";
-            return nullptr;
-        }
-      }
-      if (shader->shader_type() == cc::PaintShader::Type::kPaintRecord) {
-        const auto* record = shader->paint_record();
-        const auto tile = shader->tile();
-        if (!record || !tile.isFinite() || tile.isEmpty() ||
-            tile.width() > 4096 || tile.height() > 4096 ||
-            ++state->record_shaders > kMaxRecordShaders) {
-          state->error = "Paint-record shader tile or count exceeds budget";
-          return nullptr;
-        }
-        if (!CheckPaintRecord(state, *record, depth + 1)) {
-          return nullptr;
-        }
-      }
-      if (shader->shader_type() == cc::PaintShader::Type::kImage &&
-          !CheckPaintImage(state, shader->paint_image())) {
+      if (!CheckPaintShader(state, *shader, depth)) {
         return nullptr;
       }
     }
@@ -850,6 +921,20 @@ bool CheckPaintRecord(PaintSerialization* state,
       return false;
     }
     if (!CheckPaintOperation(state, operation, depth)) {
+      return false;
+    }
+  }
+  if (depth == 0) {
+    if (state->uninspectable_filter) {
+      state->error = "Uninspectable image-filter category";
+      return false;
+    }
+    if (!state->unsupported_error.empty()) {
+      state->error = state->unsupported_error;
+      return false;
+    }
+    if (!state->filter_requires_raster.empty()) {
+      state->error = state->filter_requires_raster;
       return false;
     }
   }
@@ -994,10 +1079,6 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
   }
   dependencies->collect_paint_ids = true;
   if (!CheckPaintRecord(dependencies, recording, 0)) {
-    return std::nullopt;
-  }
-  if (!dependencies->filter_requires_raster.empty()) {
-    dependencies->error = dependencies->filter_requires_raster;
     return std::nullopt;
   }
   std::set<uint32_t> visible_ids;
