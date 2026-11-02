@@ -66,6 +66,8 @@ class ComposeTest(unittest.TestCase):
         self.assertEqual(['config', '--quiet'], command[-2:])
         self.assertEqual(str(source.resolve()), env['CEF_SOURCE_DIRECTORY'])
         mounts = config['services']['builder']['volumes']
+        self.assertEqual(mounts,
+                         config['services']['builder-official']['volumes'])
         self.assertEqual({str(path.resolve()) for path in external},
                          {mount['source'] for mount in mounts})
         for mount in mounts:
@@ -78,6 +80,8 @@ class ComposeTest(unittest.TestCase):
         self.assertTrue(
             (source / 'artifacts').is_dir(),
             'Artifacts bind must be created by the host user, not root Docker')
+        self.assertFalse((source / 'artifacts' / 'official').exists(),
+                         'Release invocations must not create official outputs')
 
     def test_standalone_clone_needs_no_external_metadata(self):
         self.check_mounts(self.native, [])
@@ -100,6 +104,59 @@ class ComposeTest(unittest.TestCase):
         gitdir = Path(
             self.git('-C', str(source), 'rev-parse', '--absolute-git-dir'))
         self.check_mounts(source, [gitdir])
+
+    def test_official_service_creates_its_artifacts_directory(self):
+        original_run = subprocess.run
+
+        def run(command, **kwargs):
+            if command[0] == 'docker':
+                return subprocess.CompletedProcess(command, 0)
+            return original_run(command, **kwargs)
+
+        with mock.patch.object(self.compose.subprocess, 'run', side_effect=run):
+            self.assertEqual(
+                0,
+                self.compose.main(['run', '--rm', 'builder-official', 'all',
+                                   '--profile', 'official'], self.native))
+        self.assertTrue((self.native / 'artifacts' / 'official').is_dir())
+
+    def service_block(self, name):
+        text = (self.root / 'docker' / 'compose.yaml').read_text()
+        start = text.index('\n  ' + name + ':\n')
+        end = len(text)
+        for marker in ('\n  builder', '\nvolumes:'):
+            found = text.find(marker, start + 1)
+            if found != -1:
+                end = min(end, found)
+        return text[start:end]
+
+    def test_release_service_is_unchanged(self):
+        block = self.service_block('builder')
+        self.assertIn(
+            'GN_DEFINES: ${GN_DEFINES:-use_sysroot=true is_component_build=false '
+            'symbol_level=1 is_cfi=false use_thin_lto=false use_remoteexec=false '
+            'enable_remoting=false proprietary_codecs=true '
+            'ffmpeg_branding="Chrome"}', block)
+        self.assertIn('image: cef-builder:ubuntu-26.10', block)
+        self.assertNotIn('target:', block.split('environment:')[0])
+        self.assertNotIn('CEF_BUILD_SERVICE_PROFILE', block)
+        self.assertNotIn('cef-official-out', block)
+        self.assertIn('source: ../artifacts\n', block)
+
+    def test_official_service_isolates_outputs(self):
+        block = self.service_block('builder-official')
+        self.assertIn('target: official', block)
+        self.assertIn('CEF_BUILD_SERVICE_PROFILE: official', block)
+        self.assertIn('GN_DEFINES: ${OFFICIAL_GN_DEFINES:-', block)
+        self.assertIn('is_official_build=true', block)
+        self.assertNotIn('use_thin_lto=false', block)
+        self.assertNotIn('chrome_pgo_phase', block)
+        self.assertIn('source: cef-work\n        target: /work\n', block)
+        self.assertIn(
+            'source: cef-official-out\n        target: /work/chromium/src/out\n',
+            block)
+        self.assertIn('source: ../artifacts/official\n        target: /artifacts',
+                      block)
 
     def test_missing_metadata_fails_without_docker_or_host_directory_creation(
             self):

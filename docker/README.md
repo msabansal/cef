@@ -201,6 +201,116 @@ To pin the image to an immutable digest, set `BASE_IMAGE` in `.env` to
 Ubuntu-compatible base with APT.
 Dependency upgrades also require rebuilding the image; source-only edits do not.
 
+## Official (optimized) profile
+
+The default `release` profile above is unchanged. An explicitly selected
+`official` profile builds a maximally optimized Release libcef with
+`is_official_build=true`, ThinLTO and PGO, then publishes stripped binaries with
+separate debug symbols. It runs only in the `builder-official` Compose service:
+
+```sh
+python3 compose.py build -q builder-official
+python3 compose.py run --rm builder-official all --profile official
+```
+
+`build`, `sync` and `package` accept `--profile official` the same way. Only
+`--config release` is supported. `builder-official` refuses the release profile,
+`builder` refuses the official profile, and the official profile refuses to run
+unless `out/` is a separate mount.
+
+### Isolation and disk
+
+`builder-official` shares the `cef-work` volume (depot_tools, the Chromium
+checkout, toolchains, sysroot and the `/work/.cef-build.lock` serialization)
+with `builder`, but mounts the separate `cef-official-out` volume over
+`/work/chromium/src/out`. Every per-configuration file that CEF's
+`gclient_hook.py`, GN, Ninja, `reset_patched_files.py` and `make_distrib.py`
+write lives under `out/`, so official configuration and object files never
+touch the release `out/Release_GN_x64` tree or its incremental state. The
+official volume also uses the fixed CEF name `out/Release_GN_x64` internally.
+Budget a second full Release output tree (typically 100 GB or more; ThinLTO
+caches add more) plus the PGO profile (about 1 GB).
+
+Run the first `sync` with the `builder` service: the official service requires
+an existing shared checkout. Do not start `builder-official` against a new,
+empty `cef-work` volume; Docker would create the `out` mount point before
+Chromium is checked out. If that happens, remove `/work/chromium` with the
+`builder` service before syncing.
+
+Shared state outside `out/` that an official run can update is identical to
+what a release run writes: the CEF source mirror and translator output in
+`src/cef`, re-applied Chromium patches, the sysroot, and (only if it already
+exists) `src/compile_commands.json`. The official run additionally downloads
+PGO profiles into `src/chrome/build/pgo_profiles/`, which release builds ignore.
+Official builds are serialized with release builds by the shared lock; they
+cannot run concurrently.
+
+### Build settings and PGO
+
+The service sets `GN_DEFINES` from `OFFICIAL_GN_DEFINES`, never from the release
+`GN_DEFINES` value:
+
+```dotenv
+OFFICIAL_GN_DEFINES=use_sysroot=true is_component_build=false is_official_build=true symbol_level=1 use_debug_fission=false is_cfi=false use_remoteexec=false enable_remoting=false proprietary_codecs=true ffmpeg_branding="Chrome"
+```
+
+`use_thin_lto` is left at Chromium's official default (enabled). CEF itself adds
+`disable_fieldtrial_testing_config=true` and disables PartitionAlloc-Everywhere
+and BackupRefPtr for official Linux builds. `use_debug_fission=false` keeps the
+complete DWARF in `libcef.so` so packaging can move it into one `.debug` file;
+with Chromium's default split DWARF most debug information would remain as
+`.dwo` files inside the official out volume. `is_official_build=true` is
+required.
+
+Chromium defaults official Linux builds to `chrome_pgo_phase=2`, which compiles
+with a profile named by `chrome/build/linux.pgo.txt`. `sync` and `all` download
+it with `tools/update_pgo_profiles.py --target=linux update
+--gs-url-base=chromium-optimization-profiles/pgo_profiles`, the same command as
+Chromium's `checkout_pgo_profiles` DEPS hook, without changing the shared
+`.gclient`. `build` does not download; it fails before GN generation if the
+profile is missing. To opt out of PGO explicitly, append `chrome_pgo_phase=0` to
+`OFFICIAL_GN_DEFINES` (or supply your own `pgo_data_path`).
+
+### Artifacts and symbols
+
+Official artifacts are written to `artifacts/official`:
+
+```text
+artifacts/official/
+  cef_binary_<version>_linux64/                    # runtime distribution
+    Release/libcef.so                              # stripped, .gnu_debuglink
+  cef_binary_<version>_linux64_release_symbols/
+    libcef.so.debug                                # DWARF and .symtab
+    .build-id/<xx>/<rest>.debug -> ../../libcef.so.debug
+    manifest.json
+```
+
+`libcef.so` is stripped with the Chromium checkout's
+`third_party/llvm-build/Release+Asserts/bin/llvm-objcopy --strip-unneeded`,
+which removes debug sections and non-dynamic symbols but keeps `.dynsym`. Other
+distribution files, including `chrome-sandbox` and the other shared libraries,
+are not modified. Packaging happens in a hidden staging directory; the outputs
+are renamed into place only after verifying that the library and debug file
+share one GNU build-id, the library has no `.debug_*` sections and has
+`.gnu_debuglink`, and the debug file contains DWARF. A failure leaves previously
+published outputs unchanged.
+
+`manifest.json` (`"format": "cef-official-symbols/v1"`) records the SHA-256 of
+the stripped `Release/libcef.so` and of `libcef.so.debug`, the build-id, the PGO
+phase and profile name, selected effective GN values (`gn args --list`) and the
+verbatim `args.gn`.
+
+To debug, either copy `libcef.so.debug` next to the deployed `libcef.so` (GDB
+follows the debuglink), or point GDB at the symbols directory, which it searches
+by build-id:
+
+```sh
+gdb -iex 'set debug-file-directory /path/to/cef_binary_<version>_linux64_release_symbols' ./app
+```
+
+`llvm-symbolizer --debug-file-directory=<symbols dir>` and `eu-unstrip` work the
+same way.
+
 ## Entrypoint checks
 
 The orchestration tests do not download or compile Chromium:

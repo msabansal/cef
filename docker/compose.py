@@ -11,6 +11,9 @@ import subprocess
 import sys
 import uuid
 
+OFFICIAL_SERVICE = 'builder-official'
+SERVICES = ('builder', OFFICIAL_SERVICE)
+
 
 def main(argv=None, source=None):
     source = Path(source or Path(__file__).resolve().parents[1]).resolve()
@@ -33,14 +36,18 @@ def main(argv=None, source=None):
     directory = source / '.artifacts'
     directory.mkdir(exist_ok=True)
     (source / 'artifacts').mkdir(exist_ok=True)
+    args = sys.argv[1:] if argv is None else argv
+    if OFFICIAL_SERVICE in args:
+        (source / 'artifacts' / 'official').mkdir(exist_ok=True)
     override = directory / ('compose-metadata-' + uuid.uuid4().hex + '.json')
     env = os.environ.copy()
     env['CEF_SOURCE_DIRECTORY'] = str(source)
     try:
         with override.open('x', encoding='utf-8') as output:
-            json.dump({'services': {'builder': {'volumes': mounts}}}, output)
+            json.dump({'services': {service: {'volumes': mounts} for service in SERVICES}},
+                      output)
         return subprocess.run(['docker', 'compose', '-f', str(source / 'docker' / 'compose.yaml'),
-             '-f', str(override), *(sys.argv[1:] if argv is None else argv)],
+             '-f', str(override), *args],
                               env=env).returncode
     finally:
         override.unlink(missing_ok=True)

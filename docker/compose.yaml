@@ -36,5 +36,49 @@ services:
         bind:
           create_host_path: false
 
+  # Official (ThinLTO + PGO) builds share the Chromium checkout and toolchain in
+  # cef-work but shadow out/ with their own volume, so the release
+  # out/Release_GN_x64 incremental tree is never reconfigured or invalidated.
+  builder-official:
+    image: cef-builder-official:ubuntu-26.10
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: official
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ubuntu:26.10}
+        BUILDER_UID: ${BUILDER_UID:-1000}
+        BUILDER_GID: ${BUILDER_GID:-1000}
+    init: true
+    shm_size: 2gb
+    environment:
+      CEF_SOURCE_DIRECTORY: ${CEF_SOURCE_DIRECTORY:-/source/cef}
+      CEF_BUILD_SERVICE_PROFILE: official
+      GN_DEFINES: ${OFFICIAL_GN_DEFINES:-use_sysroot=true is_component_build=false is_official_build=true symbol_level=1 use_debug_fission=false is_cfi=false use_remoteexec=false enable_remoting=false proprietary_codecs=true ffmpeg_branding="Chrome"}
+    volumes:
+      - type: bind
+        source: ..
+        target: ${CEF_SOURCE_DIRECTORY:-/source/cef}
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: .
+        target: /builder
+        read_only: true
+      - type: volume
+        source: cef-work
+        target: /work
+      - type: volume
+        source: cef-official-out
+        target: /work/chromium/src/out
+      - type: bind
+        source: ../artifacts/official
+        target: /artifacts
+        bind:
+          create_host_path: false
+
 volumes:
   cef-work:
+  cef-official-out:

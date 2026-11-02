@@ -75,6 +75,216 @@ touch "$src/out/Release_GN_x64/libcef.so"
 package
 grep -q -- "--output-dir=$artifacts .*--no-archive" "$log" ||
     fail "Packaging did not disable compression"
+[[ "$(< "$gn_log")" == "$release_gn_defines" &&
+   "$release_gn_defines" == 'use_sysroot=true is_component_build=false symbol_level=1 is_cfi=false use_thin_lto=false use_remoteexec=false enable_remoting=false proprietary_codecs=true ffmpeg_branding="Chrome"' ]] ||
+    fail "Default release GN arguments changed"
+! grep -q 'update_pgo_profiles' "$log" || fail "Release build touched PGO profiles"
+[[ -z $(find "$artifacts" -mindepth 1 -print -quit 2>/dev/null) ]] ||
+    fail "Release packaging created extra artifacts or staging directories"
+(profile=release; unset CEF_BUILD_SERVICE_PROFILE; check_service_profile) ||
+    fail "Release profile was rejected by the release service"
+
+# Official profile: separate service guard, GN defaults, PGO and symbols.
+official_log=$test_root/official-commands
+fake_mount=1
+mountpoint() { [[ $fake_mount -eq 1 ]]; }
+for args in 'build --profile official --config debug' \
+            'build --profile official --config both' 'build --profile bogus'; do
+    read -r -a words <<< "$args"
+    if (parse_args "${words[@]}") 2>"$test_root/error"; then
+        fail "Invalid official arguments accepted: $args"
+    fi
+done
+if (profile=official; unset CEF_BUILD_SERVICE_PROFILE
+    check_service_profile) 2>"$test_root/error"; then
+    fail "Official profile ran in the release service"
+fi
+grep -q 'builder-official' "$test_root/error" ||
+    fail "Missing official service instructions"
+if (profile=release; CEF_BUILD_SERVICE_PROFILE=official
+    check_service_profile) 2>"$test_root/error"; then
+    fail "Release profile ran in the official service"
+fi
+if (profile=official; CEF_BUILD_SERVICE_PROFILE=official; fake_mount=0
+    check_service_profile) 2>"$test_root/error"; then
+    fail "Official profile ran without a separate out mount"
+fi
+(profile=official; CEF_BUILD_SERVICE_PROFILE=official; check_service_profile) ||
+    fail "Official profile was rejected by the official service"
+
+official_python() {
+    printf 'python3 %s\n' "$*" >> "$official_log"
+    case "$*" in
+        *tools/gclient_hook.py*) printf '%s\n' "$GN_DEFINES" > "$gn_log" ;;
+        *get_profile_path*) return "${pgo_status:-0}" ;;
+    esac
+}
+(
+    python3() { official_python "$@"; }
+    profile=official config=release jobs=2
+    unset GN_DEFINES
+    compile
+    [[ "$(< "$gn_log")" == "$official_gn_defines" ]] ||
+        fail "Official GN defaults were not used"
+    for define in is_official_build=true symbol_level=1 \
+                  use_debug_fission=false proprietary_codecs=true; do
+        grep -q -F -- "$define" "$gn_log" || fail "Official build lacks $define"
+    done
+    ! grep -q -e 'use_thin_lto=false' -e 'chrome_pgo_phase' "$gn_log" ||
+        fail "Official build disabled ThinLTO or PGO"
+    grep -q 'update_pgo_profiles.py --target=linux get_profile_path' \
+        "$official_log" || fail "Official build did not check the PGO profile"
+    grep -q 'autoninja -C out/Release_GN_x64 -j 2' "$log" ||
+        fail "Official build did not target the shadowed Release output"
+)
+: > "$official_log"
+if (python3() { official_python "$@"; }
+    profile=official config=release pgo_status=1
+    unset GN_DEFINES
+    compile) 2>"$test_root/error"; then
+    fail "Official build accepted a missing PGO profile"
+fi
+grep -q 'PGO profile is missing' "$test_root/error" ||
+    fail "Missing PGO profile error was unclear"
+! grep -q gclient_hook "$official_log" ||
+    fail "Missing PGO profile still configured the build"
+: > "$official_log"
+(
+    python3() { official_python "$@"; }
+    profile=official config=release pgo_status=1
+    GN_DEFINES="$official_gn_defines chrome_pgo_phase=0"
+    compile
+    fetch_pgo_profile
+    ! grep -q update_pgo_profiles "$official_log" ||
+        fail "PGO opt-out still required a profile"
+)
+: > "$official_log"
+(
+    python3() { official_python "$@"; }
+    GN_DEFINES=$official_gn_defines
+    fetch_pgo_profile
+    grep -q -- '--target=linux update --gs-url-base=chromium-optimization-profiles/pgo_profiles' \
+        "$official_log" || fail "Official sync did not download the PGO profile"
+)
+if (profile=official config=release
+    GN_DEFINES='use_sysroot=true is_component_build=false'
+    python3() { :; }
+    compile) 2>"$test_root/error"; then
+    fail "Official profile accepted non-official GN arguments"
+fi
+
+# Symbol split: stub LLVM tools model sections as '.name' lines in the files.
+llvm_bin=$src/third_party/llvm-build/Release+Asserts/bin
+mkdir -p "$llvm_bin" "$src/chrome/build"
+cat > "$llvm_bin/llvm-objcopy" <<'OBJCOPY'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+    --only-keep-debug)
+        [[ "${OBJCOPY_FAIL:-}" != debug ]] || exit 3
+        grep -e '^build-id=' -e '^\.debug_' -e '^\.symtab' "$2" > "$3" ;;
+    --strip-unneeded)
+        [[ "${OBJCOPY_FAIL:-}" != strip ]] || exit 4
+        link=${2#--add-gnu-debuglink=}
+        [[ -f "$link" ]] || exit 5
+        { grep -v -e '^\.debug_' -e '^\.symtab' "$3"; echo .gnu_debuglink; } > "$4" ;;
+    *) exit 2 ;;
+esac
+OBJCOPY
+cat > "$llvm_bin/llvm-readelf" <<'READELF'
+#!/usr/bin/env bash
+set -euo pipefail
+file=${!#}
+if [[ "$1" == -n ]]; then
+    id=$(sed -n 's/^build-id=//p' "$file")
+    [[ "${READELF_BAD_ID:-}" != 1 || "$file" != *.debug ]] || id=ffff
+    echo "  GNU 0x14 NT_GNU_BUILD_ID"
+    echo "    Build ID: $id"
+else
+    grep '^\.' "$file" | sed 's/^/  [ 1] /'
+fi
+READELF
+chmod +x "$llvm_bin/llvm-objcopy" "$llvm_bin/llvm-readelf"
+printf 'chrome-linux-main-1.profdata\n' > "$src/chrome/build/linux.pgo.txt"
+printf 'is_official_build=true\n' > "$src/out/Release_GN_x64/args.gn"
+dist_name='cef_binary_1.0.0+gabcdef0+chromium-156.0.8078.0_linux64'
+official_artifacts=$test_root/official-artifacts
+official_package() {
+    (
+        artifacts=$official_artifacts profile=official
+        python3() {
+            local output=${2#--output-dir=}
+            [[ "$1" == make_distrib.py ]] || return 9
+            mkdir -p "$output/$dist_name/Release"
+            printf 'build-id=ABCDEF12\n.text\n.dynsym\n.symtab\n.debug_info\n.debug_line\n' \
+                > "$output/$dist_name/Release/libcef.so"
+            printf 'not elf\n' > "$output/$dist_name/Release/chrome-sandbox"
+        }
+        gn() {
+            printf 'is_official_build = true\nchrome_pgo_phase = 2\n'
+            printf 'pgo_data_path = ""\nuse_thin_lto = true\nsymbol_level = 1\n'
+        }
+        package
+    )
+}
+official_package > /dev/null
+published=$official_artifacts/$dist_name
+symbols=${published}_release_symbols
+[[ -f "$published/Release/libcef.so" && -f "$symbols/libcef.so.debug" ]] ||
+    fail "Official package did not publish the distribution and symbols"
+! grep -q '^\.debug_' "$published/Release/libcef.so" ||
+    fail "Published libcef.so still has debug sections"
+grep -q '^\.dynsym' "$published/Release/libcef.so" ||
+    fail "Published libcef.so lost .dynsym"
+grep -q '^\.gnu_debuglink' "$published/Release/libcef.so" ||
+    fail "Published libcef.so has no debuglink"
+grep -q '^\.debug_info' "$symbols/libcef.so.debug" ||
+    fail "Debug file has no DWARF"
+[[ "$(< "$published/Release/chrome-sandbox")" == 'not elf' ]] ||
+    fail "Non-libcef files were modified"
+[[ -e "$symbols/.build-id/ab/cdef12.debug" ]] || fail "Missing build-id link"
+manifest=$symbols/manifest.json
+lib_sha=$(sha256sum "$published/Release/libcef.so")
+debug_sha=$(sha256sum "$symbols/libcef.so.debug")
+grep -q "\"sha256\": \"${lib_sha%% *}\"" "$manifest" ||
+    fail "Manifest has the wrong libcef.so hash"
+grep -q "\"debug_sha256\": \"${debug_sha%% *}\"" "$manifest" ||
+    fail "Manifest has the wrong debug file hash"
+for expected in '"build_id": "abcdef12"' '"phase": "2"' \
+                '"profile": "chrome-linux-main-1.profdata"' \
+                '"is_official_build": "true"' '"use_thin_lto": "true"' \
+                '"args_gn": "is_official_build=true"'; do
+    grep -q -F -- "$expected" "$manifest" || fail "Manifest lacks $expected"
+done
+python3_real=$(type -P python3 || type -P python || true)
+if [[ -n "$python3_real" ]]; then
+    "$python3_real" -c 'import json, sys; json.load(open(sys.argv[1]))' \
+        "$(cygpath -w "$manifest" 2>/dev/null || echo "$manifest")" ||
+        fail "Manifest is not valid JSON"
+fi
+[[ -z $(find "$official_artifacts" -maxdepth 1 -name '.official-staging.*' \
+    -print -quit) ]] || fail "Official package left a staging directory"
+
+snapshot() { (cd "$official_artifacts" && find . -type f -exec sha256sum {} + | sort); }
+before=$(snapshot)
+for failure in OBJCOPY_FAIL=strip OBJCOPY_FAIL=debug READELF_BAD_ID=1; do
+    if (export "$failure"; official_package) > /dev/null 2>"$test_root/error"; then
+        fail "Official package ignored $failure"
+    fi
+    [[ "$(snapshot)" == "$before" ]] ||
+        fail "$failure modified the published official outputs"
+    [[ -z $(find "$official_artifacts" -maxdepth 1 -name '.official-staging.*' \
+        -print -quit) ]] || fail "$failure left a staging directory"
+done
+grep -q 'Build-id mismatch' "$test_root/error" ||
+    fail "Build-id mismatch was not reported"
+rm "$llvm_bin/llvm-objcopy"
+if official_package > /dev/null 2>"$test_root/error"; then
+    fail "Official package ran without llvm-objcopy"
+fi
+grep -q 'llvm-objcopy' "$test_root/error" || fail "Missing LLVM tool error was unclear"
+[[ "$(snapshot)" == "$before" ]] || fail "Missing tools modified outputs"
+echo "PASS: official profile guard, GN defaults, PGO and symbol split"
 
 config=debug
 jobs=

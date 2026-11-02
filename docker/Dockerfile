@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 ARG BASE_IMAGE=ubuntu:26.10
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS builder
 
 # Chromium supplies the target sysroot and Clang. These packages also support
 # executing host tools that are built against that sysroot.
@@ -41,3 +41,16 @@ USER builder
 WORKDIR /work
 ENTRYPOINT ["bash", "/usr/local/lib/cef/build.sh"]
 CMD ["all"]
+
+# builder-official mounts its own volume at /work/chromium/src/out. Docker
+# initializes an empty named volume from the image directory at the mount
+# target, so the directory must exist here and be owned by the builder user.
+FROM builder AS official
+USER root
+RUN mkdir -p /work/chromium/src/out \
+    && chown builder:builder /work/chromium /work/chromium/src \
+        /work/chromium/src/out
+USER builder
+
+# Keep the release builder as the default build target.
+FROM builder
