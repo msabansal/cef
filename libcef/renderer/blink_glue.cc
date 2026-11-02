@@ -2569,10 +2569,12 @@ std::vector<std::string> FormatDamage(const DamageCanvas& canvas,
 sk_sp<SkPicture> FinishViewportPicture(SkPictureRecorder* recorder,
                                      const SkRect& viewport) {
   auto picture = recorder->finishRecordingAsPicture();
-  // Skia collapses empty recordings to zero cull bounds. A placeholder
-  // preserves the viewport without painting over the parent's contents.
+  // Empty recordings and serialized placeholders lose their cull bounds on
+  // deserialization. A nonpainting annotation survives the round trip.
   if (picture->cullRect().isEmpty() && picture->approximateOpCount() == 0) {
-    return SkPicture::MakePlaceholder(viewport);
+    auto* canvas = recorder->beginRecording(viewport);
+    canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.EmptyViewport.v1", nullptr);
+    return recorder->finishRecordingAsPicture();
   }
   return picture;
 }
