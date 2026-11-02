@@ -2482,6 +2482,17 @@ std::vector<std::string> FormatDamage(const DamageCanvas& canvas,
   return parts;
 }
 
+sk_sp<SkPicture> FinishViewportPicture(SkPictureRecorder* recorder,
+                                     const SkRect& viewport) {
+  auto picture = recorder->finishRecordingAsPicture();
+  // Skia collapses empty recordings to zero cull bounds. A placeholder
+  // preserves the viewport without painting over the parent's contents.
+  if (picture->cullRect().isEmpty() && picture->approximateOpCount() == 0) {
+    return SkPicture::MakePlaceholder(viewport);
+  }
+  return picture;
+}
+
 // The skeleton is the normal lifecycle conversion of the local root's paint
 // artifact, with each kept chunk's drawings replaced by a placeholder picture
 // that serializes as its 16-byte key. Chunks are culled as a whole against the
@@ -2636,7 +2647,8 @@ CefDrawingCommands CaptureIncrementalPicture(
     skeleton.referenced.clear();
     skeleton.seen.clear();
     SkPictureRecorder media_recorder;
-    auto* media_canvas = media_recorder.beginRecording(picture->cullRect());
+    const auto viewport = SkRect::MakeWH(bounds.width(), bounds.height());
+    auto* media_canvas = media_recorder.beginRecording(viewport);
     for (const auto& [id, data] : media_states) {
       media_canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.MediaState.v1",
                                    data.get());
@@ -2651,7 +2663,7 @@ CefDrawingCommands CaptureIncrementalPicture(
     // Replaying into a recorder keeps placeholder references intact.
     picture->playback(media_canvas);
     BoundedPaintStream stream(kMaxPictureBytes);
-    media_recorder.finishRecordingAsPicture()->serialize(&stream, &procs);
+    FinishViewportPicture(&media_recorder, viewport)->serialize(&stream, &procs);
     if (stream.failed())
       return std::nullopt;
     return stream.TakeBytes();
@@ -3139,13 +3151,14 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
     return result;
   }
   SkPictureRecorder media_recorder;
-  auto* media_canvas = media_recorder.beginRecording(picture->cullRect());
+  const auto viewport = SkRect::MakeWH(bounds.width(), bounds.height());
+  auto* media_canvas = media_recorder.beginRecording(viewport);
   for (const auto& [id, data] : media_states) {
     media_canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.MediaState.v1",
                                  data.get());
   }
   picture->playback(media_canvas);
-  picture = media_recorder.finishRecordingAsPicture();
+  picture = FinishViewportPicture(&media_recorder, viewport);
   SkSerialProcs procs;
   procs.fImageProc = &SerializeOriginalImage;
   procs.fImageCtx = &state;
