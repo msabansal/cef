@@ -267,6 +267,7 @@ class BoundedPaintStream final : public SkWStream {
 
 struct PaintSerialization {
   std::string error;
+  std::string filter_requires_raster;
   bool raster = false;
   std::function<void(const std::string&, const void*, size_t)> sink;
   // Originals the consumer already holds (streaming root captures only): they
@@ -278,6 +279,7 @@ struct PaintSerialization {
   size_t bytes = 0;
   uint64_t image_pixels = 0;
   size_t filter_nodes = 0;
+  size_t merge_inputs = 0;
   size_t paint_ops = 0;
   size_t record_bytes = 0;
   size_t record_shaders = 0;
@@ -631,6 +633,13 @@ bool CheckPaintFilter(PaintSerialization* state,
   const auto sigma_ok = [](float sigma) {
     return std::isfinite(sigma) && sigma >= 0 && sigma <= 128;
   };
+  if (const auto* crop = filter->GetCropRect();
+      crop && (!crop->isFinite() || crop->width() > 4096 ||
+               crop->height() > 4096 ||
+               double(crop->width()) * crop->height() > kMaxViewportPixels)) {
+    state->error = "Image-filter crop budget exceeded";
+    return false;
+  }
   switch (filter->type()) {
     case cc::PaintFilter::Type::kBlur: {
       const auto* blur = static_cast<const cc::BlurPaintFilter*>(filter);
@@ -651,8 +660,53 @@ bool CheckPaintFilter(PaintSerialization* state,
       }
       break;
     }
+    case cc::PaintFilter::Type::kOffset: {
+      const auto* offset = static_cast<const cc::OffsetPaintFilter*>(filter);
+      if (!std::isfinite(offset->dx()) || !std::isfinite(offset->dy()) ||
+          std::abs(offset->dx()) > 4096 || std::abs(offset->dy()) > 4096) {
+        state->error = "Image-filter offset budget exceeded";
+        return false;
+      }
+      break;
+    }
+    case cc::PaintFilter::Type::kMorphology: {
+      const auto* morphology =
+          static_cast<const cc::MorphologyPaintFilter*>(filter);
+      if (!sigma_ok(morphology->radius_x()) ||
+          !sigma_ok(morphology->radius_y()) ||
+          (morphology->morph_type() !=
+               cc::MorphologyPaintFilter::MorphType::kDilate &&
+           morphology->morph_type() !=
+               cc::MorphologyPaintFilter::MorphType::kErode)) {
+        state->error = "Image-filter morphology budget exceeded";
+        return false;
+      }
+      // Native raster is bounded here. Do not expose an unqualified serialized
+      // filter to the frozen client, or stop validation before its descendants.
+      if (!state->raster) {
+        state->filter_requires_raster =
+            "Image-filter kMorphology requires command support";
+      }
+      break;
+    }
     case cc::PaintFilter::Type::kColorFilter:
       break;
+    case cc::PaintFilter::Type::kMerge: {
+      const auto* merge = static_cast<const cc::MergePaintFilter*>(filter);
+      // count_inputs() reflects Skia's optimized filter, not the cc graph.
+      // Bound even null inputs, which do not increment the recursive node count.
+      if (merge->input_count() > kMaxFilterNodes - state->merge_inputs) {
+        state->error = "Image-filter graph budget exceeded";
+        return false;
+      }
+      state->merge_inputs += merge->input_count();
+      for (size_t i = 0; i < merge->input_count(); ++i) {
+        if (!CheckPaintFilter(state, merge->input_at(i), depth + 1)) {
+          return false;
+        }
+      }
+      return true;
+    }
     case cc::PaintFilter::Type::kXfermode: {
       const auto* blend =
           static_cast<const cc::XfermodePaintFilter*>(filter);
@@ -666,9 +720,11 @@ bool CheckPaintFilter(PaintSerialization* state,
              CheckPaintFilter(state, compose->inner().get(), depth + 1);
     }
     default:
-      state->error = "Image-filter " +
+      state->error = (state->raster ? "Raster fallback Image-filter "
+                                   : "Image-filter ") +
                      cc::PaintFilter::TypeToString(filter->type()) +
-                     " requires command support";
+                     (state->raster ? " is not resource-safe"
+                                    : " requires command support");
       return false;
   }
   // These filters only transform their input; they cannot hide image, shader
@@ -702,27 +758,6 @@ const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
           state, static_cast<const cc::DrawRecordOp&>(operation).record,
           depth + 1)) {
     return nullptr;
-  }
-  if (state->raster) {
-    if ((operation.GetType() == cc::PaintOpType::kDrawImage &&
-         !CheckPaintImage(
-             state, static_cast<const cc::DrawImageOp&>(operation).image)) ||
-        (operation.GetType() == cc::PaintOpType::kDrawImageRect &&
-         !CheckPaintImage(
-             state, static_cast<const cc::DrawImageRectOp&>(operation).image)))
-      return nullptr;
-    if (operation.IsPaintOpWithFlags()) {
-      const auto* shader =
-          static_cast<const cc::PaintOpWithFlags&>(operation).flags.getShader();
-      if (shader && shader->shader_type() == cc::PaintShader::Type::kImage &&
-          !CheckPaintImage(state, shader->paint_image()))
-        return nullptr;
-      if (shader && shader->shader_type() == cc::PaintShader::Type::kPaintRecord &&
-          (!shader->paint_record() ||
-           !CheckPaintRecord(state, *shader->paint_record(), depth + 1)))
-        return nullptr;
-    }
-    return &operation;
   }
   if (operation.GetType() == cc::PaintOpType::kDrawSkottie ||
       operation.GetType() == cc::PaintOpType::kDrawSlug) {
@@ -758,6 +793,22 @@ const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
       if (!shader->IsValid()) {
         state->error = "Invalid paint shader";
         return nullptr;
+      }
+      if (state->raster) {
+        switch (shader->shader_type()) {
+          case cc::PaintShader::Type::kEmpty:
+          case cc::PaintShader::Type::kColor:
+          case cc::PaintShader::Type::kLinearGradient:
+          case cc::PaintShader::Type::kRadialGradient:
+          case cc::PaintShader::Type::kTwoPointConicalGradient:
+          case cc::PaintShader::Type::kSweepGradient:
+          case cc::PaintShader::Type::kImage:
+          case cc::PaintShader::Type::kPaintRecord:
+            break;
+          default:
+            state->error = "Raster fallback runtime shader is not resource-safe";
+            return nullptr;
+        }
       }
       if (shader->shader_type() == cc::PaintShader::Type::kPaintRecord) {
         const auto* record = shader->paint_record();
@@ -885,7 +936,7 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
       }
       const auto* element =
           blink::DynamicTo<blink::HTMLCanvasElement>(object->GetNode());
-      if (!element || dependencies->raster) {
+      if (!element) {
         continue;
       }
       auto* context = element->RenderingContext();
@@ -894,6 +945,9 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
         dependencies->error =
             "GPU, bitmap or offscreen canvas requires command transport";
         return std::nullopt;
+      }
+      if (dependencies->raster) {
+        continue;
       }
       if (context) {
         if (!blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
@@ -940,6 +994,10 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
   }
   dependencies->collect_paint_ids = true;
   if (!CheckPaintRecord(dependencies, recording, 0)) {
+    return std::nullopt;
+  }
+  if (!dependencies->filter_requires_raster.empty()) {
+    dependencies->error = dependencies->filter_requires_raster;
     return std::nullopt;
   }
   std::set<uint32_t> visible_ids;
@@ -2916,7 +2974,7 @@ CefDrawingCommands CaptureRasterFallback(
   }
   std::map<uint32_t, sk_sp<SkImage>> images;
   size_t child_bytes = 0;
-  uint64_t child_pixels = 0;
+  uint64_t child_pixels = dependencies.image_pixels;
   for (auto* child = frame->Tree().TraverseNext(frame); child;
        child = child->Tree().TraverseNext(frame)) {
     if (!IsComposedChildFrame(frame, child)) {
@@ -2931,7 +2989,8 @@ CefDrawingCommands CaptureRasterFallback(
       continue;
     const auto found = children.find(DrawingFrameIdentity(child));
     if (found == children.end() ||
-        (child_bytes += found->second.size()) > kMaxPaintBytes) {
+        (child_bytes += found->second.size()) >
+            kMaxPaintBytes - dependencies.record_bytes) {
       result.error = "Raster fallback missing child picture or byte budget exceeded";
       return result;
     }
