@@ -1071,6 +1071,20 @@ bool EnsurePaintClean(blink::LocalFrame* frame) {
              blink::DocumentLifecycle::kPaintClean;
 }
 
+gfx::Rect CommandPaintCull(const gfx::Rect& bounds) {
+  return gfx::Rect(0, -bounds.height(), bounds.width(), 3 * bounds.height());
+}
+
+// Dependency discovery and chunk export must select the same display items.
+// The hook deliberately retains clipped chunks for client scroll prefetch.
+cc::PaintRecord ConvertCommandPaint(
+    blink::LocalFrame* frame, const gfx::Rect& cull,
+    blink::PaintChunksToCcLayer::ChunkContentHook content) {
+  return blink::PaintChunksToCcLayer::Convert(
+      blink::PaintChunkSubset(frame->View()->GetPaintArtifact()),
+      blink::PropertyTreeState::Root(), &cull, content);
+}
+
 std::optional<cc::PaintRecord> CaptureRequiredPaint(
     blink::WebLocalFrame* web_frame, const gfx::Rect& bounds,
     PaintSerialization* dependencies) {
@@ -1169,13 +1183,19 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
         layout_view->FirstFragment().ContentsProperties().Unalias()));
     recording = recorder.finishRecordingAsPicture();
   } else {
-    // The normal lifecycle paint, replayed in viewport coordinates.
-    const gfx::Rect viewport(bounds.size());
-    recording = frame->View()->GetPaintRecord(&viewport);
+    recording = ConvertCommandPaint(
+        frame, CommandPaintCull(bounds),
+        [](const blink::PaintChunk&, cc::PaintRecord items) { return items; });
   }
   dependencies->collect_paint_ids = true;
   if (!CheckPaintRecord(dependencies, recording, 0)) {
     return std::nullopt;
+  }
+  // Chunk contents are serialized without the skeleton's viewport clips.
+  // Their child/video markers must be composed even while prefetched. Only
+  // raster capture can prove an iframe unnecessary using viewport rejection.
+  if (!dependencies->raster) {
+    return recording;
   }
   std::set<uint32_t> visible_ids;
   cc::PlaybackCallbacks callbacks;
@@ -2468,7 +2488,6 @@ std::vector<std::string> FormatDamage(const DamageCanvas& canvas,
 // viewport expanded by one viewport height above and below.
 CefDrawingCommands CaptureIncrementalPicture(
     blink::LocalFrame* frame, const gfx::Rect& bounds,
-    const std::set<uint32_t>& frame_ids,
     const std::map<uint32_t, sk_sp<SkPicture>>& frame_pictures,
     const std::map<uint32_t, sk_sp<SkData>>& media_states,
     const std::vector<uint8_t>& known_bytes,
@@ -2508,11 +2527,9 @@ CefDrawingCommands CaptureIncrementalPicture(
   std::map<const blink::PaintChunk*, uint32_t> chunk_index;
   std::map<std::tuple<uint64_t, uint32_t, uint32_t>, uint32_t> occurrences;
   bool overflow = false;
-  const gfx::Rect cull(0, -bounds.height(), bounds.width(),
-                       3 * bounds.height());
-  auto skeleton_record = blink::PaintChunksToCcLayer::Convert(
-      blink::PaintChunkSubset(frame->View()->GetPaintArtifact()),
-      blink::PropertyTreeState::Root(), &cull,
+  const auto cull = CommandPaintCull(bounds);
+  auto skeleton_record = ConvertCommandPaint(
+      frame, cull,
       [&](const blink::PaintChunk& chunk, cc::PaintRecord items) {
         if (chunks.size() >= kMaxChunkRefs) {
           overflow = true;
@@ -2549,7 +2566,7 @@ CefDrawingCommands CaptureIncrementalPicture(
     }
   }
   state.collect_paint_ids = false;
-  state.media_ids = frame_ids;
+  state.media_ids.clear();
   for (const auto& [id, picture] : frame_pictures)
     state.media_ids.insert(id);
   for (const auto& [id, data] : media_states)
@@ -2659,14 +2676,12 @@ CefDrawingCommands CaptureIncrementalPicture(
                                       skeleton_callbacks, procs);
   CaptureTimer::Get().Mark("scroll");
   // Chunk pictures compose child frames and media markers like the full
-  // picture. Child frames outside the capture viewport have no picture; they
-  // are omitted, and their chunk changes once they become visible.
+  // picture, including complete child/media content in prefetched chunks.
   cc::PlaybackCallbacks chunk_callbacks;
   chunk_callbacks.custom_callback = base::BindRepeating(
       [](const std::map<uint32_t, sk_sp<SkData>>* states,
          const std::map<uint32_t, sk_sp<SkPicture>>* frames,
-         const std::set<uint32_t>* frame_ids, PaintSerialization* state,
-         SkCanvas* canvas, uint32_t id) {
+         PaintSerialization* state, SkCanvas* canvas, uint32_t id) {
         ++state->markers;
         const auto child = frames->find(id);
         if (child != frames->end()) {
@@ -2676,8 +2691,6 @@ CefDrawingCommands CaptureIncrementalPicture(
           child->second->playback(canvas);
           return;
         }
-        if (frame_ids->contains(id))
-          return;
         if (!states->contains(id)) {
           state->error = "Unknown media paint identity";
           return;
@@ -2687,7 +2700,7 @@ CefDrawingCommands CaptureIncrementalPicture(
         canvas->drawAnnotation(SkRect::MakeWH(1, 1), "Reach.Video.v1",
                                data.get());
       }, base::Unretained(&media_states), base::Unretained(&frame_pictures),
-      base::Unretained(&frame_ids), base::Unretained(&state));
+      base::Unretained(&state));
   SkSerialProcs chunk_procs;
   chunk_procs.fImageProc = &SerializeOriginalImage;
   chunk_procs.fImageCtx = &state;
@@ -2921,7 +2934,6 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   OriginalTypefaceCache frame_fonts;
   frame_fonts.originals = &resources;
   std::map<uint32_t, sk_sp<SkPicture>> frame_pictures;
-  std::set<uint32_t> frame_ids;
   for (blink::Frame* tree_frame = frame.Get(); tree_frame;
        tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
     if (!IsInlinePaintFrame(frame.Get(), tree_frame)) {
@@ -2935,8 +2947,6 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       auto* node = object->GetNode();
       if (object->IsLayoutEmbeddedContent()) {
         auto* owner = blink::DynamicTo<blink::HTMLFrameOwnerElement>(node);
-        if (owner)
-          frame_ids.insert(owner->GetDomNodeId());
         if (!owner || !dependencies.media_ids.contains(owner->GetDomNodeId()))
           continue;
         auto* child = owner ? owner->ContentFrame() : nullptr;
@@ -3072,9 +3082,9 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   }
   CaptureTimer::Get().Mark("collect");
   if (known) {
-    return CaptureIncrementalPicture(frame.Get(), bounds, frame_ids,
-                                     frame_pictures, media_states, *known,
-                                     sink, known_originals);
+    return CaptureIncrementalPicture(frame.Get(), bounds, frame_pictures,
+                                     media_states, *known, sink,
+                                     known_originals);
   }
   PaintSerialization state;
   state.sink = sink;
