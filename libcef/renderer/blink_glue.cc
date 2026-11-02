@@ -237,6 +237,9 @@ namespace {
 constexpr size_t kMaxPictureBytes = 8 * 1024 * 1024;
 constexpr size_t kMaxPaintBytes = 32 * 1024 * 1024;
 constexpr size_t kMaxFilterDepth = 32;
+// Shared filter nodes are revisited per reference; bound total traversal work
+// so a small graph cannot fan out exponentially. Not a capability cap.
+constexpr size_t kMaxFilterVisits = 1 << 16;
 constexpr size_t kMaxRecordDepth = 32;
 constexpr uint64_t kMaxViewportPixels = 4 * 1024 * 1024;
 constexpr uint64_t kMaxDecodedImagePixels = 16 * 1024 * 1024;
@@ -291,6 +294,7 @@ struct PaintSerialization {
   size_t resources = 0;
   size_t bytes = 0;
   uint64_t image_pixels = 0;
+  size_t filter_visits = 0;
   size_t record_bytes = 0;
   std::set<uint32_t> media_ids;
   std::set<uint32_t> culled_paint_ids;
@@ -806,6 +810,10 @@ bool CheckPaintFilter(PaintSerialization* state,
     state->error = "Image-filter graph depth exceeded";
     return false;
   }
+  if (++state->filter_visits > kMaxFilterVisits) {
+    state->error = "Image-filter graph traversal limit exceeded";
+    return false;
+  }
   const auto sigma_ok = [](float sigma) {
     return std::isfinite(sigma) && sigma >= 0;
   };
@@ -871,6 +879,12 @@ bool CheckPaintFilter(PaintSerialization* state,
       break;
     case cc::PaintFilter::Type::kMerge: {
       const auto* merge = static_cast<const cc::MergePaintFilter*>(filter);
+      // Charge null inputs too; they do not recurse into a visit.
+      if (merge->input_count() > kMaxFilterVisits - state->filter_visits) {
+        state->error = "Image-filter graph traversal limit exceeded";
+        return false;
+      }
+      state->filter_visits += merge->input_count();
       for (size_t i = 0; i < merge->input_count(); ++i) {
         if (!CheckPaintFilter(state, merge->input_at(i), depth + 1,
                               record_depth)) {
