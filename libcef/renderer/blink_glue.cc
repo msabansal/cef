@@ -69,6 +69,7 @@
 #include "third_party/blink/renderer/core/paint/object_paint_properties.h"
 #include "third_party/blink/renderer/platform/graphics/paint/geometry_mapper.h"
 #include "third_party/blink/renderer/core/frame/settings.h"
+#include "third_party/blink/renderer/core/frame/web_frame_widget_impl.h"
 #include "third_party/blink/renderer/core/frame/web_local_frame_impl.h"
 #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
 #include "third_party/blink/renderer/core/html/html_frame_owner_element.h"
@@ -3265,6 +3266,27 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   return result;
 }
 
+// A successful local-root capture completes a command-only visual update.
+// Failed captures and isolated same-process child pictures complete nothing.
+void CompleteDrawingCapture(blink::WebLocalFrame* web_frame,
+                            const std::string& expected_document,
+                            const CefDrawingCommands& result) {
+  if (!blink::Canvas2DBitmapProvider::IsReachCommandMode() ||
+      !result.error.empty() || result.picture.empty()) {
+    return;
+  }
+  auto* local = blink::To<blink::WebLocalFrameImpl>(web_frame);
+  auto* frame = local->GetFrame();
+  if (!frame || !frame->IsAttached() || !frame->GetDocument() ||
+      frame->GetDocument()->Token().ToString() != expected_document ||
+      frame != &frame->LocalFrameRoot()) {
+    return;
+  }
+  if (auto* widget = local->FrameWidgetImpl()) {
+    widget->DidCompleteReachCommandCapture();
+  }
+}
+
 }  // namespace
 
 CefDrawingCommands CaptureDrawingCommands(
@@ -3272,8 +3294,10 @@ CefDrawingCommands CaptureDrawingCommands(
     const std::map<std::string, std::vector<uint8_t>>& children,
     const std::map<std::string, std::vector<uint8_t>>& resources,
     const std::function<void(const std::string&, const void*, size_t)>& sink) {
-  return CaptureDrawingCommandsImpl(web_frame, expected_document, children,
-                                    resources, sink, nullptr);
+  auto result = CaptureDrawingCommandsImpl(
+      web_frame, expected_document, children, resources, sink, nullptr);
+  CompleteDrawingCapture(web_frame, expected_document, result);
+  return result;
 }
 
 CefDrawingCommands CaptureIncrementalDrawingCommands(
@@ -3288,8 +3312,11 @@ CefDrawingCommands CaptureIncrementalDrawingCommands(
     result.error = "Incremental capture requires the root frame";
     return result;
   }
-  return CaptureDrawingCommandsImpl(web_frame, expected_document, children,
-                                    resources, sink, &known, known_originals);
+  auto result = CaptureDrawingCommandsImpl(
+      web_frame, expected_document, children, resources, sink, &known,
+      known_originals);
+  CompleteDrawingCapture(web_frame, expected_document, result);
+  return result;
 }
 
 CefDrawingCommands CaptureRasterFallback(
