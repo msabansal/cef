@@ -116,6 +116,7 @@
 #include "third_party/skia/include/core/SkSerialProcs.h"
 #include "third_party/skia/include/core/SkStream.h"
 #include "third_party/skia/include/core/SkSurface.h"
+#include "third_party/skia/include/core/SkTextBlob.h"
 #include "third_party/skia/include/core/SkTypeface.h"
 #include "third_party/skia/include/encode/SkPngRustEncoder.h"
 #include "third_party/skia/include/utils/SkNoDrawCanvas.h"
@@ -271,6 +272,11 @@ struct PaintSerialization {
   std::string filter_requires_raster;
   bool uninspectable_filter = false;
   bool raster = false;
+  bool budget_only = false;
+  bool uninspectable_originals = false;
+  std::set<uint32_t> budget_images;
+  std::set<uint32_t> budget_typefaces;
+  size_t budget_text_runs = 0;
   std::function<void(const std::string&, const void*, size_t)> sink;
   // Originals the consumer already holds (streaming root captures only): they
   // are announced by identity, without bytes.
@@ -326,6 +332,7 @@ struct PaintSerialization {
       return false;
     }
     original_ids.insert(key);
+    if (budget_only) return true;
     if (sink && known_originals && known_originals->contains(key)) {
       sink(key, nullptr, 0);
       return true;
@@ -419,6 +426,10 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
   if (state->error.empty()) {
     auto encoded = image->refEncodedData();
     if (encoded && encoded->size()) {
+      if (encoded->size() > kMaxResourceBytes) {
+        state->error = "Original resource budget exceeded or resource unavailable";
+        return SkData::MakeEmpty();
+      }
       const auto* known = ImageDigests().Find(image->uniqueID());
       OriginalDigest digest;
       if (known && known->size == encoded->size()) {
@@ -431,6 +442,7 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
                         [&] { return sk_sp<const SkData>(encoded); })) {
         state->image_pixels += pixels;
         if (state->exports) state->exports->back().pixels = pixels;
+        if (state->budget_only) return SkData::MakeEmpty();
         return sk_reach::Write(sk_reach::kImage, digest.hash, digest.size);
       }
     }
@@ -499,6 +511,7 @@ SkSerialReturnType SerializeOriginalTypeface(SkTypeface* face, void* context) {
         }
         BoundedPaintStream stream(sk_reach::kDescriptorBytes);
         if (descriptor.serialize(&stream) && !stream.failed()) {
+          if (state->budget_only) return SkData::MakeEmpty();
           const auto bytes = stream.TakeBytes();
           auto meta = SkData::MakeWithCopy(bytes.data(), bytes.size());
           return sk_reach::Write(sk_reach::kFont, hash, digest.size, meta.get());
@@ -623,6 +636,36 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
     state->error = "Animated image frame count exceeds client decode budget";
     return false;
   }
+  if (state->budget_only) {
+    const uint64_t pixels = uint64_t(std::max(0, image.width())) *
+                            std::max(0, image.height());
+    if (!pixels || image.width() > 4096 || image.height() > 4096) {
+      state->error = "Decoded image pixel budget exceeded";
+      return false;
+    }
+    if (image.IsTextureBacked() || image.IsDeferredPaintRecord() ||
+        image.animation_type() == cc::PaintImage::AnimationType::kVideo) {
+      // These remain rejected; do not invoke GetSwSkImage's GPU readback path.
+      state->uninspectable_originals = true;
+      if (pixels > kMaxDecodedImagePixels - state->image_pixels) {
+        state->error = "Decoded image pixel budget exceeded";
+        return false;
+      }
+      state->image_pixels += pixels;
+      return true;
+    }
+    // For a verified non-texture image this returns the cached SkImage, without
+    // decoding pixels or executing the image/filter/paint-record effects.
+    const auto original = image.GetSwSkImage();
+    if (!original) {
+      state->error = "Original image resource unavailable";
+      return false;
+    }
+    if (state->budget_images.insert(original->uniqueID()).second) {
+      SerializeOriginalImage(original.get(), state);
+    }
+    return state->error.empty();
+  }
   return true;
 }
 
@@ -637,7 +680,7 @@ bool CheckPaintShader(PaintSerialization* state,
     state->error = "Invalid paint shader";
     return false;
   }
-  if (state->raster) {
+  if (state->raster || state->budget_only) {
     switch (shader.shader_type()) {
       case cc::PaintShader::Type::kEmpty:
       case cc::PaintShader::Type::kColor:
@@ -649,8 +692,12 @@ bool CheckPaintShader(PaintSerialization* state,
       case cc::PaintShader::Type::kPaintRecord:
         break;
       default:
-        DeferUnsupportedPaint(
-            state, "Raster fallback runtime shader is not resource-safe");
+        if (state->budget_only) {
+          state->uninspectable_originals = true;
+        } else {
+          DeferUnsupportedPaint(
+              state, "Raster fallback runtime shader is not resource-safe");
+        }
         break;
     }
   }
@@ -868,6 +915,26 @@ const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
   if (operation.GetType() == cc::PaintOpType::kDrawSkottie ||
       operation.GetType() == cc::PaintOpType::kDrawSlug) {
     DeferUnsupportedPaint(state, "Skottie or GPU text requires command support");
+    if (state->budget_only) state->uninspectable_originals = true;
+  }
+  if (state->budget_only &&
+      operation.GetType() == cc::PaintOpType::kDrawTextBlob) {
+    const auto& blob = static_cast<const cc::DrawTextBlobOp&>(operation).blob;
+    if (blob) {
+      SkTextBlob::Iter iterator(*blob);
+      SkTextBlob::Iter::Run run;
+      while (iterator.next(&run)) {
+        if (++state->budget_text_runs > kMaxPaintOps) {
+          state->error = "Original text run budget exceeded";
+          return nullptr;
+        }
+        if (run.fTypeface &&
+            state->budget_typefaces.insert(run.fTypeface->uniqueID()).second) {
+          SerializeOriginalTypeface(run.fTypeface, state);
+          if (!state->error.empty()) return nullptr;
+        }
+      }
+    }
   }
   if ((operation.GetType() == cc::PaintOpType::kDrawImage &&
        !CheckPaintImage(
@@ -925,6 +992,29 @@ bool CheckPaintRecord(PaintSerialization* state,
     }
   }
   if (depth == 0) {
+    if (state->budget_only) {
+      if (state->uninspectable_originals) {
+        state->error =
+            "Original resource budget cannot inspect unsupported payload";
+        return false;
+      }
+      return true;
+    }
+    if (!state->raster &&
+        (state->uninspectable_filter || !state->unsupported_error.empty() ||
+         !state->filter_requires_raster.empty())) {
+      // Capability errors cannot hide budgets normally enforced during
+      // serialization. Inspect originals without recording/rendering rejected
+      // effects, emitting resources, or counting them in the export state.
+      PaintSerialization budget;
+      budget.budget_only = true;
+      budget.collect_paint_ids = state->collect_paint_ids;
+      budget.media_ids = state->media_ids;
+      if (!CheckPaintRecord(&budget, record, 0)) {
+        state->error = budget.error;
+        return false;
+      }
+    }
     if (state->uninspectable_filter) {
       state->error = "Uninspectable image-filter category";
       return false;
