@@ -130,6 +130,9 @@ class CefFrameHostImpl : public CefFrame, public cef::mojom::BrowserFrame {
   // Must be called on the UI thread.
   bool IsDetached() const;
 
+  // Settle reads on document replacement, and all requests on frame loss.
+  void CancelDrawingRequests(bool include_input, const char* boundary);
+
   enum class DetachReason {
     RENDER_FRAME_DELETED,
     NEW_MAIN_FRAME,
@@ -184,6 +187,9 @@ class CefFrameHostImpl : public CefFrame, public cef::mojom::BrowserFrame {
 
   void OnRenderFrameDisconnect();
 
+  void DeliverProcessMessage(const std::string& name, base::ListValue arguments);
+  void SendDrawingError(int request, const std::string& reason);
+
   void DetachRenderFrame();
 
   std::string GetDebugString() const;
@@ -208,6 +214,16 @@ class CefFrameHostImpl : public CefFrame, public cef::mojom::BrowserFrame {
       queued_renderer_actions_;
 
   mojo::Remote<cef::mojom::RenderFrame> render_frame_;
+
+  struct PendingDrawingRequest {
+    int id;
+    bool applies_input;
+    std::string operation;
+    CefRefPtr<CefBrowserHostBase> browser;
+  };
+  // Reach serializes requests per browser. Never queue private capture IPC
+  // behind an outstanding request on a frame that may have been replaced.
+  std::optional<PendingDrawingRequest> pending_drawing_request_;
 
   IMPLEMENT_REFCOUNTING(CefFrameHostImpl);
 };

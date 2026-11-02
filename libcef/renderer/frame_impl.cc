@@ -4,6 +4,8 @@
 
 #include "cef/libcef/renderer/frame_impl.h"
 
+#include <cstdlib>
+
 #include "build/build_config.h"
 
 // Enable deprecation warnings on Windows. See http://crbug.com/585142.
@@ -307,6 +309,13 @@ void CefFrameImpl::SendProcessMessage(CefProcessId target_process,
   }
 
   if (message->GetArgumentList() != nullptr) {
+    if (std::getenv("REACH_DRAWING_REQUEST_TRACE") &&
+        message->GetName() == "Reach.DrawingCommands.v1") {
+      LOG(WARNING) << "Reach drawing renderer reply: frame="
+                   << GetIdentifier().ToString()
+                   << " request=" << message->GetArgumentList()->GetInt(0)
+                   << " attached=" << (frame_ != nullptr);
+    }
     // Invalidate the message object immediately by taking the argument list.
     auto argument_list =
         static_cast<CefProcessMessageImpl*>(message.get())->TakeArgumentList();
@@ -831,6 +840,18 @@ void CefFrameImpl::FrameAttachedAck(bool allow) {
 
 void CefFrameImpl::SendMessage(const std::string& name,
                                base::ListValue arguments) {
+  if (std::getenv("REACH_DRAWING_REQUEST_TRACE") &&
+      (name == "Reach.DrawingFrame.v1" || name == "Reach.DrawingRoute.v1" ||
+       name == "Reach.DrawingInput.v1" ||
+       name == "Reach.CaptureDrawingCommands.v1")) {
+    LOG(WARNING) << "Reach drawing renderer received: frame="
+                 << GetIdentifier().ToString()
+                 << " request="
+                 << (!arguments.empty() && arguments[0].is_int()
+                         ? arguments[0].GetInt()
+                         : 0)
+                 << " operation=" << name;
+  }
   if (name == "Reach.DrawingRoute.v1" || name == "Reach.DrawingInput.v1") {
     CefRefPtr<CefFrameImpl> retain(this);
     auto response = CefProcessMessage::Create("Reach.DrawingCommands.v1");
@@ -903,7 +924,10 @@ void CefFrameImpl::SendMessage(const std::string& name,
           arguments[1].GetString().size() <= 128 && arguments[2].is_list() &&
           valid_input(arguments[2].GetList());
     }
-    values->SetInt(0, valid ? arguments[0].GetInt() : 0);
+    values->SetInt(0, !arguments.empty() && arguments[0].is_int() &&
+                              arguments[0].GetInt() > 0
+                          ? arguments[0].GetInt()
+                          : 0);
     if (!valid || !frame_) {
       capture.error = "Invalid or detached drawing input request";
     } else if (route) {
@@ -988,7 +1012,10 @@ void CefFrameImpl::SendMessage(const std::string& name,
           (arguments.size() == 7 || arguments[7].is_blob())));
     const int mode = valid && arguments.size() >= 6
         ? arguments[5].GetInt() : 0;
-    values->SetInt(0, valid ? arguments[0].GetInt() : 0);
+    values->SetInt(0, !arguments.empty() && arguments[0].is_int() &&
+                              arguments[0].GetInt() > 0
+                          ? arguments[0].GetInt()
+                          : 0);
     if (!valid || !frame_) {
       capture.error = "Invalid or detached drawing-frame request";
     } else if (incremental && frame_->Parent()) {
@@ -1165,7 +1192,10 @@ void CefFrameImpl::SendMessage(const std::string& name,
                         arguments[5].GetInt() <= 4096;
       }
     }
-    values->SetInt(0, valid_request ? arguments[0].GetInt() : 0);
+    values->SetInt(0, !arguments.empty() && arguments[0].is_int() &&
+                              arguments[0].GetInt() > 0
+                          ? arguments[0].GetInt()
+                          : 0);
     blink_glue::CefDrawingCommands capture;
     if (!valid_request) {
       capture.error = "Invalid drawing-command request";

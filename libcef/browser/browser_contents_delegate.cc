@@ -594,6 +594,7 @@ void CefBrowserContentsDelegate::DidFinishNavigation(
     // Don't call OnLoadStart for same page navigations (fragments,
     // history state).
     if (!navigation_handle->IsSameDocument()) {
+      frame->CancelDrawingRequests(false, "document-commit");
       OnLoadStart(frame.get(), navigation_handle->GetPageTransition());
       if (navigation_handle->IsServedFromBackForwardCache()) {
         // We won't get an OnLoadEnd notification from anywhere else.

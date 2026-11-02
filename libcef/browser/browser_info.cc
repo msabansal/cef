@@ -222,6 +222,12 @@ void CefBrowserInfo::FrameHostStateChanged(
   DVLOG(1) << __func__ << ": "
            << frame_util::GetFrameDebugString(host->GetGlobalFrameToken());
 
+  if (new_state != content::RenderFrameHost::LifecycleState::kActive) {
+    if (auto frame = GetFrameForHost(host)) {
+      frame->CancelDrawingRequests(true, "inactive");
+    }
+  }
+
   if ((old_state == content::RenderFrameHost::LifecycleState::kPrerendering ||
        old_state ==
            content::RenderFrameHost::LifecycleState::kInBackForwardCache) &&

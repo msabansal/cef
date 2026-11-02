@@ -4,6 +4,8 @@
 
 #include "cef/libcef/browser/frame_host_impl.h"
 
+#include <cstdlib>
+
 #include "cef/include/cef_request.h"
 #include "cef/include/cef_stream.h"
 #include "cef/include/cef_v8.h"
@@ -287,27 +289,45 @@ void CefFrameHostImpl::SendProcessMessage(
 
   const std::string name = message->GetName();
   if (name == "Reach.DrawingFrame.v1" || name == "Reach.DrawingRoute.v1" ||
-      name == "Reach.DrawingInput.v1") {
+      name == "Reach.DrawingInput.v1" ||
+      name == "Reach.CaptureDrawingCommands.v1") {
     if (!CEF_CURRENTLY_ON_UIT()) {
       CEF_POST_TASK(CEF_UIT,
           base::BindOnce(&CefFrameHostImpl::SendProcessMessage, this,
                          target_process, message));
       return;
     }
-    if (is_temporary() || !render_frame_host_ || !render_frame_.is_bound()) {
-      auto arguments = message->GetArgumentList();
-      base::ListValue response;
-      response.Append(arguments ? arguments->GetInt(0) : 0);
-      response.Append("Drawing frame unavailable before dispatch");
-      response.Append(0);
-      response.Append(0);
-      SendMessage("Reach.DrawingCommands.v1", std::move(response));
-      return;
-    }
     auto route_input = name == "Reach.DrawingRoute.v1" && message->GetArgumentList() &&
                                message->GetArgumentList()->GetSize() == 5
                            ? message->GetArgumentList()->GetList(4)
                            : nullptr;
+    const auto arguments = message->GetArgumentList();
+    const int request = arguments ? arguments->GetInt(0) : 0;
+    if (pending_drawing_request_) {
+      if (pending_drawing_request_->id == request) {
+        CancelDrawingRequests(true, "duplicate");
+      } else {
+        SendDrawingError(request, "Drawing frame request already pending");
+      }
+      return;
+    }
+    if (is_temporary() || !render_frame_host_ || !render_frame_.is_bound() ||
+        !render_frame_host_->IsRenderFrameLive() ||
+        render_frame_host_->GetLifecycleState() !=
+            content::RenderFrameHost::LifecycleState::kActive) {
+      SendDrawingError(request, "Drawing frame unavailable before dispatch");
+      return;
+    }
+    pending_drawing_request_ = PendingDrawingRequest{
+        request, name == "Reach.DrawingInput.v1" || route_input != nullptr, name,
+        GetBrowserHostBase()};
+    if (std::getenv("REACH_DRAWING_REQUEST_TRACE")) {
+      LOG(WARNING) << "Reach drawing dispatch: frame=" << GetIdentifier().ToString()
+                   << " request=" << request << " operation=" << name
+                   << " metadata="
+                   << (name == "Reach.DrawingFrame.v1" &&
+                       arguments->GetBool(1));
+    }
     if (name == "Reach.DrawingInput.v1" || route_input) {
       auto arguments = message->GetArgumentList();
       // A route request carries the input it applies if the route ends in
@@ -590,6 +610,8 @@ std::pair<bool, bool> CefFrameHostImpl::Detach(DetachReason reason,
   // Must be a main frame if |is_current_main_frame| is true.
   CHECK(!is_current_main_frame || is_main_frame_);
 
+  CancelDrawingRequests(true, "detach");
+
   const bool is_bound = render_frame_.is_bound();
   if (is_bound) {
     if (VLOG_IS_ON(1)) {
@@ -732,6 +754,8 @@ void CefFrameHostImpl::SendToRenderFrame(const std::string& function_name,
 void CefFrameHostImpl::OnRenderFrameDisconnect() {
   CEF_REQUIRE_UIT();
 
+  CancelDrawingRequests(true, "disconnect");
+
   DVLOG(1) << __func__ << ": " << GetDebugString();
 
   if (auto browser_info = GetBrowserInfo()) {
@@ -746,6 +770,81 @@ void CefFrameHostImpl::OnRenderFrameDisconnect() {
 
 void CefFrameHostImpl::SendMessage(const std::string& name,
                                    base::ListValue arguments) {
+  CEF_REQUIRE_UIT();
+  if (name == "Reach.DrawingCommands.v1") {
+    if (arguments.empty() || !arguments[0].is_int() ||
+        !pending_drawing_request_ ||
+        pending_drawing_request_->id != arguments[0].GetInt()) {
+      LOG(WARNING) << "Reach drawing ignored retired response: frame="
+                   << GetIdentifier().ToString();
+      return;
+    }
+    if (std::getenv("REACH_DRAWING_REQUEST_TRACE")) {
+      LOG(WARNING) << "Reach drawing reply: frame=" << GetIdentifier().ToString()
+                   << " request=" << pending_drawing_request_->id
+                   << " operation=" << pending_drawing_request_->operation;
+    }
+    pending_drawing_request_.reset();
+  }
+  DeliverProcessMessage(name, std::move(arguments));
+}
+
+void CefFrameHostImpl::SendDrawingError(int request, const std::string& reason) {
+  base::ListValue response;
+  response.Append(request);
+  response.Append(reason);
+  response.Append(0);
+  response.Append(0);
+  DeliverProcessMessage("Reach.DrawingCommands.v1", std::move(response));
+}
+
+void CefFrameHostImpl::CancelDrawingRequests(bool include_input,
+                                             const char* boundary) {
+  CEF_REQUIRE_UIT();
+  if (!pending_drawing_request_ ||
+      (!include_input && pending_drawing_request_->applies_input)) {
+    return;
+  }
+  auto pending = std::exchange(pending_drawing_request_, std::nullopt);
+  LOG(WARNING) << "Reach drawing terminal: frame=" << GetIdentifier().ToString()
+               << " request=" << pending->id
+               << " operation=" << pending->operation
+               << " boundary=" << boundary
+               << " input_uncertain=" << pending->applies_input;
+  // Detach can run under CefBrowserInfo::NotificationStateLock. Deliver after
+  // that lock is released, retaining the original browser even if this frame
+  // has been invalidated in the meantime.
+  CEF_POST_TASK(
+      CEF_UIT,
+      base::BindOnce(
+          [](CefRefPtr<CefBrowserHostBase> browser,
+             CefRefPtr<CefFrameHostImpl> frame, int request, std::string reason) {
+            if (!browser) {
+              return;
+            }
+            if (auto client = browser->GetClient()) {
+              base::ListValue response;
+              response.Append(request);
+              response.Append(reason);
+              response.Append(0);
+              response.Append(0);
+              CefRefPtr<CefProcessMessageImpl> message(
+                  new CefProcessMessageImpl("Reach.DrawingCommands.v1",
+                                            std::move(response),
+                                            /*read_only=*/true));
+              client->OnProcessMessageReceived(browser, frame, PID_RENDERER,
+                                              message);
+            }
+          },
+          std::move(pending->browser), CefRefPtr<CefFrameHostImpl>(this),
+          pending->id,
+          std::string(pending->applies_input
+                          ? "Drawing input delivery uncertain: frame superseded"
+                          : "Drawing frame superseded")));
+}
+
+void CefFrameHostImpl::DeliverProcessMessage(const std::string& name,
+                                             base::ListValue arguments) {
   if (auto browser = GetBrowserHostBase()) {
     if (auto client = browser->GetClient()) {
       CefRefPtr<CefProcessMessageImpl> message(
