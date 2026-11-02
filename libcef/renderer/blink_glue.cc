@@ -272,6 +272,8 @@ class BoundedPaintStream final : public SkWStream {
   std::vector<uint8_t> bytes_;
 };
 
+using ImageStates = std::map<sk_reach::Hash, std::pair<size_t, bool>>;
+
 struct PaintSerialization {
   std::string error;
   std::string unsupported_error;
@@ -282,6 +284,9 @@ struct PaintSerialization {
   bool uninspectable_originals = false;
   std::set<uint32_t> budget_images;
   std::set<uint32_t> budget_typefaces;
+  ImageStates image_states;
+  ImageStates all_image_states;
+  size_t image_metadata_bytes = 0;
   size_t budget_text_runs = 0;
   std::function<void(const std::string&, const void*, size_t)> sink;
   // Originals the consumer already holds (streaming root captures only): they
@@ -415,6 +420,14 @@ sk_reach::Hash Digest(const SkData& data) {
       static_cast<const char*>(data.data()), data.size()));
 }
 
+OriginalDigest ImageDigest(SkImage* image, const SkData& encoded) {
+  const auto* known = ImageDigests().Find(image->uniqueID());
+  if (known && known->size == encoded.size()) return *known;
+  OriginalDigest digest{Digest(encoded), encoded.size()};
+  ImageDigests().Insert(image->uniqueID(), digest);
+  return digest;
+}
+
 SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
   auto* state = static_cast<PaintSerialization*>(context);
   if (state->error.empty() &&
@@ -436,14 +449,7 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
         state->error = "Original resource budget exceeded or resource unavailable";
         return SkData::MakeEmpty();
       }
-      const auto* known = ImageDigests().Find(image->uniqueID());
-      OriginalDigest digest;
-      if (known && known->size == encoded->size()) {
-        digest = *known;
-      } else {
-        digest = {Digest(*encoded), encoded->size()};
-        ImageDigests().Insert(image->uniqueID(), digest);
-      }
+      const auto digest = ImageDigest(image, *encoded);
       if (state->Export(sk_reach::kImage, digest.hash, digest.size,
                         [&] { return sk_sp<const SkData>(encoded); })) {
         state->image_pixels += pixels;
@@ -642,6 +648,40 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
     state->error = "Animated image frame count exceeds client decode budget";
     return false;
   }
+  if (!state->budget_only && !image.IsTextureBacked() &&
+      !image.IsDeferredPaintRecord() &&
+      image.animation_type() != cc::PaintImage::AnimationType::kVideo) {
+    const auto original = image.GetSwSkImage();
+    const auto encoded = original ? original->refEncodedData() : nullptr;
+    if (encoded && encoded->size() >= 8 &&
+        !std::memcmp(encoded->data(), "\x89PNG\r\n\x1a\n", 8)) {
+      if (encoded->size() > kMaxResourceBytes) {
+        state->error = "Original resource budget exceeded or resource unavailable";
+        return false;
+      }
+      const auto digest = ImageDigest(original.get(), *encoded);
+      const bool loading =
+          image.completion_state() ==
+              cc::PaintImage::CompletionState::kPartiallyDone &&
+          image.animation_type() == cc::PaintImage::AnimationType::kStatic;
+      const auto value = std::make_pair(digest.size, loading);
+      const auto [entry, inserted] =
+          state->all_image_states.emplace(digest.hash, value);
+      if ((!inserted && entry->second != value) ||
+          state->all_image_states.size() > 4096) {
+        state->error = "Conflicting or excessive original image completion metadata";
+        return false;
+      }
+      if (inserted) {
+        if (digest.size > kMaxResourceBytes - state->image_metadata_bytes) {
+          state->error = "Original resource budget exceeded or resource unavailable";
+          return false;
+        }
+        state->image_metadata_bytes += digest.size;
+      }
+      state->image_states.emplace(digest.hash, value);
+    }
+  }
   if (state->budget_only) {
     const uint64_t pixels = uint64_t(std::max(0, image.width())) *
                             std::max(0, image.height());
@@ -673,6 +713,48 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
     return state->error.empty();
   }
   return true;
+}
+
+bool DrawImageStates(SkCanvas* canvas, const ImageStates& states,
+                     std::string* error) {
+  base::ListValue entries;
+  for (const auto& [hash, state] : states) {
+    base::DictValue value;
+    value.Set("hash", sk_reach::Hex(hash));
+    value.Set("length", static_cast<int>(state.first));
+    value.Set("loading", state.second);
+    entries.Append(std::move(value));
+    if (entries.size() == 32 || hash == states.rbegin()->first) {
+      auto json_entries = base::WriteJson(entries);
+      if (!json_entries) {
+        *error = "Original image completion metadata serialization failed";
+        return false;
+      }
+      // Like damage metadata, keep the discriminator first on the shared channel.
+      const auto json =
+          "{\"originalImages\":1,\"entries\":" + *json_entries + "}";
+      if (json.size() > 4096) {
+        *error = "Original image completion metadata serialization failed";
+        return false;
+      }
+      const auto data = SkData::MakeWithCopy(json.data(), json.size());
+      canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.MediaState.v1",
+                             data.get());
+      entries = base::ListValue();
+    }
+  }
+  return true;
+}
+
+sk_sp<SkPicture> WithImageStates(sk_sp<SkPicture> picture,
+                                const ImageStates& states,
+                                std::string* error) {
+  if (!picture || states.empty()) return picture;
+  SkPictureRecorder recorder;
+  auto* canvas = recorder.beginRecording(picture->cullRect());
+  if (!DrawImageStates(canvas, states, error)) return nullptr;
+  picture->playback(canvas);
+  return recorder.finishRecordingAsPicture();
 }
 
 bool CheckPaintRecord(PaintSerialization* state,
@@ -1822,6 +1904,7 @@ class ChunkSerializationCache {
     ChunkHash hash;
     std::vector<uint8_t> bytes;
     std::vector<PaintSerialization::Exported> exports;
+    ImageStates image_states;
     uint64_t used = 0;
   };
 
@@ -1852,10 +1935,11 @@ class ChunkSerializationCache {
 
   const Entry* Find(const ChunkKey& key,
                     const std::vector<cc::PaintRecord>& items,
-                    const SkRect& bounds) {
+                    const SkRect& bounds, const ImageStates& image_states) {
     auto found = entries_.find(key);
     if (found == entries_.end() || found->second.bounds != bounds ||
-        found->second.items.size() != items.size()) {
+        found->second.items.size() != items.size() ||
+        found->second.image_states != image_states) {
       return nullptr;
     }
     for (size_t i = 0; i < items.size(); ++i) {
@@ -2570,6 +2654,7 @@ CefDrawingCommands CaptureIncrementalPicture(
     result.error = state.error;
     return result;
   }
+  const auto skeleton_image_states = std::move(state.image_states);
   for (const auto id : state.media_ids) {
     if (id >= chunks.size()) {
       result.error = "Unknown paint chunk marker";
@@ -2582,11 +2667,15 @@ CefDrawingCommands CaptureIncrementalPicture(
     state.media_ids.insert(id);
   for (const auto& [id, data] : media_states)
     state.media_ids.insert(id);
+  std::vector<ImageStates> chunk_image_states;
+  chunk_image_states.reserve(chunks.size());
   for (const auto& chunk : chunks) {
+    state.image_states.clear();
     if (!CheckPaintRecord(&state, chunk.record, 0)) {
       result.error = state.error;
       return result;
     }
+    chunk_image_states.push_back(std::move(state.image_states));
   }
   std::vector<ChunkKey> keys;
   std::vector<sk_sp<SkPicture>> placeholders;
@@ -2649,6 +2738,8 @@ CefDrawingCommands CaptureIncrementalPicture(
     SkPictureRecorder media_recorder;
     const auto viewport = SkRect::MakeWH(bounds.width(), bounds.height());
     auto* media_canvas = media_recorder.beginRecording(viewport);
+    if (!DrawImageStates(media_canvas, skeleton_image_states, &state.error))
+      return std::nullopt;
     for (const auto& [id, data] : media_states) {
       media_canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.MediaState.v1",
                                    data.get());
@@ -2728,7 +2819,8 @@ CefDrawingCommands CaptureIncrementalPicture(
     std::vector<cc::PaintRecord> items;
     const bool cacheable = ChunkSerializationCache::Items(chunk.record, &items);
     const ChunkSerializationCache::Entry* hit =
-        cacheable ? cache.Find(chunk.key, items, chunk.bounds) : nullptr;
+        cacheable ? cache.Find(chunk.key, items, chunk.bounds,
+                               chunk_image_states[index]) : nullptr;
     if (hit && ReplayChunkExports(&state, *hit)) {
       if (!state.error.empty()) {
         result.error = state.error;
@@ -2742,6 +2834,14 @@ CefDrawingCommands CaptureIncrementalPicture(
         BoundedPaintStream stream(kMaxPictureBytes);
         if (auto verified = chunk.record.ToSkPicture(chunk.bounds, nullptr,
                                                      chunk_callbacks)) {
+          verified = WithImageStates(std::move(verified),
+                                      chunk_image_states[index],
+                                      &scratch.error);
+          if (!verified) {
+            state.error = scratch.error;
+            result.error = state.error;
+            return result;
+          }
           verified->serialize(&stream, &scratch_procs);
         }
         if (stream.failed() ||
@@ -2774,6 +2874,8 @@ CefDrawingCommands CaptureIncrementalPicture(
     auto mark = base::TimeTicks::Now();
     auto chunk_picture =
         chunk.record.ToSkPicture(chunk.bounds, nullptr, chunk_callbacks);
+    chunk_picture = WithImageStates(std::move(chunk_picture),
+                                    chunk_image_states[index], &state.error);
     recording += base::TimeTicks::Now() - mark;
     if (!state.error.empty() || !chunk_picture) {
       result.error =
@@ -2812,7 +2914,8 @@ CefDrawingCommands CaptureIncrementalPicture(
     }
     if (cacheable && state.markers == markers) {
       cache.Store(chunk.key, {std::move(items), chunk.bounds, hash,
-                              std::move(bytes), std::move(exports)});
+                              std::move(bytes), std::move(exports),
+                              chunk_image_states[index]});
     }
   }
   cache.EndCapture();
@@ -3153,6 +3256,10 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   SkPictureRecorder media_recorder;
   const auto viewport = SkRect::MakeWH(bounds.width(), bounds.height());
   auto* media_canvas = media_recorder.beginRecording(viewport);
+  if (!DrawImageStates(media_canvas, state.image_states, &state.error)) {
+    result.error = state.error;
+    return result;
+  }
   for (const auto& [id, data] : media_states) {
     media_canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.MediaState.v1",
                                  data.get());
