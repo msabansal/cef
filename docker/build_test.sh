@@ -88,6 +88,9 @@ grep -q -- "--output-dir=$artifacts .*--no-archive" "$log" ||
 official_log=$test_root/official-commands
 fake_mount=1
 mountpoint() { [[ $fake_mount -eq 1 ]]; }
+v8_profile=$src/v8/tools/builtins-pgo/profiles/x64.profile
+mkdir -p "$(dirname "$v8_profile")"
+printf 'profile\n' > "$v8_profile"
 for args in 'build --profile official --config debug' \
             'build --profile official --config both' 'build --profile bogus'; do
     read -r -a words <<< "$args"
@@ -165,7 +168,32 @@ grep -q 'PGO profile is missing' "$test_root/error" ||
     fetch_pgo_profile
     grep -q -- '--target=linux update --gs-url-base=chromium-optimization-profiles/pgo_profiles' \
         "$official_log" || fail "Official sync did not download the PGO profile"
+    grep -q -- "v8/tools/builtins-pgo/download_profiles.py download --depot-tools $work/depot_tools --force --quiet --check-v8-revision" \
+        "$official_log" || fail "Official sync did not download the V8 builtins profile"
 )
+mv "$v8_profile" "$v8_profile.saved"
+: > "$official_log"
+if (python3() { official_python "$@"; }
+    profile=official config=release
+    unset GN_DEFINES
+    compile) 2>"$test_root/error"; then
+    fail "Official build accepted a missing V8 builtins profile"
+fi
+grep -q 'V8 builtins PGO profile is missing' "$test_root/error" ||
+    fail "Missing V8 builtins profile error was unclear"
+! grep -q gclient_hook "$official_log" ||
+    fail "Missing V8 builtins profile still configured the build"
+: > "$official_log"
+(
+    python3() { official_python "$@"; }
+    profile=official config=release
+    GN_DEFINES="$official_gn_defines v8_builtins_profiling_log_file=\"\""
+    compile
+    fetch_pgo_profile
+    ! grep -q builtins-pgo "$official_log" ||
+        fail "V8 builtins profile opt-out still downloaded a profile"
+)
+mv "$v8_profile.saved" "$v8_profile"
 if (profile=official config=release
     GN_DEFINES='use_sysroot=true is_component_build=false'
     python3() { :; }

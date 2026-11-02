@@ -271,6 +271,13 @@ Chromium's `checkout_pgo_profiles` DEPS hook, without changing the shared
 profile is missing. To opt out of PGO explicitly, append `chrome_pgo_phase=0` to
 `OFFICIAL_GN_DEFINES` (or supply your own `pgo_data_path`).
 
+Optimized V8 also compiles its embedded builtins with
+`v8/tools/builtins-pgo/profiles/x64.profile`. The same steps download it with
+`v8/tools/builtins-pgo/download_profiles.py download --force --check-v8-revision`
+(the `checkout_v8_builtins_pgo_profiles` DEPS hook), and `build` fails before
+GN generation if it is missing. Opt out with
+`v8_builtins_profiling_log_file=""` in `OFFICIAL_GN_DEFINES`.
+
 ### Artifacts and symbols
 
 Official artifacts are written to `artifacts/official`:

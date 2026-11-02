@@ -117,6 +117,17 @@ fetch_pgo_profile() {
     (cd "$src" && python3 tools/update_pgo_profiles.py --target=linux update \
         "--gs-url-base=$pgo_gs_url_base") ||
         die "Downloading the Chromium PGO profile failed."
+    v8_builtins_profile_required || return 0
+    # Equivalent to the DEPS hook gated on checkout_v8_builtins_pgo_profiles.
+    (cd "$src" && python3 v8/tools/builtins-pgo/download_profiles.py download \
+        --depot-tools "$work/depot_tools" --force --quiet --check-v8-revision) ||
+        die "Downloading the V8 builtins PGO profile failed."
+}
+
+# Optimized V8 builds compile embedded builtins with
+# v8/tools/builtins-pgo/profiles/<cpu>.profile unless the log file is overridden.
+v8_builtins_profile_required() {
+    [[ -z "$(gn_define_value v8_builtins_profiling_log_file)" ]]
 }
 
 check_pgo_profile() {
@@ -126,6 +137,11 @@ check_pgo_profile() {
         die "The Chromium PGO profile is missing. Run 'all' or 'sync' with" \
             "--profile official to download it, or opt out by setting" \
             "OFFICIAL_GN_DEFINES with chrome_pgo_phase=0."
+    v8_builtins_profile_required || return 0
+    [[ -s "$src/v8/tools/builtins-pgo/profiles/x64.profile" ]] ||
+        die "The V8 builtins PGO profile is missing. Run 'all' or 'sync' with" \
+            "--profile official to download it, or opt out by setting" \
+            "OFFICIAL_GN_DEFINES with v8_builtins_profiling_log_file=\"\"."
 }
 
 copy_source() {
