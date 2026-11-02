@@ -1012,7 +1012,6 @@ void CefFrameImpl::SendMessage(const std::string& name,
         const bool image = key.starts_with("image:") && key.size() == 70;
         const bool font = key.starts_with("font:") && key.size() == 69;
         if ((!image && !font) || !value.is_blob() || value.GetBlob().empty() ||
-            value.GetBlob().size() > (image ? 4u : 32u) * 1024 * 1024 ||
             (bytes += value.GetBlob().size()) > 32 * 1024 * 1024) {
           capture.error = "Invalid original resource or composition byte budget exceeded";
           break;

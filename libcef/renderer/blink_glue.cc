@@ -235,14 +235,9 @@ std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
 namespace {
 
 constexpr size_t kMaxPictureBytes = 8 * 1024 * 1024;
-constexpr size_t kMaxResourceBytes = 4 * 1024 * 1024;
 constexpr size_t kMaxPaintBytes = 32 * 1024 * 1024;
-constexpr size_t kMaxPaintOps = 100000;
-constexpr size_t kMaxLayoutObjects = 100000;
-constexpr size_t kMaxFilterNodes = 1024;
 constexpr size_t kMaxFilterDepth = 32;
 constexpr size_t kMaxRecordDepth = 32;
-constexpr size_t kMaxRecordShaders = 1024;
 constexpr uint64_t kMaxViewportPixels = 4 * 1024 * 1024;
 constexpr uint64_t kMaxDecodedImagePixels = 16 * 1024 * 1024;
 
@@ -287,7 +282,6 @@ struct PaintSerialization {
   ImageStates image_states;
   ImageStates all_image_states;
   size_t image_metadata_bytes = 0;
-  size_t budget_text_runs = 0;
   std::function<void(const std::string&, const void*, size_t)> sink;
   // Originals the consumer already holds (streaming root captures only): they
   // are announced by identity, without bytes.
@@ -297,11 +291,7 @@ struct PaintSerialization {
   size_t resources = 0;
   size_t bytes = 0;
   uint64_t image_pixels = 0;
-  size_t filter_nodes = 0;
-  size_t merge_inputs = 0;
-  size_t paint_ops = 0;
   size_t record_bytes = 0;
-  size_t record_shaders = 0;
   std::set<uint32_t> media_ids;
   std::set<uint32_t> culled_paint_ids;
   bool collect_paint_ids = false;
@@ -366,8 +356,10 @@ struct PaintSerialization {
     if (!error.empty()) {
       return false;
     }
-    if (size == 0 || size > kMaxResourceBytes - bytes) {
-      error = "Original resource budget exceeded or resource unavailable";
+    // Originals are bounded by the aggregate paint budget, not per resource.
+    if (size == 0 || size > kMaxPaintBytes - bytes) {
+      error = "Aggregate original resource budget exceeded or resource "
+              "unavailable";
       return false;
     }
     ++resources;
@@ -445,8 +437,8 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
   if (state->error.empty()) {
     auto encoded = image->refEncodedData();
     if (encoded && encoded->size()) {
-      if (encoded->size() > kMaxResourceBytes) {
-        state->error = "Original resource budget exceeded or resource unavailable";
+      if (encoded->size() > kMaxPaintBytes) {
+        state->error = "Aggregate original resource budget exceeded";
         return SkData::MakeEmpty();
       }
       const auto digest = ImageDigest(image, *encoded);
@@ -644,10 +636,6 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
   }
   // Animation decoding and color conversion belong to the client. Multipart
   // updates retain the current part's original bytes, checked by serialization.
-  if (image.FrameCount() > 256) {
-    state->error = "Animated image frame count exceeds client decode budget";
-    return false;
-  }
   if (!state->budget_only && !image.IsTextureBacked() &&
       !image.IsDeferredPaintRecord() &&
       image.animation_type() != cc::PaintImage::AnimationType::kVideo) {
@@ -655,8 +643,8 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
     const auto encoded = original ? original->refEncodedData() : nullptr;
     if (encoded && encoded->size() >= 8 &&
         !std::memcmp(encoded->data(), "\x89PNG\r\n\x1a\n", 8)) {
-      if (encoded->size() > kMaxResourceBytes) {
-        state->error = "Original resource budget exceeded or resource unavailable";
+      if (encoded->size() > kMaxPaintBytes) {
+        state->error = "Aggregate original resource budget exceeded";
         return false;
       }
       const auto digest = ImageDigest(original.get(), *encoded);
@@ -667,14 +655,13 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
       const auto value = std::make_pair(digest.size, loading);
       const auto [entry, inserted] =
           state->all_image_states.emplace(digest.hash, value);
-      if ((!inserted && entry->second != value) ||
-          state->all_image_states.size() > 4096) {
-        state->error = "Conflicting or excessive original image completion metadata";
+      if (!inserted && entry->second != value) {
+        state->error = "Conflicting original image completion metadata";
         return false;
       }
       if (inserted) {
-        if (digest.size > kMaxResourceBytes - state->image_metadata_bytes) {
-          state->error = "Original resource budget exceeded or resource unavailable";
+        if (digest.size > kMaxPaintBytes - state->image_metadata_bytes) {
+          state->error = "Aggregate original resource budget exceeded";
           return false;
         }
         state->image_metadata_bytes += digest.size;
@@ -793,9 +780,8 @@ bool CheckPaintShader(PaintSerialization* state,
     const auto* record = shader.paint_record();
     const auto tile = shader.tile();
     if (!record || !tile.isFinite() || tile.isEmpty() ||
-        tile.width() > 4096 || tile.height() > 4096 ||
-        ++state->record_shaders > kMaxRecordShaders) {
-      state->error = "Paint-record shader tile or count exceeds budget";
+        tile.width() > 4096 || tile.height() > 4096) {
+      state->error = "Paint-record shader tile is invalid or oversized";
       return false;
     }
     if (!CheckPaintRecord(state, *record, depth + 1)) {
@@ -816,12 +802,12 @@ bool CheckPaintFilter(PaintSerialization* state,
   if (!filter) {
     return true;
   }
-  if (depth >= kMaxFilterDepth || ++state->filter_nodes > kMaxFilterNodes) {
-    state->error = "Image-filter graph budget exceeded";
+  if (depth >= kMaxFilterDepth) {
+    state->error = "Image-filter graph depth exceeded";
     return false;
   }
   const auto sigma_ok = [](float sigma) {
-    return std::isfinite(sigma) && sigma >= 0 && sigma <= 128;
+    return std::isfinite(sigma) && sigma >= 0;
   };
   const auto unsupported = [&]() {
     DeferUnsupportedPaint(
@@ -830,18 +816,15 @@ bool CheckPaintFilter(PaintSerialization* state,
                    (state->raster ? " is not resource-safe"
                                   : " requires command support"));
   };
-  if (const auto* crop = filter->GetCropRect();
-      crop && (!crop->isFinite() || crop->width() > 4096 ||
-               crop->height() > 4096 ||
-               double(crop->width()) * crop->height() > kMaxViewportPixels)) {
-    state->error = "Image-filter crop budget exceeded";
+  if (const auto* crop = filter->GetCropRect(); crop && !crop->isFinite()) {
+    state->error = "Image-filter crop is invalid";
     return false;
   }
   switch (filter->type()) {
     case cc::PaintFilter::Type::kBlur: {
       const auto* blur = static_cast<const cc::BlurPaintFilter*>(filter);
       if (!sigma_ok(blur->sigma_x()) || !sigma_ok(blur->sigma_y())) {
-        state->error = "Image-filter blur budget exceeded";
+        state->error = "Image-filter blur is invalid";
         return false;
       }
       break;
@@ -850,18 +833,16 @@ bool CheckPaintFilter(PaintSerialization* state,
       const auto* shadow =
           static_cast<const cc::DropShadowPaintFilter*>(filter);
       if (!sigma_ok(shadow->sigma_x()) || !sigma_ok(shadow->sigma_y()) ||
-          !std::isfinite(shadow->dx()) || !std::isfinite(shadow->dy()) ||
-          std::abs(shadow->dx()) > 4096 || std::abs(shadow->dy()) > 4096) {
-        state->error = "Image-filter shadow budget exceeded";
+          !std::isfinite(shadow->dx()) || !std::isfinite(shadow->dy())) {
+        state->error = "Image-filter shadow is invalid";
         return false;
       }
       break;
     }
     case cc::PaintFilter::Type::kOffset: {
       const auto* offset = static_cast<const cc::OffsetPaintFilter*>(filter);
-      if (!std::isfinite(offset->dx()) || !std::isfinite(offset->dy()) ||
-          std::abs(offset->dx()) > 4096 || std::abs(offset->dy()) > 4096) {
-        state->error = "Image-filter offset budget exceeded";
+      if (!std::isfinite(offset->dx()) || !std::isfinite(offset->dy())) {
+        state->error = "Image-filter offset is invalid";
         return false;
       }
       break;
@@ -875,7 +856,7 @@ bool CheckPaintFilter(PaintSerialization* state,
                cc::MorphologyPaintFilter::MorphType::kDilate &&
            morphology->morph_type() !=
                cc::MorphologyPaintFilter::MorphType::kErode)) {
-        state->error = "Image-filter morphology budget exceeded";
+        state->error = "Image-filter morphology is invalid";
         return false;
       }
       // Native raster is bounded here. Do not expose an unqualified serialized
@@ -890,13 +871,6 @@ bool CheckPaintFilter(PaintSerialization* state,
       break;
     case cc::PaintFilter::Type::kMerge: {
       const auto* merge = static_cast<const cc::MergePaintFilter*>(filter);
-      // count_inputs() reflects Skia's optimized filter, not the cc graph.
-      // Bound even null inputs, which do not increment the recursive node count.
-      if (merge->input_count() > kMaxFilterNodes - state->merge_inputs) {
-        state->error = "Image-filter graph budget exceeded";
-        return false;
-      }
-      state->merge_inputs += merge->input_count();
       for (size_t i = 0; i < merge->input_count(); ++i) {
         if (!CheckPaintFilter(state, merge->input_at(i), depth + 1,
                               record_depth)) {
@@ -1012,10 +986,6 @@ const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
       SkTextBlob::Iter iterator(*blob);
       SkTextBlob::Iter::Run run;
       while (iterator.next(&run)) {
-        if (++state->budget_text_runs > kMaxPaintOps) {
-          state->error = "Original text run budget exceeded";
-          return nullptr;
-        }
         if (run.fTypeface &&
             state->budget_typefaces.insert(run.fTypeface->uniqueID()).second) {
           SerializeOriginalTypeface(run.fTypeface, state);
@@ -1071,10 +1041,6 @@ bool CheckPaintRecord(PaintSerialization* state,
   }
   state->record_bytes += record.bytes_used();
   for (const auto& operation : record) {
-    if (++state->paint_ops > kMaxPaintOps) {
-      state->error = "Nested paint operation budget exceeded";
-      return false;
-    }
     if (!CheckPaintOperation(state, operation, depth)) {
       return false;
     }
@@ -1189,7 +1155,6 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
     dependencies->error = "Frame changed during lifecycle update";
     return std::nullopt;
   }
-  size_t objects = 0;
   std::set<uint32_t> frame_ids;
   for (blink::Frame* tree_frame = frame; tree_frame;
        tree_frame = tree_frame->Tree().TraverseNext(frame)) {
@@ -1201,10 +1166,6 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
     auto* root = tree_document ? tree_document->GetLayoutView() : nullptr;
     for (blink::LayoutObject* object = root; object;
          object = object->NextInPreOrder(root)) {
-      if (++objects > kMaxLayoutObjects) {
-        dependencies->error = "Layout object budget exceeded";
-        return std::nullopt;
-      }
       if (object->IsLayoutEmbeddedContent()) {
         if (auto* owner = blink::DynamicTo<blink::HTMLFrameOwnerElement>(
                 object->GetNode())) {
@@ -1800,11 +1761,6 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame,
       continue;
     if (DrawingFrameIdentity(child).empty()) {
       result.error = "Paint-required child frame has no embedding identity";
-      return result;
-    }
-    if (children.size() >= (raster ? 255u : 16u)) {
-      result.error =
-          "Paint-required child frame count budget exceeded: selected=16, attempted=17";
       return result;
     }
     children.Append(DrawingFrameIdentity(child));
@@ -3073,10 +3029,10 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
           return result;
         }
         const auto found = children.find(DrawingFrameIdentity(child));
-        if (found == children.end() || frame_pictures.size() >= 16 ||
+        if (found == children.end() ||
             (child_bytes += found->second.size()) > kMaxPaintBytes) {
           result.error =
-              "Missing child frame picture or composition budget exceeded";
+              "Missing child frame picture or composition byte budget exceeded";
           return result;
         }
         SkDeserialProcs procs;
@@ -3095,7 +3051,6 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       }
     }
   }
-  size_t media_count = 0;
   std::map<uint32_t, sk_sp<SkData>> media_states;
   for (blink::Frame* tree_frame = frame.Get(); tree_frame;
        tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
@@ -3115,8 +3070,8 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
         continue;
       // Video state is only replayed where its marker painted. Unpainted
       // videos (e.g. a long feed outside the paint cull rect) are not in this
-      // picture, so they neither need transport support nor count against
-      // the media budget. Audio has no marker and always does.
+      // picture, so they need neither transport support nor media state.
+      // Audio has no marker and always does.
       if (media->IsHTMLVideoElement() &&
           !dependencies.media_ids.contains(media->GetDomNodeId())) {
         continue;
@@ -3152,10 +3107,10 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       if ((blank || (url.IsEmpty() && !journal)) &&
           !media->IsHTMLVideoElement())
         continue;
-      if (++media_count > 16 || !std::isfinite(media->currentTime()) ||
+      if (!std::isfinite(media->currentTime()) ||
           !std::isfinite(media->playbackRate()) ||
           media->playbackRate() < 0.25 || media->playbackRate() > 4) {
-        result.error = "Media count or playback state exceeds budget";
+        result.error = "Media playback state is invalid";
         return result;
       }
       base::DictValue state;
