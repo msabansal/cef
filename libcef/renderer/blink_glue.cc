@@ -51,6 +51,7 @@
 #include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
 #include "third_party/blink/renderer/core/animation/pending_animations.h"
 #include "third_party/blink/renderer/core/dom/document.h"
+#include "third_party/blink/renderer/core/dom/document_lifecycle.h"
 #include "third_party/blink/renderer/core/dom/element.h"
 #include "third_party/blink/renderer/core/dom/flat_tree_traversal.h"
 #include "third_party/blink/renderer/core/dom/node.h"
@@ -76,6 +77,7 @@
 #include "third_party/blink/renderer/core/input/context_menu_allowed_scope.h"
 #include "third_party/blink/renderer/core/input/event_handler.h"
 #include "third_party/blink/renderer/core/layout/hit_test_location.h"
+#include "third_party/blink/renderer/core/layout/hit_test_request.h"
 #include "third_party/blink/renderer/core/layout/hit_test_result.h"
 #include "third_party/blink/renderer/core/layout/layout_box.h"
 #include "third_party/blink/renderer/core/layout/layout_embedded_content.h"
@@ -1396,10 +1398,14 @@ std::string ApplyDrawingMouse(blink::WebLocalFrame* web_frame,
     return frame->IsAttached() && frame->GetDocument() == document.Get() &&
            frame->GetPage() == page.Get() && frame->View();
   };
-  const auto menu_frame_at_point = [&]() -> blink::LocalFrame* {
+  const auto menu_frame_at_point =
+      [&](bool no_lifecycle_update) -> blink::LocalFrame* {
     blink::HitTestLocation location(blink::PhysicalOffset(
         frame->View()->ConvertFromRootFrame(gfx::Point(x, y))));
-    const auto hit = frame->GetEventHandler().HitTestResultAtLocation(location);
+    const auto hit = frame->GetEventHandler().HitTestResultAtLocation(
+        location,
+        blink::HitTestRequest::kReadOnly | blink::HitTestRequest::kActive,
+        nullptr, no_lifecycle_update);
     blink::Frame* target = hit.InnerNodeOrImageMapImage()
         ? hit.InnerNodeOrImageMapImage()->GetDocument().GetFrame()
         : page->GetFocusController().FocusedOrMainFrame();
@@ -1409,7 +1415,16 @@ std::string ApplyDrawingMouse(blink::WebLocalFrame* web_frame,
   blink::Persistent<blink::LocalFrame> menu_frame;
   blink::Persistent<blink::Document> menu_document;
   if (context_menu) {
-    menu_frame = menu_frame_at_point();
+    const auto* root_document = frame->LocalFrameRoot().GetDocument();
+    if (!root_document || !root_document->IsActive() || !document->IsActive() ||
+        root_document->Lifecycle().GetState() <
+            blink::DocumentLifecycle::kPrePaintClean ||
+        document->Lifecycle().GetState() <
+            blink::DocumentLifecycle::kPrePaintClean)
+      return "Context menu layout is not ready";
+    // Layout is already current; capture child authority without another
+    // lifecycle update that could run page callbacks before the capture.
+    menu_frame = menu_frame_at_point(true);
     if (!frame_unchanged())
       return "Frame changed during context menu hit test";
     if (menu_frame)
@@ -1427,12 +1442,12 @@ std::string ApplyDrawingMouse(blink::WebLocalFrame* web_frame,
     };
     if (!menu_frame_unchanged())
       return "Frame changed during context menu mouse dispatch";
-    auto* target = menu_frame_at_point();
-    if (!menu_frame_unchanged() || target != menu_frame.Get())
-      return "Target changed during context menu mouse dispatch";
     page->GetContextMenuController().ClearContextMenu();
     if (!menu_frame_unchanged())
       return "Frame changed during context menu clearing";
+    auto* target = menu_frame_at_point(false);
+    if (!menu_frame_unchanged() || target != menu_frame.Get())
+      return "Target changed before context menu dispatch";
     event.menu_source_type = ui::mojom::blink::MenuSourceType::kMouse;
     event.id = blink::PointerEventFactory::kMouseId;
     blink::ContextMenuAllowedScope scope;
