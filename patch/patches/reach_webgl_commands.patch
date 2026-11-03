@@ -628,10 +628,10 @@ index 0000000..aa43bed
 +}  // namespace blink
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.h third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
 new file mode 100644
-index 0000000..0d3351c
+index 0000000..02360c0
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,198 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +
@@ -789,7 +789,8 @@ index 0000000..0d3351c
 +        else if constexpr (sizeof(Element) == 1)
 +          type = std::is_signed_v<Element> ? "Int8Array" : "Uint8Array";
 +        if (!type.empty())
-+          return Bytes(command, type, base::as_byte_span(value));
++          return Bytes(command, type,
++                       base::as_byte_span(base::allow_nonunique_obj, value));
 +      }
 +      return Sequence(command, value);
 +    } else if constexpr (requires {
