@@ -1,3 +1,51 @@
+diff --git cc/paint/paint_image.h cc/paint/paint_image.h
+index 85ea12c..c0ad1d2 100644
+--- cc/paint/paint_image.h
++++ cc/paint/paint_image.h
+@@ -329,6 +329,10 @@ class CC_PAINT_EXPORT PaintImage {
+   bool IsLazyGenerated() const {
+     return paint_record_ || paint_image_generator_;
+   }
++  const PaintRecord* paint_record() const {
++    return paint_record_ ? &*paint_record_ : nullptr;
++  }
++  const gfx::Rect& paint_record_rect() const { return paint_record_rect_; }
+   bool IsDeferredPaintRecord() const { return !!deferred_paint_record_; }
+   bool IsPaintWorklet() const {
+     return deferred_paint_record_ &&
+diff --git third_party/blink/renderer/platform/graphics/image_pattern.cc third_party/blink/renderer/platform/graphics/image_pattern.cc
+index 6f17b81..4556fb4 100644
+--- third_party/blink/renderer/platform/graphics/image_pattern.cc
++++ third_party/blink/renderer/platform/graphics/image_pattern.cc
+@@ -6,9 +6,11 @@
+ 
+ #include "base/check.h"
+ #include "base/memory/ptr_util.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
+ #include "third_party/blink/renderer/platform/graphics/image.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/paint_shader.h"
+ #include "third_party/skia/include/core/SkImage.h"
++#include "ui/gfx/geometry/skia_conversions.h"
+ 
+ namespace blink {
+ 
+@@ -41,6 +43,16 @@ sk_sp<PaintShader> ImagePattern::CreateShader(
+     return PaintShader::MakeColor(SkColors::kTransparent);
+   }
+ 
++  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++    if (const auto* record = tile_image_.paint_record()) {
++      return PaintShader::MakePaintRecord(
++          *record, gfx::RectToSkRect(tile_image_.paint_record_rect()),
++          IsRepeatX() ? SkTileMode::kRepeat : SkTileMode::kDecal,
++          IsRepeatY() ? SkTileMode::kRepeat : SkTileMode::kDecal,
++          &local_matrix);
++    }
++  }
++
+   return PaintShader::MakeImage(
+       tile_image_, IsRepeatX() ? SkTileMode::kRepeat : SkTileMode::kDecal,
+       IsRepeatY() ? SkTileMode::kRepeat : SkTileMode::kDecal, &local_matrix);
 diff --git third_party/blink/renderer/core/html/canvas/html_canvas_element.cc third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 index 2a5404e..2e99b4a 100644
 --- third_party/blink/renderer/core/html/canvas/html_canvas_element.cc

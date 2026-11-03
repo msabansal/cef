@@ -465,10 +465,11 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
       }
     }
     if (state->error.empty()) {
-      static unsigned diagnostics = 0;
+      static std::set<uint32_t> diagnostics;
       const char* timing = getenv("REACH_DRAWING_TIMING");
-      if (diagnostics < 16 && timing && std::string_view(timing) == "1") {
-        ++diagnostics;
+      if (diagnostics.size() < 16 && timing &&
+          std::string_view(timing) == "1" &&
+          diagnostics.insert(image->uniqueID()).second) {
         fprintf(stderr,
                 "ReachUnencodedImage width=%d height=%d image=%u lazy=%d "
                 "color=%d alpha=%d budget_only=%d\n",
@@ -666,6 +667,22 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
       image.animation_type() != cc::PaintImage::AnimationType::kVideo) {
     const auto original = image.GetSwSkImage();
     const auto encoded = original ? original->refEncodedData() : nullptr;
+    if (original && (!encoded || !encoded->size())) {
+      static std::set<uint32_t> diagnostics;
+      const char* timing = getenv("REACH_DRAWING_TIMING");
+      if (diagnostics.size() < 16 && timing &&
+          std::string_view(timing) == "1" &&
+          diagnostics.insert(original->uniqueID()).second) {
+        fprintf(stderr,
+                "ReachUnencodedPaintImage image=%u stable=%lld width=%d "
+                "height=%d lazy=%d record=%d header=%d animation=%d\n",
+                original->uniqueID(), static_cast<long long>(image.stable_id()),
+                image.width(), image.height(), image.IsLazyGenerated(),
+                image.paint_record() != nullptr,
+                image.GetImageHeaderMetadata() != nullptr,
+                static_cast<int>(image.animation_type()));
+      }
+    }
     if (encoded && encoded->size() > 0) {
       if (encoded->size() > kMaxPaintBytes) {
         state->error = "Aggregate original resource budget exceeded";
