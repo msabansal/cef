@@ -1,3 +1,58 @@
+diff --git cc/paint/paint_image_builder.cc cc/paint/paint_image_builder.cc
+index 44d2dcb..25bb8b8 100644
+--- cc/paint/paint_image_builder.cc
++++ cc/paint/paint_image_builder.cc
+@@ -4,6 +4,15 @@
+ 
+ #include "cc/paint/paint_image_builder.h"
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <set>
++#include <string_view>
++
++#include "base/debug/stack_trace.h"
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
++
+ namespace cc {
+ 
+ // static
+@@ -118,6 +127,34 @@ PaintImage PaintImageBuilder::TakePaintImage() {
+   // copy.
+   if (!paint_image_.cached_sk_image_)
+     paint_image_.CreateSkImage();
++
++  const char* timing = std::getenv("REACH_DRAWING_TIMING");
++  if (timing && std::string_view(timing) == "1" && paint_image_.sk_image_ &&
++      paint_image_.cached_sk_image_ &&
++      !paint_image_.cached_sk_image_->isTextureBacked()) {
++    const auto& original = paint_image_.cached_sk_image_;
++    const auto encoded = original->refEncodedData();
++    if (!encoded || !encoded->size()) {
++      static base::NoDestructor<base::Lock> lock;
++      static base::NoDestructor<std::set<uint32_t>> diagnostics;
++      bool trace = false;
++      {
++        base::AutoLock guard(*lock);
++        if (diagnostics->size() < 64) {
++          trace = diagnostics->insert(original->uniqueID()).second;
++        }
++      }
++      if (trace) {
++        fprintf(stderr,
++                "ReachUnencodedImageProducer image=%u stable=%lld width=%d "
++                "height=%d\n%s",
++                original->uniqueID(),
++                static_cast<long long>(paint_image_.stable_id()),
++                original->width(), original->height(),
++                base::debug::StackTrace(12).ToString().c_str());
++      }
++    }
++  }
+   return std::move(paint_image_);
+ }
+ 
 diff --git cc/paint/paint_image.h cc/paint/paint_image.h
 index 85ea12c..c0ad1d2 100644
 --- cc/paint/paint_image.h
