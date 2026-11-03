@@ -646,17 +646,14 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
       image.animation_type() != cc::PaintImage::AnimationType::kVideo) {
     const auto original = image.GetSwSkImage();
     const auto encoded = original ? original->refEncodedData() : nullptr;
-    if (encoded && encoded->size() >= 8 &&
-        !std::memcmp(encoded->data(), "\x89PNG\r\n\x1a\n", 8)) {
+    if (encoded && encoded->size() > 0) {
       if (encoded->size() > kMaxPaintBytes) {
         state->error = "Aggregate original resource budget exceeded";
         return false;
       }
       const auto digest = ImageDigest(original.get(), *encoded);
-      const bool loading =
-          image.completion_state() ==
-              cc::PaintImage::CompletionState::kPartiallyDone &&
-          image.animation_type() == cc::PaintImage::AnimationType::kStatic;
+      const bool loading = image.completion_state() ==
+                           cc::PaintImage::CompletionState::kPartiallyDone;
       const auto value = std::make_pair(digest.size, loading);
       const auto [entry, inserted] =
           state->all_image_states.emplace(digest.hash, value);
