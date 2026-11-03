@@ -245,10 +245,10 @@ index 0000000..3638b2e
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 new file mode 100644
-index 0000000..aa43bed
+index 0000000..db2b016
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,377 @@
+@@ -0,0 +1,378 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -283,8 +283,8 @@ index 0000000..aa43bed
 +}
 +
 +std::atomic_size_t& RetainedBytes() {
-+  static base::NoDestructor<std::atomic_size_t> bytes(0);
-+  return *bytes;
++  static std::atomic_size_t bytes{0};
++  return bytes;
 +}
 +
 +uint64_t NextId() {
@@ -497,12 +497,13 @@ index 0000000..aa43bed
 +    return;
 +  }
 +  base::DictValue attributes;
-+  std::vector<char> name(std::max(1, max_length));
++  const GLsizei name_capacity = std::max(1, max_length);
++  std::vector<char> name(name_capacity);
 +  for (GLint index = 0; index < count; ++index) {
 +    GLsizei length = 0;
 +    GLint size = 0;
 +    GLenum type = 0;
-+    gl->GetActiveAttrib(program->Object(), index, name.size(), &length, &size,
++    gl->GetActiveAttrib(program->Object(), index, name_capacity, &length, &size,
 +                        &type, name.data());
 +    if (length <= 0 || static_cast<size_t>(length) >= name.size()) {
 +      command.error = "WebGL program attribute name is invalid";
