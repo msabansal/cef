@@ -324,15 +324,27 @@ struct PaintSerialization {
   };
   std::vector<Exported>* exports = nullptr;
 
-  bool Export(uint8_t kind, const sk_reach::Hash& hash, size_t size,
-              const std::function<sk_sp<const SkData>()>& load) {
-    if (!size) return false;
-    if (exports) exports->push_back({kind, hash, size, 0});
-    const std::string key = (kind == sk_reach::kImage ? "image:" : "font:") +
-                            sk_reach::Hex(hash);
-    if (original_ids.contains(key)) return true;
+  bool Export(uint8_t kind,
+              const sk_reach::Hash& hash,
+              size_t size,
+              const std::function<sk_sp<const SkData>()>& load,
+              uint64_t pixels = 0) {
+    if (!size)
+      return false;
+    if (exports)
+      exports->push_back({kind, hash, size, pixels});
+    const std::string key =
+        (kind == sk_reach::kImage ? "image:" : "font:") + sk_reach::Hex(hash);
+    if (original_ids.contains(key))
+      return true;
     if (kind == sk_reach::kImage) {
-      if (!AddResource(size)) return false;
+      if (pixels > kMaxDecodedImagePixels - image_pixels) {
+        error = "Decoded image pixel budget exceeded";
+        return false;
+      }
+      if (!AddResource(size))
+        return false;
+      image_pixels += pixels;
     } else {
       if (size > sk_reach::kFontBytes - font_bytes) {
         error = "Original font resource byte budget exceeded";
@@ -444,10 +456,6 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
   }
   const uint64_t pixels =
       static_cast<uint64_t>(image->width()) * image->height();
-  if (state->error.empty() &&
-      pixels > kMaxDecodedImagePixels - state->image_pixels) {
-    state->error = "Decoded image pixel budget exceeded";
-  }
   if (state->error.empty()) {
     auto encoded = image->refEncodedData();
     if (encoded && encoded->size()) {
@@ -456,11 +464,11 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
         return SkData::MakeEmpty();
       }
       const auto digest = ImageDigest(image, *encoded);
-      if (state->Export(sk_reach::kImage, digest.hash, digest.size,
-                        [&] { return sk_sp<const SkData>(encoded); })) {
-        state->image_pixels += pixels;
-        if (state->exports) state->exports->back().pixels = pixels;
-        if (state->budget_only) return SkData::MakeEmpty();
+      if (state->Export(
+              sk_reach::kImage, digest.hash, digest.size,
+              [&] { return sk_sp<const SkData>(encoded); }, pixels)) {
+        if (state->budget_only)
+          return SkData::MakeEmpty();
         return sk_reach::Write(sk_reach::kImage, digest.hash, digest.size);
       }
     }
@@ -2045,18 +2053,13 @@ bool ReplayChunkExports(PaintSerialization* state,
     }
   }
   for (const auto& exported : entry.exports) {
-    if (exported.kind == sk_reach::kImage &&
-        exported.pixels > kMaxDecodedImagePixels - state->image_pixels) {
-      state->error = "Decoded image pixel budget exceeded";
-      return true;
-    }
-    if (!state->Export(exported.kind, exported.hash, exported.size,
-                       [] { return sk_sp<const SkData>(); })) {
+    if (!state->Export(
+            exported.kind, exported.hash, exported.size,
+            [] { return sk_sp<const SkData>(); }, exported.pixels)) {
       if (state->error.empty())
         state->error = "Cached chunk original export failed";
       return true;
     }
-    state->image_pixels += exported.pixels;
   }
   return true;
 }
@@ -2775,10 +2778,8 @@ CefDrawingCommands CaptureIncrementalPicture(
   procs.fTypefaceCtx = &state;
   procs.fPictureProc = &SerializeChunkReference;
   procs.fPictureCtx = &skeleton;
-  const uint64_t skeleton_image_pixels = state.image_pixels;
   const auto serialize_skeleton =
       [&](bool with_damage) -> std::optional<std::vector<uint8_t>> {
-    state.image_pixels = skeleton_image_pixels;
     skeleton.referenced.clear();
     skeleton.seen.clear();
     SkPictureRecorder media_recorder;
