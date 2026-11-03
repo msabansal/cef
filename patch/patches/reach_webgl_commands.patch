@@ -215,10 +215,10 @@ index d611207..e7b0902 100644
      "ext_blend_min_max.cc",
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_call.h third_party/blink/renderer/modules/webgl/reach_webgl_call.h
 new file mode 100644
-index 0000000..3638b2e
+index 0000000..756ada6
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_call.h
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,104 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 +
@@ -269,6 +269,8 @@ index 0000000..3638b2e
 +    command.value.Set("op", name);
 +    base::ListValue encoded;
 +    (journal->Argument(command, encoded, args), ...);
++    if (!command.error.empty())
++      command.error = std::string(name) + ": " + command.error;
 +    command.value.Set("args", std::move(encoded));
 +    if constexpr (std::is_base_of_v<WebGLExtension, Receiver>)
 +      journal->Target(command, receiver);
@@ -707,7 +709,7 @@ index 0000000..db2b016
 +}  // namespace blink
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.h third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
 new file mode 100644
-index 0000000..2949d5f
+index 0000000..9231e9e
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
 @@ -0,0 +1,202 @@
@@ -818,8 +820,8 @@ index 0000000..2949d5f
 +        return base::Value();
 +      }
 +      return base::Value(number);
-+    } else if constexpr (std::is_same_v<V, String>) {
-+      std::string text = value.Utf8();
++    } else if constexpr (std::is_convertible_v<const V&, String>) {
++      std::string text = static_cast<String>(value).Utf8();
 +      command.input_bytes += text.size();
 +      if (text.size() > 1024 * 1024 || command.input_bytes > 4 * 1024 * 1024) {
 +        command.error = "WebGL string budget exceeded";
