@@ -95,6 +95,8 @@
 #include "third_party/blink/renderer/core/script/classic_script.h"
 #include "third_party/blink/renderer/core/scroll/scrollable_area.h"
 #include "third_party/blink/renderer/modules/encryptedmedia/html_media_element_encrypted_media.h"
+#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
+#include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
 #include "third_party/blink/renderer/platform/bindings/script_forbidden_scope.h"
 #include "third_party/blink/renderer/platform/bindings/v8_binding.h"
 #include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
@@ -221,6 +223,14 @@ std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
   if (!base::StringToUint64(journal_id, &id) ||
       !base::StringToUint64(cursor_text, &cursor) || max_bytes <= 0) {
     return "Invalid media journal request";
+  }
+  if (id & (uint64_t{1} << 63)) {
+    auto* journal = blink::ReachWebGLJournal::Find(id);
+    auto* element = journal ? journal->element() : nullptr;
+    auto* owner = element ? element->GetDocument().GetFrame() : nullptr;
+    if (!owner || !owner->IsAttached() || &owner->LocalFrameRoot() != frame)
+      return "WebGL journal unavailable";
+    return journal->Read(cursor, static_cast<size_t>(max_bytes), out);
   }
   auto* journal = blink::ReachMediaJournal::Find(id);
   auto* element = journal ? journal->element() : nullptr;
@@ -1206,6 +1216,24 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
         if (context->isContextLost()) {
           dependencies->error = "WebGL canvas context is lost";
           return std::nullopt;
+        }
+        if (!dependencies->raster &&
+            blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode()) {
+          if (web_frame->Parent()) {
+            dependencies->error =
+                "Out-of-process WebGL canvas requires owned journal routing";
+            return std::nullopt;
+          }
+          auto* journal =
+              static_cast<blink::WebGLRenderingContextBase*>(context)
+                  ->ReachJournal();
+          if (!journal || !journal->usable()) {
+            dependencies->error =
+                journal ? "WebGL command transport: " + journal->error()
+                        : "WebGL canvas has no command transport";
+            return std::nullopt;
+          }
+          continue;
         }
       }
       if (element->IsOffscreenCanvasRegistered() ||
@@ -3100,6 +3128,26 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
     ObserveMediaState(media_document->domWindow());
     for (auto& node :
          blink::FlatTreeTraversal::DescendantsOf(*media_document)) {
+      if (auto* canvas = blink::DynamicTo<blink::HTMLCanvasElement>(node);
+          canvas &&
+          blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode() &&
+          dependencies.media_ids.contains(canvas->GetDomNodeId())) {
+        auto* context = canvas->RenderingContext();
+        if (context && context->IsWebGL()) {
+          auto* journal =
+              static_cast<blink::WebGLRenderingContextBase*>(context)
+                  ->ReachJournal();
+          const auto json = journal ? journal->State() : std::string();
+          if (json.empty() || json.size() > 4096) {
+            result.error = "WebGL command state unavailable or exceeds budget";
+            return result;
+          }
+          media_states.emplace(
+              canvas->GetDomNodeId(),
+              SkData::MakeWithCopy(json.data(), json.size()));
+        }
+        continue;
+      }
       auto* media = blink::DynamicTo<blink::HTMLMediaElement>(node);
       if (!media)
         continue;

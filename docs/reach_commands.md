@@ -132,6 +132,21 @@ Capture bounds include 16 frames, depth 8, 32 MiB aggregate picture input and
 16 Mi pixels across frame viewports. Native focus and hit testing route input
 across isolated frames without changing same-origin or site-isolation policy.
 
+`REACH_WEBGL_COMMAND_REPLAY=1`, together with `--reach-drawing-commands`,
+opts into experimental main-thread WebGL1/2 command journaling. Converted native
+calls, copied numeric uploads and object identities use a separate high-bit
+journal namespace on the existing owned media-journal route. Canvas paint emits
+composition markers instead of WebGL frame snapshots. Native JavaScript queries
+and CPU readbacks remain authoritative; resize, context generations, native
+validation and implicit drawing-buffer discard constrain client replay.
+This does not change the default raster compatibility policy or qualify Maps.
+DOM image/video/canvas uploads, workers and out-of-process WebGL composition are
+not yet supported and fail explicitly. Retention is bounded to 100,000 commands,
+65,536 object identities and 64 MiB per context, with 256 MiB retained command
+bytes per renderer; these finite histories are not indefinite-session support.
+Native compilation, command-only changing pixels/input and matching client
+composition must pass basic acceptance before enabling this in a deployment.
+
 Authored HTTP frame scenarios qualify software/WebGL pixels, original resources,
 mouse/keyboard input, scrolling, navigation and removal. A separate native trace
 qualifies retained Canvas2D and child original resources without matched source

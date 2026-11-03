@@ -1,0 +1,978 @@
+diff --git third_party/blink/renderer/bindings/scripts/bind_gen/interface.py third_party/blink/renderer/bindings/scripts/bind_gen/interface.py
+index 995d858..ac7417c 100644
+--- third_party/blink/renderer/bindings/scripts/bind_gen/interface.py
++++ third_party/blink/renderer/bindings/scripts/bind_gen/interface.py
+@@ -616,6 +616,26 @@ def _wrap_passed_argument(name, idl_type):
+     return _format("std::move({})", name)
+ 
+ 
++def _reach_webgl_api_call(code_node, cg_context, func_name, arguments):
++    interface = cg_context.interface
++    if (not interface or
++            not (cg_context.operation or cg_context.attribute_set) or
++            cg_context.member_like.is_static or
++            not interface.identifier.startswith(
++                ("WebGL", "ANGLE", "EXT", "KHR", "NV", "OES", "OVR", "WEBGL"))):
++        return None
++    code_node.accumulate(
++        CodeGenAccumulator.require_include_headers([
++            "third_party/blink/renderer/modules/webgl/reach_webgl_call.h"
++        ]))
++    return (
++        'ReachInvokeWebGL(${blink_receiver}, "' + func_name + '", '
++        '[&](auto&&... reach_args) -> decltype(auto) { return '
++        '${blink_receiver}->' + func_name +
++        '(std::forward<decltype(reach_args)>(reach_args)...); }' +
++        (", " + ", ".join(arguments) if arguments else "") + ")")
++
++
+ def _make_blink_api_call(code_node,
+                          cg_context,
+                          num_of_args=None,
+@@ -713,6 +733,10 @@ def _make_blink_api_call(code_node,
+     else:
+         func_designator = _format("${blink_receiver}->{}", func_name)
+ 
++    reach_call = _reach_webgl_api_call(code_node, cg_context, func_name,
++                                      arguments)
++    if reach_call:
++        return reach_call
+     expr = _format("{_1}({_2})", _1=func_designator, _2=", ".join(arguments))
+     return expr
+ 
+@@ -2559,16 +2583,15 @@ def make_no_alloc_direct_call_callback_def(cg_context, function_name,
+ 
+     is_return_type_void = function_like.return_type.is_undefined
+ 
++    func_name = backward_compatible_api_func(cg_context)
++    reach_call = _reach_webgl_api_call(body, cg_context, func_name,
++                                      blink_arguments)
++    expression = reach_call or _format(
++        "${blink_receiver}->{}({})", func_name, ", ".join(blink_arguments))
+     if is_return_type_void:
+-        body.append(
+-            F("${blink_receiver}->{member_func}({blink_arguments});",
+-              member_func=backward_compatible_api_func(cg_context),
+-              blink_arguments=", ".join(blink_arguments)))
++        body.append(F("{};", expression))
+     else:
+-        body.append(
+-            F("auto&& return_value = ${blink_receiver}->{member_func}({blink_arguments});",
+-              member_func=backward_compatible_api_func(cg_context),
+-              blink_arguments=", ".join(blink_arguments)))
++        body.append(F("auto&& return_value = {};", expression))
+     if cg_context.may_throw_exception:
+         body.append(
+             CxxUnlikelyIfNode(cond="${exception_state}.HadException()",
+diff --git third_party/blink/renderer/core/html/canvas/html_canvas_element.cc third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index 2e99b4a..c6b3332 100644
+--- third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -110,6 +110,7 @@
+ #include "third_party/blink/renderer/core/page/page_animator.h"
+ #include "third_party/blink/renderer/core/paint/paint_auto_dark_mode.h"
+ #include "third_party/blink/renderer/core/paint/paint_layer.h"
++#include "third_party/blink/renderer/core/paint/video_painter.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
+ #include "third_party/blink/renderer/core/resize_observer/resize_observer_utilities.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_state.h"
+@@ -1332,6 +1333,17 @@ void HTMLCanvasElement::Paint(GraphicsContext& context,
+ 
+ void HTMLCanvasElement::PaintInternal(GraphicsContext& context,
+                                       const PhysicalRect& r) {
++  if (Canvas2DBitmapProvider::IsReachWebGLCommandMode() &&
++      IsReachMediaCapture() && IsWebGL()) {
++    auto* target = context.Canvas();
++    cc::PaintCanvasAutoRestore restore(target, true);
++    target->translate(r.X(), r.Y());
++    target->scale(r.Width(), r.Height());
++    target->clipRect(SkRect::MakeWH(1, 1));
++    target->recordCustomData(GetDomNodeId());
++    RenderingContext()->MarkLayerComposited();
++    return;
++  }
+   if (Canvas2DBitmapProvider::IsReachCommandMode() &&
+       IsRenderingContext2D()) {
+     RenderingContext()->FlushCanvas(FlushReason::kPrinting);
+diff --git third_party/blink/renderer/core/paint/video_painter.cc third_party/blink/renderer/core/paint/video_painter.cc
+index 0121229..633acb5 100644
+--- third_party/blink/renderer/core/paint/video_painter.cc
++++ third_party/blink/renderer/core/paint/video_painter.cc
+@@ -30,6 +30,10 @@ bool SetReachMediaCapture(bool enabled) {
+   return previous;
+ }
+ 
++bool IsReachMediaCapture() {
++  return g_reach_media_capture;
++}
++
+ void VideoPainter::PaintReplaced(const PaintInfo& paint_info,
+                                  const PhysicalOffset& paint_offset) {
+   if (paint_info.phase != PaintPhase::kForeground &&
+diff --git third_party/blink/renderer/core/paint/video_painter.h third_party/blink/renderer/core/paint/video_painter.h
+index db92058..c703baa 100644
+--- third_party/blink/renderer/core/paint/video_painter.h
++++ third_party/blink/renderer/core/paint/video_painter.h
+@@ -12,6 +12,7 @@
+ namespace blink {
+ 
+ CORE_EXPORT bool SetReachMediaCapture(bool enabled);
++CORE_EXPORT bool IsReachMediaCapture();
+ 
+ class LayoutVideo;
+ struct PaintInfo;
+diff --git third_party/blink/renderer/modules/webgl/BUILD.gn third_party/blink/renderer/modules/webgl/BUILD.gn
+index d611207..e7b0902 100644
+--- third_party/blink/renderer/modules/webgl/BUILD.gn
++++ third_party/blink/renderer/modules/webgl/BUILD.gn
+@@ -7,6 +7,9 @@ import("//ui/gl/features.gni")
+ 
+ blink_modules_sources("webgl") {
+   sources = [
++    "reach_webgl_call.h",
++    "reach_webgl_journal.cc",
++    "reach_webgl_journal.h",
+     "angle_instanced_arrays.cc",
+     "angle_instanced_arrays.h",
+     "ext_blend_min_max.cc",
+diff --git third_party/blink/renderer/modules/webgl/reach_webgl_call.h third_party/blink/renderer/modules/webgl/reach_webgl_call.h
+new file mode 100644
+index 0000000..3638b2e
+--- /dev/null
++++ third_party/blink/renderer/modules/webgl/reach_webgl_call.h
+@@ -0,0 +1,102 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
++
++#include <functional>
++#include <type_traits>
++#include <utility>
++
++#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
++#include "third_party/blink/renderer/modules/webgl/webgl_program.h"
++#include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
++
++namespace blink {
++
++template <typename T>
++bool ReachIsReadbackView(const T& value) {
++  using V = std::remove_cvref_t<T>;
++  if constexpr (std::is_convertible_v<V, const DOMArrayBufferView*>)
++    return true;
++  else if constexpr (requires { value.Get(); })
++    return ReachIsReadbackView(value.Get());
++  return false;
++}
++
++template <typename Receiver, typename F, typename... Args>
++std::invoke_result_t<F, Args...> ReachInvokeWebGL(Receiver* receiver,
++                                                  const char* name,
++                                                  F&& invoke,
++                                                  Args&&... args) {
++  using Result = std::invoke_result_t<F, Args...>;
++  WebGLRenderingContextBase* context = nullptr;
++  if constexpr (std::is_base_of_v<WebGLRenderingContextBase, Receiver>) {
++    context = receiver;
++  } else {
++    context = WebGLExtensionScopedContext(receiver).Context();
++  }
++  ReachWebGLJournal* journal = nullptr;
++  const bool cpu_readback = std::string_view(name) == "readPixels" &&
++                            (ReachIsReadbackView(args) || ...);
++  if (Canvas2DBitmapProvider::IsReachWebGLCommandMode() && context &&
++      !context->isContextLost() && !cpu_readback &&
++      ReachWebGLJournal::ShouldRecord(name)) {
++    journal = context->ReachJournal();
++  }
++  const uint64_t serial = context ? context->ReachValidationSerial() : 0;
++  ReachWebGLCommand command;
++  if (journal && journal->usable()) {
++    command.value.Set("op", name);
++    base::ListValue encoded;
++    (journal->Argument(command, encoded, args), ...);
++    command.value.Set("args", std::move(encoded));
++    if constexpr (std::is_base_of_v<WebGLExtension, Receiver>)
++      journal->Target(command, receiver);
++  } else {
++    journal = nullptr;
++  }
++  const auto accepted = [&] {
++    if (!journal || context->isContextLost() ||
++        context->ReachValidationSerial() != serial) {
++      return false;
++    }
++    bool exception = false;
++    const auto check = [&]<typename T>(const T& value) {
++      if constexpr (std::is_same_v<std::remove_cvref_t<T>, ExceptionState>)
++        exception |= value.HadException();
++    };
++    (check(args), ...);
++    return !exception;
++  };
++  const auto commit = [&] {
++    const auto decorate = [&]<typename T>(const T& value) {
++      if constexpr (std::is_convertible_v<T, WebGLProgram*>) {
++        if (std::string_view(name) == "linkProgram")
++          journal->Program(command, value);
++      }
++    };
++    (decorate(args), ...);
++    journal->Append(std::move(command));
++  };
++  if constexpr (std::is_void_v<Result>) {
++    std::invoke(std::forward<F>(invoke), std::forward<Args>(args)...);
++    if (accepted())
++      commit();
++  } else {
++    Result result =
++        std::invoke(std::forward<F>(invoke), std::forward<Args>(args)...);
++    if (accepted()) {
++      if constexpr (std::is_pointer_v<Result> &&
++                    std::is_convertible_v<Result, const ScriptWrappable*>) {
++        journal->Result(command, result);
++      } else if constexpr (std::is_integral_v<Result>) {
++        if (std::string_view(name) == "getUniformBlockIndex")
++          journal->Result(command, static_cast<uint32_t>(result));
++      }
++      commit();
++    }
++    return result;
++  }
++}
++
++}  // namespace blink
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
+diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
+new file mode 100644
+index 0000000..aa43bed
+--- /dev/null
++++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
+@@ -0,0 +1,377 @@
++#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
++
++#include <algorithm>
++#include <atomic>
++
++#include "base/base64.h"
++#include "base/json/json_writer.h"
++#include "base/no_destructor.h"
++#include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "gpu/command_buffer/client/gles2_interface.h"
++#include "third_party/blink/renderer/bindings/modules/v8/v8_webgl_context_attributes.h"
++#include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
++#include "third_party/blink/renderer/modules/webgl/webgl_program.h"
++#include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
++
++namespace blink {
++namespace {
++
++constexpr uint64_t kJournalBit = uint64_t{1} << 63;
++constexpr size_t kMaxJournalBytes = 64 * 1024 * 1024;
++constexpr size_t kMaxRetainedBytes = 256 * 1024 * 1024;
++constexpr size_t kMaxCommandBytes = 4 * 1024 * 1024;
++constexpr size_t kMaxCommands = 100000;
++constexpr uint32_t kMaxObjects = 65536;
++
++using Journals = std::map<uint64_t, WeakPersistent<WebGLRenderingContextBase>>;
++
++Journals& Registry() {
++  static base::NoDestructor<Journals> journals;
++  return *journals;
++}
++
++std::atomic_size_t& RetainedBytes() {
++  static base::NoDestructor<std::atomic_size_t> bytes(0);
++  return *bytes;
++}
++
++uint64_t NextId() {
++  uint64_t id;
++  do {
++    id = kJournalBit | base::RandUint64();
++  } while (Registry().contains(id));
++  return id;
++}
++
++}  // namespace
++
++ReachWebGLJournal::ReachWebGLJournal(WebGLRenderingContextBase& context)
++    : context_(&context),
++      element_(context.Host() && !context.Host()->IsOffscreenCanvas()
++                   ? static_cast<HTMLCanvasElement*>(context.Host())
++                   : nullptr),
++      id_(NextId()),
++      generation_(context.GetContextGeneration()) {
++  auto& journals = Registry();
++  for (auto it = journals.begin(); it != journals.end();) {
++    auto* owner = it->second.Get();
++    auto* journal = owner ? owner->ReachExistingJournal() : nullptr;
++    if (!journal || journal->id_ != it->first ||
++        journal->generation_ != owner->GetContextGeneration())
++      it = journals.erase(it);
++    else
++      ++it;
++  }
++  if (!element_ || journals.size() >= 64) {
++    Fail("WebGL context ownership or context budget is invalid");
++    return;
++  }
++  journals.emplace(id_, WeakPersistent<WebGLRenderingContextBase>(&context));
++  Resize(context.drawingBufferWidth(), context.drawingBufferHeight());
++  for (const char* name : {"viewport", "scissor"}) {
++    ReachWebGLCommand command;
++    command.value.Set("op", name);
++    base::ListValue args;
++    args.Append(0);
++    args.Append(0);
++    args.Append(context.drawingBufferWidth());
++    args.Append(context.drawingBufferHeight());
++    command.value.Set("args", std::move(args));
++    Append(std::move(command));
++  }
++}
++
++ReachWebGLJournal::~ReachWebGLJournal() {
++  RetainedBytes().fetch_sub(bytes_, std::memory_order_relaxed);
++}
++
++HTMLCanvasElement* ReachWebGLJournal::element() const {
++  return element_.Get();
++}
++
++ReachWebGLJournal* ReachWebGLJournal::Find(uint64_t id) {
++  auto it = Registry().find(id);
++  auto* context = it == Registry().end() ? nullptr : it->second.Get();
++  auto* journal = context ? context->ReachExistingJournal() : nullptr;
++  return journal && journal->id_ == id &&
++                 journal->generation_ == context->GetContextGeneration()
++             ? journal
++             : nullptr;
++}
++
++bool ReachWebGLJournal::ShouldRecord(std::string_view name) {
++  if (name == "getUniformLocation" || name == "getUniformBlockIndex")
++    return true;
++  return !name.starts_with("get") && !name.starts_with("is") &&
++         name != "checkFramebufferStatus" && name != "makeXRCompatible";
++}
++
++void ReachWebGLJournal::Fail(std::string_view error) {
++  if (error_.empty())
++    error_ = error;
++}
++
++base::Value ReachWebGLJournal::Bytes(ReachWebGLCommand& command,
++                                     std::string_view type,
++                                     base::span<const uint8_t> bytes) {
++  if (bytes.size() > 3 * 1024 * 1024 ||
++      command.input_bytes > kMaxCommandBytes - bytes.size()) {
++    command.error = "WebGL copied upload budget exceeded";
++    return base::Value();
++  }
++  command.input_bytes += bytes.size();
++  base::DictValue upload;
++  upload.Set("type", type);
++  upload.Set("data", base::Base64Encode(bytes));
++  return base::Value(std::move(upload));
++}
++
++base::Value ReachWebGLJournal::View(ReachWebGLCommand& command,
++                                    const DOMArrayBufferView& view) {
++  std::string_view type;
++  switch (view.GetType()) {
++    case DOMArrayBufferView::kTypeInt8:
++      type = "Int8Array";
++      break;
++    case DOMArrayBufferView::kTypeUint8:
++      type = "Uint8Array";
++      break;
++    case DOMArrayBufferView::kTypeUint8Clamped:
++      type = "Uint8ClampedArray";
++      break;
++    case DOMArrayBufferView::kTypeInt16:
++      type = "Int16Array";
++      break;
++    case DOMArrayBufferView::kTypeUint16:
++      type = "Uint16Array";
++      break;
++    case DOMArrayBufferView::kTypeInt32:
++      type = "Int32Array";
++      break;
++    case DOMArrayBufferView::kTypeUint32:
++      type = "Uint32Array";
++      break;
++    case DOMArrayBufferView::kTypeFloat32:
++      type = "Float32Array";
++      break;
++    case DOMArrayBufferView::kTypeFloat64:
++      type = "Float64Array";
++      break;
++    default:
++      command.error = "Unsupported WebGL upload view";
++      return base::Value();
++  }
++  return Bytes(command, type, view.ByteSpanMaybeShared());
++}
++
++base::Value ReachWebGLJournal::Reference(ReachWebGLCommand& command,
++                                         const ScriptWrappable* object) {
++  auto it = identities_.find(object);
++  if (it == identities_.end() || it->second.object.Get() != object) {
++    command.error = "WebGL object was not recorded in this context";
++    return base::Value();
++  }
++  base::DictValue reference;
++  reference.Set("ref", static_cast<int>(it->second.id));
++  return base::Value(std::move(reference));
++}
++
++uint32_t ReachWebGLJournal::CreateIdentity(ReachWebGLCommand& command,
++                                           const ScriptWrappable* object) {
++  if (next_identity_ > kMaxObjects) {
++    command.error = "WebGL object identity budget exceeded";
++    return 0;
++  }
++  const uint32_t id = next_identity_++;
++  identities_.insert_or_assign(
++      object, Identity{WeakPersistent<const ScriptWrappable>(object), id});
++  return id;
++}
++
++void ReachWebGLJournal::Result(ReachWebGLCommand& command,
++                               const ScriptWrappable* object) {
++  if (object)
++    command.value.Set("out", static_cast<int>(CreateIdentity(command, object)));
++}
++
++void ReachWebGLJournal::Result(ReachWebGLCommand& command, uint32_t value) {
++  command.value.Set("value", static_cast<double>(value));
++}
++
++void ReachWebGLJournal::Target(ReachWebGLCommand& command,
++                               WebGLExtension* extension) {
++  auto value = Reference(command, extension);
++  if (value.is_dict()) {
++    const auto id = value.GetDict().FindInt("ref");
++    if (id)
++      command.value.Set("target", *id);
++  }
++}
++
++void ReachWebGLJournal::Extension(const String& name,
++                                  WebGLExtension* extension) {
++  if (!extension || !usable() || name == "WEBGL_lose_context" ||
++      name == "WEBGL_debug_shaders" || name == "WEBGL_debug_renderer_info")
++    return;
++  auto it = identities_.find(extension);
++  if (it != identities_.end() && it->second.object.Get() == extension)
++    return;
++  ReachWebGLCommand command;
++  command.value.Set("op", "getExtension");
++  base::ListValue args;
++  args.Append(name.Utf8());
++  command.value.Set("args", std::move(args));
++  Result(command, extension);
++  Append(std::move(command));
++}
++
++void ReachWebGLJournal::Program(ReachWebGLCommand& command,
++                                WebGLProgram* program) {
++  if (!program || !command.error.empty())
++    return;
++  auto* gl = context_->ContextGL();
++  GLint linked = 0;
++  gl->GetProgramiv(program->Object(), GL_LINK_STATUS, &linked);
++  command.value.Set("value", linked ? 1 : 0);
++  if (!linked)
++    return;
++  GLint count = 0;
++  GLint max_length = 0;
++  gl->GetProgramiv(program->Object(), GL_ACTIVE_ATTRIBUTES, &count);
++  gl->GetProgramiv(program->Object(), GL_ACTIVE_ATTRIBUTE_MAX_LENGTH,
++                   &max_length);
++  if (count < 0 || count > 32 || max_length < 0 || max_length > 1024) {
++    command.error = "WebGL program attribute budget exceeded";
++    return;
++  }
++  base::DictValue attributes;
++  std::vector<char> name(std::max(1, max_length));
++  for (GLint index = 0; index < count; ++index) {
++    GLsizei length = 0;
++    GLint size = 0;
++    GLenum type = 0;
++    gl->GetActiveAttrib(program->Object(), index, name.size(), &length, &size,
++                        &type, name.data());
++    if (length <= 0 || static_cast<size_t>(length) >= name.size()) {
++      command.error = "WebGL program attribute name is invalid";
++      return;
++    }
++    const GLint location =
++        gl->GetAttribLocation(program->Object(), name.data());
++    if (location < 0 || location > 31) {
++      command.error = "WebGL program attribute location is invalid";
++      return;
++    }
++    attributes.Set(std::string(name.data(), length), location);
++  }
++  command.value.Set("attributes", std::move(attributes));
++}
++
++void ReachWebGLJournal::Append(ReachWebGLCommand command) {
++  if (!usable())
++    return;
++  if (!command.error.empty()) {
++    Fail(command.error);
++    return;
++  }
++  auto json = base::WriteJson(command.value);
++  if (!json || json->size() > kMaxCommandBytes ||
++      commands_.size() >= kMaxCommands ||
++      json->size() > kMaxJournalBytes - bytes_) {
++    Fail("WebGL command journal budget exceeded");
++    return;
++  }
++  const size_t previous =
++      RetainedBytes().fetch_add(json->size(), std::memory_order_relaxed);
++  if (previous > kMaxRetainedBytes - json->size()) {
++    RetainedBytes().fetch_sub(json->size(), std::memory_order_relaxed);
++    Fail("Combined WebGL command journal budget exceeded");
++    return;
++  }
++  bytes_ += json->size();
++  commands_.push_back(std::move(*json));
++}
++
++void ReachWebGLJournal::Resize(int width, int height) {
++  if (width <= 0 || width > 4096 || height <= 0 || height > 4096) {
++    Fail("WebGL backing size exceeds the command budget");
++    return;
++  }
++  ReachWebGLCommand command;
++  command.value.Set("op", "$resize");
++  base::ListValue args;
++  args.Append(width);
++  args.Append(height);
++  command.value.Set("args", std::move(args));
++  Append(std::move(command));
++}
++
++void ReachWebGLJournal::Discard() {
++  ReachWebGLCommand command;
++  command.value.Set("op", "$discard");
++  command.value.Set("args", base::ListValue());
++  Append(std::move(command));
++}
++
++std::string ReachWebGLJournal::State() {
++  if (!usable() || !element_ || !context_ || context_->isContextLost())
++    return {};
++  auto* attributes = context_->getContextAttributes();
++  if (!attributes)
++    return {};
++  base::DictValue state;
++  state.Set("webgl", 1);
++  state.Set("id", element_->GetDomNodeId());
++  state.Set("journal", base::NumberToString(id_));
++  state.Set("seq", base::NumberToString(commands_.size()));
++  state.Set("version", context_->IsWebGL2() ? 2 : 1);
++  state.Set("width", context_->drawingBufferWidth());
++  state.Set("height", context_->drawingBufferHeight());
++  base::DictValue settings;
++  settings.Set("alpha", attributes->alpha());
++  settings.Set("depth", attributes->depth());
++  settings.Set("stencil", attributes->stencil());
++  settings.Set("antialias", attributes->antialias());
++  settings.Set("premultipliedAlpha", attributes->premultipliedAlpha());
++  settings.Set("preserveDrawingBuffer", attributes->preserveDrawingBuffer());
++  state.Set("attributes", std::move(settings));
++  auto json = base::WriteJson(state);
++  if (!json) {
++    Fail("WebGL metadata serialization failed");
++    return {};
++  }
++  return std::move(*json);
++}
++
++std::string ReachWebGLJournal::Read(uint64_t cursor,
++                                    size_t max_bytes,
++                                    std::vector<uint8_t>* output) const {
++  if (!usable() || cursor > commands_.size() || max_bytes <= 256)
++    return "WebGL command journal unavailable or cursor invalid";
++  size_t end = static_cast<size_t>(cursor);
++  size_t bytes = 0;
++  while (end < commands_.size() &&
++         commands_[end].size() + 1 <= max_bytes - 256 - bytes) {
++    bytes += commands_[end].size() + 1;
++    ++end;
++  }
++  if (end == cursor && cursor < commands_.size())
++    return "WebGL command does not fit the bounded journal response";
++  std::string json = "{\"webgl\":1,\"journal\":\"" + base::NumberToString(id_) +
++                     "\",\"from\":\"" + base::NumberToString(cursor) +
++                     "\",\"next\":\"" + base::NumberToString(end) +
++                     "\",\"commands\":[";
++  for (size_t index = static_cast<size_t>(cursor); index < end; ++index) {
++    if (index != cursor)
++      json += ',';
++    json += commands_[index];
++  }
++  json += "]}";
++  if (json.size() > max_bytes)
++    return "WebGL command response exceeds its byte budget";
++  output->assign(json.begin(), json.end());
++  return {};
++}
++
++}  // namespace blink
+diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.h third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
+new file mode 100644
+index 0000000..0d3351c
+--- /dev/null
++++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
+@@ -0,0 +1,197 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
++
++#include <cmath>
++#include <cstdint>
++#include <map>
++#include <string>
++#include <string_view>
++#include <type_traits>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/values.h"
++#include "third_party/blink/renderer/core/typed_arrays/dom_array_buffer.h"
++#include "third_party/blink/renderer/core/typed_arrays/dom_array_buffer_view.h"
++#include "third_party/blink/renderer/modules/modules_export.h"
++#include "third_party/blink/renderer/modules/webgl/webgl_extension.h"
++#include "third_party/blink/renderer/modules/webgl/webgl_object.h"
++#include "third_party/blink/renderer/modules/webgl/webgl_uniform_location.h"
++#include "third_party/blink/renderer/platform/bindings/exception_state.h"
++#include "third_party/blink/renderer/platform/heap/persistent.h"
++#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++
++namespace v8 {
++class Isolate;
++}
++
++namespace blink {
++
++class HTMLCanvasElement;
++class ScriptState;
++class WebGLProgram;
++class WebGLRenderingContextBase;
++
++struct ReachWebGLCommand {
++  base::DictValue value;
++  std::string error;
++  size_t input_bytes = 0;
++};
++
++class MODULES_EXPORT ReachWebGLJournal final {
++ public:
++  explicit ReachWebGLJournal(WebGLRenderingContextBase&);
++  ~ReachWebGLJournal();
++
++  static ReachWebGLJournal* Find(uint64_t);
++  static bool ShouldRecord(std::string_view);
++  bool usable() const { return error_.empty(); }
++  const std::string& error() const { return error_; }
++  uint64_t generation() const { return generation_; }
++  HTMLCanvasElement* element() const;
++  std::string State();
++  std::string Read(uint64_t cursor,
++                   size_t max_bytes,
++                   std::vector<uint8_t>* output) const;
++  void Append(ReachWebGLCommand);
++  void Resize(int width, int height);
++  void Discard();
++  void Extension(const String&, WebGLExtension*);
++  void Program(ReachWebGLCommand&, WebGLProgram*);
++  void Result(ReachWebGLCommand&, const ScriptWrappable*);
++  void Result(ReachWebGLCommand&, uint32_t);
++  void Target(ReachWebGLCommand&, WebGLExtension*);
++
++  template <typename T>
++  void Argument(ReachWebGLCommand& command,
++                base::ListValue& args,
++                const T& value) {
++    using V = std::remove_cvref_t<T>;
++    if constexpr (std::is_same_v<V, ExceptionState> ||
++                  std::is_same_v<V, v8::Isolate*> ||
++                  std::is_same_v<V, ScriptState*>) {
++      return;
++    } else {
++      args.Append(Encode(command, value));
++    }
++  }
++
++ private:
++  struct Identity {
++    WeakPersistent<const ScriptWrappable> object;
++    uint32_t id;
++  };
++
++  base::Value Bytes(ReachWebGLCommand&,
++                    std::string_view,
++                    base::span<const uint8_t>);
++  base::Value View(ReachWebGLCommand&, const DOMArrayBufferView&);
++  base::Value Reference(ReachWebGLCommand&, const ScriptWrappable*);
++  uint32_t CreateIdentity(ReachWebGLCommand&, const ScriptWrappable*);
++  void Fail(std::string_view);
++
++  template <typename T>
++  base::Value Encode(ReachWebGLCommand& command, const T& value) {
++    using V = std::remove_cvref_t<T>;
++    if (!command.error.empty())
++      return base::Value();
++    if constexpr (std::is_same_v<V, bool>) {
++      return base::Value(value);
++    } else if constexpr (std::is_arithmetic_v<V> || std::is_enum_v<V>) {
++      const double number = static_cast<double>(value);
++      if (!std::isfinite(number) || std::abs(number) > 9007199254740991.0) {
++        command.error = "Nonrepresentable WebGL argument";
++        return base::Value();
++      }
++      return base::Value(number);
++    } else if constexpr (std::is_same_v<V, String>) {
++      std::string text = value.Utf8();
++      command.input_bytes += text.size();
++      if (text.size() > 1024 * 1024 || command.input_bytes > 4 * 1024 * 1024) {
++        command.error = "WebGL string budget exceeded";
++        return base::Value();
++      }
++      return base::Value(std::move(text));
++    } else if constexpr (std::is_pointer_v<V>) {
++      using Element = std::remove_cv_t<std::remove_pointer_t<V>>;
++      if (!value)
++        return base::Value();
++      if constexpr (std::is_convertible_v<V, const DOMArrayBufferView*>) {
++        return View(command, *value);
++      } else if constexpr (std::is_convertible_v<V,
++                                                 const DOMArrayBufferBase*>) {
++        return Bytes(command, "ArrayBuffer", value->ByteSpanMaybeShared());
++      } else if constexpr (std::is_convertible_v<V, const WebGLObject*> ||
++                           std::is_same_v<Element, WebGLUniformLocation> ||
++                           std::is_convertible_v<V, const WebGLExtension*>) {
++        return Reference(command, value);
++      }
++      command.error = "WebGL source argument requires command transport";
++      return base::Value();
++    } else if constexpr (requires { value.Get(); }) {
++      return Encode(command, value.Get());
++    } else if constexpr (requires {
++                           value.has_value();
++                           *value;
++                         }) {
++      return value.has_value() ? Encode(command, *value) : base::Value();
++    } else if constexpr (requires {
++                           typename V::value_type;
++                           value.data();
++                           value.size();
++                         }) {
++      using Element = std::remove_cv_t<typename V::value_type>;
++      if constexpr (std::is_arithmetic_v<Element>) {
++        std::string_view type;
++        if constexpr (std::is_same_v<Element, float>)
++          type = "Float32Array";
++        else if constexpr (std::is_same_v<Element, double>)
++          type = "Float64Array";
++        else if constexpr (sizeof(Element) == 4)
++          type = std::is_signed_v<Element> ? "Int32Array" : "Uint32Array";
++        else if constexpr (sizeof(Element) == 2)
++          type = std::is_signed_v<Element> ? "Int16Array" : "Uint16Array";
++        else if constexpr (sizeof(Element) == 1)
++          type = std::is_signed_v<Element> ? "Int8Array" : "Uint8Array";
++        if (!type.empty())
++          return Bytes(command, type, base::as_byte_span(value));
++      }
++      return Sequence(command, value);
++    } else if constexpr (requires {
++                           value.begin();
++                           value.end();
++                           value.size();
++                         }) {
++      return Sequence(command, value);
++    } else {
++      command.error = "Unsupported converted WebGL argument";
++      return base::Value();
++    }
++  }
++
++  template <typename T>
++  base::Value Sequence(ReachWebGLCommand& command, const T& values) {
++    if (values.size() > 16384) {
++      command.error = "WebGL argument list budget exceeded";
++      return base::Value();
++    }
++    base::ListValue result;
++    for (const auto& value : values)
++      result.Append(Encode(command, value));
++    return base::Value(std::move(result));
++  }
++
++  WeakPersistent<WebGLRenderingContextBase> context_;
++  WeakPersistent<HTMLCanvasElement> element_;
++  const uint64_t id_;
++  const uint64_t generation_;
++  std::map<const ScriptWrappable*, Identity> identities_;
++  uint32_t next_identity_ = 1;
++  std::vector<std::string> commands_;
++  size_t bytes_ = 0;
++  std::string error_;
++};
++
++}  // namespace blink
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
+diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index b17f336..6866836 100644
+--- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -44,6 +44,8 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/memory_dump_manager.h"
+ #include "base/trace_event/trace_event.h"
++#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
+ #include "build/build_config.h"
+ #include "components/viz/common/gpu/raster_context_provider.h"
+ #include "components/viz/common/resources/shared_image_format_utils.h"
+@@ -1574,6 +1576,7 @@ void WebGLRenderingContextBase::InitializeNewContext() {
+   // initialized. Restore it now.
+   GetDrawingBuffer()->RestoreAllState();
+   ActivateContext(this);
++  ReachJournal();
+ }
+ 
+ void WebGLRenderingContextBase::SetupFlags() {
+@@ -1766,6 +1769,17 @@ void WebGLRenderingContextBase::OnErrorMessage(const char* message,
+   NotifyWebGLErrorOrWarning(message);
+ }
+ 
++ReachWebGLJournal* WebGLRenderingContextBase::ReachJournal() {
++  if (!Canvas2DBitmapProvider::IsReachWebGLCommandMode() || !Host() ||
++      Host()->IsOffscreenCanvas() || isContextLost())
++    return nullptr;
++  if (!reach_journal_ ||
++      reach_journal_->generation() != GetContextGeneration()) {
++    reach_journal_ = std::make_unique<ReachWebGLJournal>(*this);
++  }
++  return reach_journal_.get();
++}
++
+ WebGLRenderingContextBase::HowToClear
+ WebGLRenderingContextBase::ClearIfComposited(
+     WebGLRenderingContextBase::ClearCaller caller,
+@@ -1805,6 +1819,8 @@ WebGLRenderingContextBase::ClearIfComposited(
+   // clear.
+   bool combined_clear =
+       mask && !scissor_enabled_ && back_draw_buffer_ == GL_BACK;
++  if (reach_journal_)
++    reach_journal_->Discard();
+ 
+   ContextGL()->Disable(GL_SCISSOR_TEST);
+   if (combined_clear && (mask & GL_COLOR_BUFFER_BIT)) {
+@@ -2455,6 +2471,8 @@ void WebGLRenderingContextBase::Reshape(int width, int height) {
+   // buffer will also start off clear (and this matches what reshape will do).
+   GetDrawingBuffer()->Resize(gfx::Size(width, height));
+   GetDrawingBuffer()->MarkContentsChanged();
++  if (reach_journal_)
++    reach_journal_->Resize(drawingBufferWidth(), drawingBufferHeight());
+ 
+   Host()->UpdateMemoryUsage();
+ 
+@@ -3875,6 +3893,8 @@ WebGLExtension* WebGLRenderingContextBase::EnableExtensionIfSupported(
+     }
+ 
+     MarkExtensionEnabled(extension->GetName());
++    if (auto* journal = ReachJournal())
++      journal->Extension(String(tracker->ExtensionName()), extension);
+     return extension;
+   }
+ 
+@@ -9266,6 +9286,7 @@ void WebGLRenderingContextBase::SynthesizeGLError(
+     const char* function_name,
+     const char* description,
+     ConsoleDisplayPreference display) {
++  ++reach_validation_serial_;
+   String error_type = GetErrorString(error);
+   if (synthesized_errors_to_console_ && display == kDisplayInConsole) {
+     String message =
+diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
+index 2e5ca58..c3aa40d 100644
+--- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
++++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
+@@ -111,6 +111,7 @@ class WebGLObject;
+ class WebGLProgram;
+ class WebGLRenderbuffer;
+ class WebGLRenderingContextBase;
++class ReachWebGLJournal;
+ class WebGLShader;
+ class WebGLShaderPrecisionFormat;
+ class WebGLVertexArrayObjectBase;
+@@ -149,6 +150,12 @@ class MODULES_EXPORT WebGLRenderingContextBase
+ 
+   HTMLCanvasElement* canvas() const;
+ 
++  ReachWebGLJournal* ReachJournal();
++  ReachWebGLJournal* ReachExistingJournal() const {
++    return reach_journal_.get();
++  }
++  uint64_t ReachValidationSerial() const { return reach_validation_serial_; }
++
+   virtual String ContextName() const = 0;
+   virtual void RegisterContextExtensions() = 0;
+ 
+@@ -1960,6 +1967,8 @@ class MODULES_EXPORT WebGLRenderingContextBase
+   SkAlphaType GetAlphaType() const;
+ 
+  private:
++  std::unique_ptr<ReachWebGLJournal> reach_journal_;
++  uint64_t reach_validation_serial_ = 0;
+   WebGLRenderingContextBase(CanvasRenderingContextHost*,
+                             scoped_refptr<base::SingleThreadTaskRunner>,
+                             std::unique_ptr<WebGraphicsContext3DProvider>,
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
+index 153c924..20b76bf 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
++++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
+@@ -13,6 +13,7 @@
+ #include "base/check.h"
+ #include "base/check_op.h"
+ #include "base/command_line.h"
++#include "base/environment.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/ptr_util.h"
+ #include "base/strings/stringprintf.h"
+@@ -43,6 +44,14 @@ bool Canvas2DBitmapProvider::IsReachCommandMode() {
+       "reach-drawing-commands");
+ }
+ 
++bool Canvas2DBitmapProvider::IsReachWebGLCommandMode() {
++  static const bool enabled = [] {
++    auto environment = base::Environment::Create();
++    return environment->GetVar("REACH_WEBGL_COMMAND_REPLAY") == "1";
++  }();
++  return enabled && IsReachCommandMode();
++}
++
+ Canvas2DBitmapProvider::Canvas2DBitmapProvider(
+     gfx::Size size,
+     viz::SharedImageFormat format,
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
+index 2cb58aa..4873818 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
++++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
+@@ -69,6 +69,7 @@ class PLATFORM_EXPORT Canvas2DBitmapProvider final
+   ~Canvas2DBitmapProvider() override;
+ 
+   static bool IsReachCommandMode();
++  static bool IsReachWebGLCommandMode();
+   bool IsValid() const { return IsReachCommandMode() || GetSkSurface(); }
+   void SetDelegate(CanvasResourceProviderDelegate* delegate) {
+     delegate_ = delegate;
