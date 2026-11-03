@@ -465,11 +465,11 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
       }
     }
     if (state->error.empty()) {
-      static std::set<uint32_t> diagnostics;
+      static base::NoDestructor<std::set<uint32_t>> diagnostics;
       const char* timing = getenv("REACH_DRAWING_TIMING");
-      if (diagnostics.size() < 16 && timing &&
+      if (diagnostics->size() < 16 && timing &&
           std::string_view(timing) == "1" &&
-          diagnostics.insert(image->uniqueID()).second) {
+          diagnostics->insert(image->uniqueID()).second) {
         fprintf(stderr,
                 "ReachUnencodedImage width=%d height=%d image=%u lazy=%d "
                 "color=%d alpha=%d budget_only=%d\n",
@@ -668,11 +668,11 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
     const auto original = image.GetSwSkImage();
     const auto encoded = original ? original->refEncodedData() : nullptr;
     if (original && (!encoded || !encoded->size())) {
-      static std::set<uint32_t> diagnostics;
+      static base::NoDestructor<std::set<uint32_t>> diagnostics;
       const char* timing = getenv("REACH_DRAWING_TIMING");
-      if (diagnostics.size() < 16 && timing &&
+      if (diagnostics->size() < 16 && timing &&
           std::string_view(timing) == "1" &&
-          diagnostics.insert(original->uniqueID()).second) {
+          diagnostics->insert(original->uniqueID()).second) {
         fprintf(stderr,
                 "ReachUnencodedPaintImage image=%u stable=%lld width=%d "
                 "height=%d lazy=%d record=%d header=%d animation=%d\n",
