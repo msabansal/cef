@@ -465,6 +465,17 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
       }
     }
     if (state->error.empty()) {
+      static unsigned diagnostics = 0;
+      const char* timing = getenv("REACH_DRAWING_TIMING");
+      if (diagnostics < 16 && timing && std::string_view(timing) == "1") {
+        ++diagnostics;
+        fprintf(stderr,
+                "ReachUnencodedImage width=%d height=%d image=%u lazy=%d "
+                "color=%d alpha=%d budget_only=%d\n",
+                image->width(), image->height(), image->uniqueID(),
+                image->isLazyGenerated(), static_cast<int>(image->colorType()),
+                static_cast<int>(image->alphaType()), state->budget_only);
+      }
       state->error =
           "Image has no original encoded resource; raster fallback rejected";
     }
