@@ -1,8 +1,8 @@
 diff --git third_party/blink/renderer/bindings/scripts/bind_gen/interface.py third_party/blink/renderer/bindings/scripts/bind_gen/interface.py
-index 995d858..ac7417c 100644
+index 995d858..e8a476b 100644
 --- third_party/blink/renderer/bindings/scripts/bind_gen/interface.py
 +++ third_party/blink/renderer/bindings/scripts/bind_gen/interface.py
-@@ -616,6 +616,26 @@ def _wrap_passed_argument(name, idl_type):
+@@ -616,6 +616,28 @@ def _wrap_passed_argument(name, idl_type):
      return _format("std::move({})", name)
  
  
@@ -11,6 +11,8 @@ index 995d858..ac7417c 100644
 +    if (not interface or
 +            not (cg_context.operation or cg_context.attribute_set) or
 +            cg_context.member_like.is_static or
++            interface.identifier in ("WebGLRenderingContextWebGPU",
++                                     "WebGL2RenderingContextWebGPU") or
 +            not interface.identifier.startswith(
 +                ("WebGL", "ANGLE", "EXT", "KHR", "NV", "OES", "OVR", "WEBGL"))):
 +        return None
@@ -29,7 +31,7 @@ index 995d858..ac7417c 100644
  def _make_blink_api_call(code_node,
                           cg_context,
                           num_of_args=None,
-@@ -713,6 +733,10 @@ def _make_blink_api_call(code_node,
+@@ -713,6 +735,10 @@ def _make_blink_api_call(code_node,
      else:
          func_designator = _format("${blink_receiver}->{}", func_name)
  
@@ -40,7 +42,7 @@ index 995d858..ac7417c 100644
      expr = _format("{_1}({_2})", _1=func_designator, _2=", ".join(arguments))
      return expr
  
-@@ -2559,16 +2583,15 @@ def make_no_alloc_direct_call_callback_def(cg_context, function_name,
+@@ -2559,16 +2585,15 @@ def make_no_alloc_direct_call_callback_def(cg_context, function_name,
  
      is_return_type_void = function_like.return_type.is_undefined
  
@@ -64,6 +66,82 @@ index 995d858..ac7417c 100644
      if cg_context.may_throw_exception:
          body.append(
              CxxUnlikelyIfNode(cond="${exception_state}.HadException()",
+diff --git third_party/blink/renderer/bindings/scripts/bind_gen/reach_webgl_test.py third_party/blink/renderer/bindings/scripts/bind_gen/reach_webgl_test.py
+new file mode 100644
+index 0000000..c6e70dd
+--- /dev/null
++++ third_party/blink/renderer/bindings/scripts/bind_gen/reach_webgl_test.py
+@@ -0,0 +1,50 @@
++import ast
++from pathlib import Path
++from types import SimpleNamespace
++import unittest
++
++
++class ReachWebGLBindingTest(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        source = Path(__file__).with_name("interface.py")
++        tree = ast.parse(source.read_text(encoding="utf-8"))
++        helper = next(node for node in tree.body
++                      if isinstance(node, ast.FunctionDef)
++                      and node.name == "_reach_webgl_api_call")
++        namespace = {
++            "CodeGenAccumulator":
++                SimpleNamespace(require_include_headers=tuple),
++        }
++        exec(compile(ast.Module(body=[helper], type_ignores=[]), str(source),
++                     "exec"), namespace)
++        cls.wrap_call = staticmethod(namespace["_reach_webgl_api_call"])
++
++    def generate(self, identifier):
++        context = SimpleNamespace(
++            interface=SimpleNamespace(identifier=identifier),
++            operation=True,
++            attribute_set=False,
++            member_like=SimpleNamespace(is_static=False))
++        node = SimpleNamespace(accumulate=lambda headers: None)
++        return self.wrap_call(node, context, "clear", ["mask"])
++
++    def test_experimental_backend_is_not_instrumented_as_legacy_webgl(self):
++        for identifier in ("WebGLRenderingContextWebGPU",
++                           "WebGL2RenderingContextWebGPU"):
++            with self.subTest(identifier=identifier):
++                self.assertIsNone(self.generate(identifier))
++
++    def test_legacy_contexts_and_extensions_keep_converted_arguments(self):
++        for identifier in ("WebGLRenderingContext", "WebGL2RenderingContext",
++                           "ANGLEInstancedArrays", "OESVertexArrayObject"):
++            with self.subTest(identifier=identifier):
++                expression = self.generate(identifier)
++                self.assertIsNotNone(expression)
++                self.assertTrue(expression.startswith(
++                    'ReachInvokeWebGL(${blink_receiver}, "clear", '))
++                self.assertTrue(expression.endswith(", mask)"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
+index 5d240af..0af2916 100644
+--- third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
++++ third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
+@@ -74,6 +74,7 @@ class Element;
+ class ExceptionState;
+ class ExecutionContext;
+ class ImageBitmap;
++class ReachWebGLJournal;
+ class ScriptState;
+ class StaticBitmapImage;
+ class V8RenderingContext;
+@@ -134,6 +135,7 @@ class CORE_EXPORT CanvasRenderingContext
+   bool IsWebGPU() const {
+     return canvas_rendering_type_ == CanvasRenderingAPI::kWebgpu;
+   }
++  virtual ReachWebGLJournal* GetReachWebGLJournal() { return nullptr; }
+ 
+   // ActiveScriptWrappable
+   // As this class inherits from ActiveScriptWrappable, as long as
 diff --git third_party/blink/renderer/core/html/canvas/html_canvas_element.cc third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 index 2e99b4a..c6b3332 100644
 --- third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
@@ -910,7 +988,7 @@ index b17f336..6866836 100644
    if (synthesized_errors_to_console_ && display == kDisplayInConsole) {
      String message =
 diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
-index 2e5ca58..c3aa40d 100644
+index 2e5ca58..2a9fe21 100644
 --- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
 +++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
 @@ -111,6 +111,7 @@ class WebGLObject;
@@ -921,11 +999,12 @@ index 2e5ca58..c3aa40d 100644
  class WebGLShader;
  class WebGLShaderPrecisionFormat;
  class WebGLVertexArrayObjectBase;
-@@ -149,6 +150,12 @@ class MODULES_EXPORT WebGLRenderingContextBase
+@@ -149,6 +150,13 @@ class MODULES_EXPORT WebGLRenderingContextBase
  
    HTMLCanvasElement* canvas() const;
  
 +  ReachWebGLJournal* ReachJournal();
++  ReachWebGLJournal* GetReachWebGLJournal() override { return ReachJournal(); }
 +  ReachWebGLJournal* ReachExistingJournal() const {
 +    return reach_journal_.get();
 +  }
@@ -934,7 +1013,7 @@ index 2e5ca58..c3aa40d 100644
    virtual String ContextName() const = 0;
    virtual void RegisterContextExtensions() = 0;
  
-@@ -1960,6 +1967,8 @@ class MODULES_EXPORT WebGLRenderingContextBase
+@@ -1960,6 +1968,8 @@ class MODULES_EXPORT WebGLRenderingContextBase
    SkAlphaType GetAlphaType() const;
  
   private:

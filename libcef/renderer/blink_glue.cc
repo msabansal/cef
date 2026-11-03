@@ -96,7 +96,6 @@
 #include "third_party/blink/renderer/core/scroll/scrollable_area.h"
 #include "third_party/blink/renderer/modules/encryptedmedia/html_media_element_encrypted_media.h"
 #include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
-#include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
 #include "third_party/blink/renderer/platform/bindings/script_forbidden_scope.h"
 #include "third_party/blink/renderer/platform/bindings/v8_binding.h"
 #include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
@@ -1224,9 +1223,7 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
                 "Out-of-process WebGL canvas requires owned journal routing";
             return std::nullopt;
           }
-          auto* journal =
-              static_cast<blink::WebGLRenderingContextBase*>(context)
-                  ->ReachJournal();
+          auto* journal = context->GetReachWebGLJournal();
           if (!journal || !journal->usable()) {
             dependencies->error =
                 journal ? "WebGL command transport: " + journal->error()
@@ -3134,9 +3131,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
           dependencies.media_ids.contains(canvas->GetDomNodeId())) {
         auto* context = canvas->RenderingContext();
         if (context && context->IsWebGL()) {
-          auto* journal =
-              static_cast<blink::WebGLRenderingContextBase*>(context)
-                  ->ReachJournal();
+          auto* journal = context->GetReachWebGLJournal();
           const auto json = journal ? journal->State() : std::string();
           if (json.empty() || json.size() > 4096) {
             result.error = "WebGL command state unavailable or exceeds budget";
