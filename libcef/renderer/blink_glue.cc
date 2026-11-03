@@ -1574,7 +1574,11 @@ std::string ApplyDrawingWheel(blink::WebLocalFrame* web_frame,
   event.SetPositionInScreen(x, y);
   event.delta_x = dx;
   event.delta_y = dy;
-  event.delta_units = ui::ScrollGranularity::kScrollByPrecisePixel;
+  // Chromium excludes precise-pixel events from Ctrl+wheel page zoom.
+  event.delta_units =
+      (flags & blink::WebInputEvent::kControlKey) && dy != 0
+          ? ui::ScrollGranularity::kScrollByPixel
+          : ui::ScrollGranularity::kScrollByPrecisePixel;
   event.event_action =
       blink::WebMouseWheelEvent::GetPlatformSpecificDefaultEventAction(event);
   if (frame->GetEventHandler().HandleWheelEvent(event) !=
