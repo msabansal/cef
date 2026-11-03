@@ -148,9 +148,15 @@ recreate the browser, enable normal OSR delivery, or change origin/site-isolatio
 policy. Raster composition permits at most 256 discovered frames, depth 8,
 16 Mi aggregate viewport/decoded-child pixels, and the same byte budgets.
 Texture-backed/deferred images and unknown custom paint fail explicitly rather
-than producing an incomplete screenshot. This path is not a GPU/compositor or
+than producing an incomplete screenshot. Main-thread WebGL1/2 canvases may use
+Blink's ordinary unaccelerated canvas paint in explicitly authorized raster
+capture only. Before painting, each canvas must have nonzero dimensions no
+larger than 4096 and their aggregate source area must not exceed 16 Mi pixels.
+Lost contexts, bitmap/WebGPU and OffscreenCanvas remain rejected. The complete
+paint record still passes the independent image/filter/operation budgets.
+This path is not a GPU/compositor or
 universal live-media capture API. The application must send a separate raster
 packet and structured fallback reason; raster success is not command success.
 Live/range streaming, detached Audio objects, WebAudio graphs, external
-subtitles, GPU/WebGL capture, production transport and full-browser fidelity
+subtitles, arbitrary GPU capture, production transport and full-browser fidelity
 are not qualified. Do not remove rejection checks to claim compatibility.

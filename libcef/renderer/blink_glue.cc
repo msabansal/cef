@@ -1168,6 +1168,7 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
     return std::nullopt;
   }
   std::set<uint32_t> frame_ids;
+  uint64_t webgl_pixels = 0;
   for (blink::Frame* tree_frame = frame; tree_frame;
        tree_frame = tree_frame->Tree().TraverseNext(frame)) {
     if (!IsInlinePaintFrame(frame, tree_frame)) {
@@ -1190,8 +1191,26 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
         continue;
       }
       auto* context = element->RenderingContext();
+      if (context && context->IsWebGL()) {
+        const auto size = element->Size();
+        const uint64_t pixels =
+            uint64_t(std::max(0, size.width())) * std::max(0, size.height());
+        // Blink's ordinary canvas paint makes an unaccelerated snapshot.
+        // Bound its source allocation before recording that raster paint.
+        if (!pixels || size.width() > 4096 || size.height() > 4096 ||
+            pixels > kMaxDecodedImagePixels - webgl_pixels) {
+          dependencies->error = "WebGL canvas pixel budget exceeded";
+          return std::nullopt;
+        }
+        webgl_pixels += pixels;
+        if (context->isContextLost()) {
+          dependencies->error = "WebGL canvas context is lost";
+          return std::nullopt;
+        }
+      }
       if (element->IsOffscreenCanvasRegistered() ||
-          (context && !context->IsRenderingContext2D())) {
+          (context && !context->IsRenderingContext2D() &&
+           !(dependencies->raster && context->IsWebGL()))) {
         dependencies->error =
             "GPU, bitmap or offscreen canvas requires command transport";
         return std::nullopt;
