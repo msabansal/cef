@@ -103,6 +103,10 @@ int main() {
        {Context::kRealLostContext, Context::kWebGLLoseContextLostContext}) {
     Context context;
     context.ReachCanvasVideoChanged(true);
+    assert(context.host.layout.invalidated);
+    context.host.layout.invalidated = false;
+    context.ReachCanvasVideoChanged(false);
+    assert(!context.host.layout.invalidated);
     auto budget = std::make_shared<blink::ReachCanvasVideo::Budget>();
     auto& original = *context.reach_canvas_video_;
     original.SetBudget(budget);
@@ -123,7 +127,9 @@ int main() {
     // Blink restores the drawing buffer on the same rendering-context object.
     context.context_lost_mode_ = Context::kNotLostContext;
     context.drawing_buffer_ = std::make_shared<blink::DrawingBuffer>();
+    context.host.layout.invalidated = false;
     context.ReachCanvasVideoChanged(true);
+    assert(context.host.layout.invalidated);
     auto& restored = *context.reach_canvas_video_;
     assert(restored.stream() != retired_stream);
     assert(restored.Checkpoint(

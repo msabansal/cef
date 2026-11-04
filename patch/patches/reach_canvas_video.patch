@@ -1,5 +1,5 @@
 diff --git third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
-index 9ef16aa..a7efcca 100644
+index 9ef16aa..085dad1 100644
 --- third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
 +++ third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
 @@ -26,6 +26,7 @@
@@ -34,7 +34,7 @@ index 9ef16aa..a7efcca 100644
  #include "ui/accessibility/accessibility_features.h"
  #include "ui/gfx/geometry/rect_conversions.h"
  #include "ui/gfx/geometry/size_conversions.h"
-@@ -67,6 +71,100 @@ BASE_FEATURE(kAllowAcceleratedTexElement, base::FEATURE_ENABLED_BY_DEFAULT);
+@@ -67,6 +71,105 @@ BASE_FEATURE(kAllowAcceleratedTexElement, base::FEATURE_ENABLED_BY_DEFAULT);
  // element to update its accessibility related information. This value is chosen
  // arbitrarily and can be subject to optimization.
  constexpr base::TimeDelta kAccessibilityUkmRecordingDelay = base::Seconds(5);
@@ -50,8 +50,13 @@ index 9ef16aa..a7efcca 100644
 +  if (!Canvas2DBitmapProvider::IsReachWebGLVideoMode() || !IsWebGL() ||
 +      !Host() || Host()->IsOffscreenCanvas())
 +    return;
-+  if (!reach_canvas_video_)
++  if (!reach_canvas_video_) {
 +    reach_canvas_video_ = std::make_unique<ReachCanvasVideo>();
++    auto* canvas = static_cast<HTMLCanvasElement*>(Host());
++    // Replace any cached paint recorded while this context was lost.
++    if (auto* layout = canvas->GetLayoutObject())
++      layout->SetShouldDoFullPaintInvalidation();
++  }
 +  if (epoch)
 +    reach_canvas_video_->Epoch();
 +  else
@@ -135,7 +140,7 @@ index 9ef16aa..a7efcca 100644
  }
  
  CanvasRenderingContext::CanvasRenderingContext(
-@@ -90,6 +188,7 @@ CanvasRenderingContext::CanvasRenderingContext(
+@@ -90,6 +193,7 @@ CanvasRenderingContext::CanvasRenderingContext(
  }
  
  void CanvasRenderingContext::Dispose() {
