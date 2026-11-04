@@ -1,0 +1,43 @@
+{
+  "chromium_tag": "156.0.8078.0",
+  "chromium_commit": "9ce0cc67aed57702fcfc011b9e49b0b02d7d5e3a",
+  "patches": [
+    "reach_canvas_frames",
+    "reach_video_commands",
+    "reach_webgl_commands"
+  ],
+  "files": {
+    "cc/paint/paint_image.h": "7e818da05699f025fcc91b2a4788de54f828a078498c8e22380cc1189b2fa5a4",
+    "cc/paint/paint_image_builder.cc": "85139d098b74646a72bf6fdf571e2fcd34d18197339f90f228e050238b20fad8",
+    "third_party/blink/renderer/bindings/scripts/bind_gen/interface.py": "b33175a4aac263038a4a781238a3207989ce2f4963215115d9313bfea9776ce8",
+    "third_party/blink/renderer/bindings/scripts/bind_gen/reach_webgl_test.py": null,
+    "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h": "367d2dee24900243a071a6a405ff26565185a467a77e17dc6dfcd390107fbba5",
+    "third_party/blink/renderer/core/html/canvas/html_canvas_element.cc": "32d08cf9c9fb5ef2574507578d445bb940d1b2d14ae9b1e55a97c04e8fbd94f0",
+    "third_party/blink/renderer/core/imagebitmap/image_bitmap.cc": "a829a0dd78d91b32df433704b2199120832f6980965a83a7ad78f99f475dfffd",
+    "third_party/blink/renderer/core/imagebitmap/image_bitmap.h": "794b4fafe1caa01cd5063307a7e76a26a5c7e0833f52f4df417191b60460b4b2",
+    "third_party/blink/renderer/core/paint/embedded_content_painter.cc": "2ae34252969ed00333b5f8fed8644fd1c7aff15d216a889de0f5844354133428",
+    "third_party/blink/renderer/core/paint/html_canvas_painter.cc": "62094df82a42e2988dea73588f6f71aa865a6b433912b55fa57039af8b468853",
+    "third_party/blink/renderer/core/paint/video_painter.cc": "f2ac643fdf2e4c88075a62bcdf6410b04060df6f55853a3e0c0dfb4c10b18bab",
+    "third_party/blink/renderer/core/paint/video_painter.h": "27000dd23873bca88128629497dbdf0870bc8852287e40f7cc04194fcba890dd",
+    "third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc": "10faac1c1e6e6764f9128561ee50d73dd89066c469ac29d1c937f073307b470b",
+    "third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.h": "c7b2ee9405b93014e65980d48bf9761f02db2f11d7d676c2845c2bbf97b7b72b",
+    "third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_test.cc": "599fa9c652b79c90edf3c7211f3dc4ad5250f3b062993f4c0357d24bfe46cab8",
+    "third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.cc": "964a439d175314cd58166ba7288cf08903ce748daf1b91d0a211ff6638f33120",
+    "third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.h": "0ccae20f72398f45c21efff03cab97dc65c788a72b4f9a0baaededf9446e398c",
+    "third_party/blink/renderer/modules/webgl/BUILD.gn": "7b7331a0593d02f933cf7b5cd3d0a09d1121547e555e7fdd8b64a47eec56fa7f",
+    "third_party/blink/renderer/modules/webgl/reach_webgl_call.h": null,
+    "third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc": null,
+    "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h": null,
+    "third_party/blink/renderer/modules/webgl/reach_webgl_pending.h": null,
+    "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc": "cdd4ad854c1af086de7b9dc7d5850b8a20e50490aa39a8b56be87fc4251b8d57",
+    "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h": "f16314b3aa39a1f4d190c1c47b8b6edef5c29b7c2b23d4d4320b62e06f30b628",
+    "third_party/blink/renderer/platform/BUILD.gn": "8a53b1e5684c309c0960942556ca59d5d5cbba416c5c891b6e4a612a3de19d6d",
+    "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc": "6129c27bd4ef9fe6de42235b2ff351899a36d22cb2c48a094ae47e7f1b853b1a",
+    "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h": "a0848e64577fb5df2c6dba19e593729b8fd1983969d5b58e2c91f81db0b0660c",
+    "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider_test.cc": "95602aea88ee61ce09e0dc9a64d8af9d704a9f942badedebeacf05f848ff4f7a",
+    "third_party/blink/renderer/platform/graphics/image_pattern.cc": "15d3ec39d87d836be670c4c7708f6c7f7c92dcfbfefd8f1bbe6b9932cee9408c",
+    "third_party/blink/renderer/platform/graphics/reach_image_bitmap_original.h": null,
+    "third_party/blink/renderer/platform/graphics/static_bitmap_image.cc": "c10f79fdd5eb8dbd1451ba72e6b17af9645d04d04d4c9a1529ef0a75b5817d76",
+    "third_party/blink/renderer/platform/graphics/static_bitmap_image.h": "719fc38fc2735147c447fd336b9030347736053a4aff6250b8c045e5536c9ba9"
+  }
+}

@@ -142,6 +142,31 @@ Native context destruction emits no final batch or change notification;
 weak-owner discovery can subsequently omit that stream. Client disposal needs
 coordinator-authoritative lifetime/inventory integration, never picture absence.
 
+## Reach native patch application
+
+```powershell
+python tests\run_reach_webgl_patch_test.py --fixture <unmodified-chromium>
+```
+
+The fixture must contain the unmodified files from Chromium
+`156.0.8078.0`, commit `9ce0cc67aed57702fcfc011b9e49b0b02d7d5e3a`.
+`reach_webgl_patch_baseline.json` pins SHA-256 identities for 26 upstream files
+and requires six Reach-introduced files to be absent, not empty placeholders.
+The identities were verified against that immutable Chromium commit; no
+network or fixture auto-update runs during testing.
+
+The runner copies verified inputs into its own `.artifacts` checkout, then
+executes the actual production reset script and patcher. It preserves the
+configured Canvas/Video/WebGL order and verifies omitted preceding patches do
+not touch these 32 paths. It checks clean application, creation of all six new
+files, exact final WebGL blob identities, strict forward/reverse application,
+already-applied detection, and incremental reset/reapplication with unchanged
+file timestamps. The input fixture is never changed; no CEF build runs.
+Passing `--baseline 4b3275a79064727003c59cc5958894e16d0c8f99` reproduces the
+four missing-file failures caused by treating introduced files as modifications
+of pre-existing empty files. Cached-index-only checks against such placeholders
+do not establish application on the real Chromium baseline.
+
 ## Shared Code
 
 ### [shared](shared/)
