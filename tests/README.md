@@ -42,6 +42,21 @@ Automated unit test suite for CEF API validation.
 - **Coverage:** Comprehensive CEF API testing across all platforms
 - **Best for:** CI/CD integration, validating CEF releases
 
+## Reach live WebGL pending delivery
+
+`python tests\run_reach_webgl_pending_test.py --compiler cl` runs the portable
+queue regression from a Visual Studio developer shell. On Linux, use
+`python3 tests/run_reach_webgl_pending_test.py --compiler c++`. The test extracts
+the production header from `reach_webgl_commands.patch`; it does not build CEF.
+It covers 150,000 commands with applied-prefix retirement, non-destructive
+reads, duplicate/delayed/future/unread/unsent/stale-generation acknowledgements,
+original-byte delivery budgeting and the shared 256 MiB pending-memory bound.
+Marking a sent prefix is separate from application and does not release memory.
+
+These are queue tests, not browser pixel, source-cookie isolation, renderer IPC
+or reload/context-loss qualification. Full CEF builds remain on the canonical
+build VM. Pending delivery is not a reconstruction checkpoint.
+
 ## Shared Code
 
 ### [shared](shared/)

@@ -243,16 +243,17 @@ index db92058..c703baa 100644
  class LayoutVideo;
  struct PaintInfo;
 diff --git third_party/blink/renderer/modules/webgl/BUILD.gn third_party/blink/renderer/modules/webgl/BUILD.gn
-index d611207..e7b0902 100644
+index d611207..70a6606 100644
 --- third_party/blink/renderer/modules/webgl/BUILD.gn
 +++ third_party/blink/renderer/modules/webgl/BUILD.gn
-@@ -7,6 +7,9 @@ import("//ui/gl/features.gni")
+@@ -7,6 +7,10 @@ import("//ui/gl/features.gni")
  
  blink_modules_sources("webgl") {
    sources = [
 +    "reach_webgl_call.h",
 +    "reach_webgl_journal.cc",
 +    "reach_webgl_journal.h",
++    "reach_webgl_pending.h",
      "angle_instanced_arrays.cc",
      "angle_instanced_arrays.h",
      "ext_blend_min_max.cc",
@@ -369,10 +370,10 @@ index 0000000..6a04ffa
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 new file mode 100644
-index 0000000..8787a5a
+index 0000000..c0b47b7
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,460 @@
+@@ -0,0 +1,564 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -393,10 +394,7 @@ index 0000000..8787a5a
 +namespace {
 +
 +constexpr uint64_t kJournalBit = uint64_t{1} << 63;
-+constexpr size_t kMaxJournalBytes = 64 * 1024 * 1024;
-+constexpr size_t kMaxRetainedBytes = 256 * 1024 * 1024;
 +constexpr size_t kMaxCommandBytes = 4 * 1024 * 1024;
-+constexpr size_t kMaxCommands = 100000;
 +constexpr uint32_t kMaxObjects = 65536;
 +
 +using Journals = std::map<uint64_t, WeakPersistent<WebGLRenderingContextBase>>;
@@ -410,6 +408,9 @@ index 0000000..8787a5a
 +  static std::atomic_size_t bytes{0};
 +  return bytes;
 +}
++
++void (*change_callback)(HTMLCanvasElement*) = nullptr;
++std::string (*original_hasher)(base::span<const uint8_t>) = nullptr;
 +
 +uint64_t NextId() {
 +  uint64_t id;
@@ -427,7 +428,8 @@ index 0000000..8787a5a
 +                   ? static_cast<HTMLCanvasElement*>(context.Host())
 +                   : nullptr),
 +      id_(NextId()),
-+      generation_(context.GetContextGeneration()) {
++      generation_(context.GetContextGeneration()),
++      commands_(RetainedBytes(), generation_) {
 +  auto& journals = Registry();
 +  for (auto it = journals.begin(); it != journals.end();) {
 +    auto* owner = it->second.Get();
@@ -458,7 +460,7 @@ index 0000000..8787a5a
 +}
 +
 +ReachWebGLJournal::~ReachWebGLJournal() {
-+  RetainedBytes().fetch_sub(bytes_, std::memory_order_relaxed);
++  RetainedBytes().fetch_sub(original_bytes_, std::memory_order_relaxed);
 +}
 +
 +HTMLCanvasElement* ReachWebGLJournal::element() const {
@@ -475,6 +477,25 @@ index 0000000..8787a5a
 +             : nullptr;
 +}
 +
++std::vector<ReachWebGLJournal*> ReachWebGLJournal::Current() {
++  std::vector<ReachWebGLJournal*> result;
++  for (const auto& [id, owner] : Registry()) {
++    if (auto* journal = Find(id))
++      result.push_back(journal);
++  }
++  return result;
++}
++
++void ReachWebGLJournal::SetChangeCallback(
++    void (*callback)(HTMLCanvasElement*)) {
++  change_callback = callback;
++}
++
++void ReachWebGLJournal::SetOriginalHasher(
++    std::string (*hasher)(base::span<const uint8_t>)) {
++  original_hasher = hasher;
++}
++
 +bool ReachWebGLJournal::ShouldRecord(std::string_view name) {
 +  if (name == "getUniformLocation" || name == "getUniformBlockIndex")
 +    return true;
@@ -485,6 +506,14 @@ index 0000000..8787a5a
 +void ReachWebGLJournal::Fail(std::string_view error) {
 +  if (error_.empty())
 +    error_ = error;
++  NotifyChange();
++}
++
++void ReachWebGLJournal::NotifyChange() {
++  if (change_callback && element_ && !change_pending_) {
++    change_pending_ = true;
++    change_callback(element_.Get());
++  }
 +}
 +
 +base::Value ReachWebGLJournal::Bytes(ReachWebGLCommand& command,
@@ -543,6 +572,42 @@ index 0000000..8787a5a
 +void ReachWebGLJournal::RejectTextureUpload(std::string_view error) {
 +  if (HasTextureSource())
 +    pending_->error = error;
++}
++
++void ReachWebGLJournal::OriginalTexture(base::ListValue args,
++                                         sk_sp<const SkData> encoded,
++                                         int width,
++                                         int height) {
++  if (!HasTextureSource())
++    return;
++  if (!encoded || encoded->isEmpty() || !original_hasher ||
++      encoded->size() > kMaxOriginalBytes ||
++      width <= 0 || height <= 0 || width > 4096 || height > 4096) {
++    RejectTextureUpload("WebGL original encoded image unavailable or too large");
++    return;
++  }
++  const auto* op = pending_->value.FindString("op");
++  if (!op || pending_->error !=
++                 *op + ": WebGL source argument requires command transport")
++    return;
++  const auto* begin = static_cast<const uint8_t*>(encoded->data());
++  const auto hash =
++      original_hasher(UNSAFE_BUFFERS(base::span(begin, encoded->size())));
++  if (hash.size() != 64) {
++    RejectTextureUpload("WebGL original image digest unavailable");
++    return;
++  }
++  base::DictValue reference;
++  reference.Set("image", hash);
++  reference.Set("length", static_cast<double>(encoded->size()));
++  reference.Set("width", width);
++  reference.Set("height", height);
++  args.Append(std::move(reference));
++  pending_->value.Set("args", std::move(args));
++  pending_->original = std::move(encoded);
++  pending_->original_hash = hash;
++  pending_->error.clear();
++  pending_->texture_source = false;
 +}
 +
 +void ReachWebGLJournal::TextureUpload(base::ListValue args,
@@ -613,7 +678,15 @@ index 0000000..8787a5a
 +
 +uint32_t ReachWebGLJournal::CreateIdentity(ReachWebGLCommand& command,
 +                                           const ScriptWrappable* object) {
-+  if (next_identity_ > kMaxObjects) {
++  if (identities_.size() >= kMaxObjects) {
++    for (auto it = identities_.begin(); it != identities_.end();) {
++      if (!it->second.object)
++        it = identities_.erase(it);
++      else
++        ++it;
++    }
++  }
++  if (!next_identity_ || identities_.size() >= kMaxObjects) {
 +    command.error = "WebGL object identity budget exceeded";
 +    return 0;
 +  }
@@ -734,21 +807,31 @@ index 0000000..8787a5a
 +    return;
 +  }
 +  auto json = base::WriteJson(command.value);
-+  if (!json || json->size() > kMaxCommandBytes ||
-+      commands_.size() >= kMaxCommands ||
-+      json->size() > kMaxJournalBytes - bytes_) {
-+    Fail("WebGL command journal budget exceeded");
++  if (!json || json->size() > kMaxCommandBytes) {
++    Fail("WebGL command delivery size exceeded");
 +    return;
 +  }
-+  const size_t previous =
-+      RetainedBytes().fetch_add(json->size(), std::memory_order_relaxed);
-+  if (previous > kMaxRetainedBytes - json->size()) {
-+    RetainedBytes().fetch_sub(json->size(), std::memory_order_relaxed);
-+    Fail("Combined WebGL command journal budget exceeded");
-+    return;
++  if (command.original && !originals_.contains(command.original_hash)) {
++    const size_t charge = command.original->size() + 256;
++    size_t previous = RetainedBytes().load();
++    do {
++      if (previous > ReachWebGLPending::kLimit - charge) {
++        Fail("Combined WebGL pending original budget exceeded");
++        return;
++      }
++    } while (!RetainedBytes().compare_exchange_weak(previous, previous + charge));
++    original_bytes_ += charge;
++    originals_.emplace(command.original_hash,
++                       Original{command.original, commands_.next() + 1});
 +  }
-+  bytes_ += json->size();
-+  commands_.push_back(std::move(*json));
++  const std::string error = commands_.Append(
++      std::move(*json), command.original ? command.original->size() : 0);
++  if (error.empty() && command.original)
++    originals_.at(command.original_hash).last_next = commands_.next();
++  if (!error.empty())
++    Fail(error);
++  else
++    NotifyChange();
 +}
 +
 +void ReachWebGLJournal::Resize(int width, int height) {
@@ -779,10 +862,11 @@ index 0000000..8787a5a
 +  if (!attributes)
 +    return {};
 +  base::DictValue state;
-+  state.Set("webgl", 1);
++  state.Set("webgl", 2);
 +  state.Set("id", element_->GetDomNodeId());
-+  state.Set("journal", base::NumberToString(id_));
-+  state.Set("seq", base::NumberToString(commands_.size()));
++  state.Set("stream", base::NumberToString(id_));
++  state.Set("generation", base::NumberToString(generation_));
++  state.Set("seq", base::NumberToString(commands_.next()));
 +  state.Set("version", context_->IsWebGL2() ? 2 : 1);
 +  state.Set("width", context_->drawingBufferWidth());
 +  state.Set("height", context_->drawingBufferHeight());
@@ -804,41 +888,62 @@ index 0000000..8787a5a
 +
 +std::string ReachWebGLJournal::Read(uint64_t cursor,
 +                                    size_t max_bytes,
-+                                    std::vector<uint8_t>* output) const {
-+  if (!usable() || cursor > commands_.size() || max_bytes <= 256)
-+    return "WebGL command journal unavailable or cursor invalid";
-+  size_t end = static_cast<size_t>(cursor);
-+  size_t bytes = 0;
-+  while (end < commands_.size() &&
-+         commands_[end].size() + 1 <= max_bytes - 256 - bytes) {
-+    bytes += commands_[end].size() + 1;
-+    ++end;
-+  }
-+  if (end == cursor && cursor < commands_.size())
-+    return "WebGL command does not fit the bounded journal response";
-+  std::string json = "{\"webgl\":1,\"journal\":\"" + base::NumberToString(id_) +
++                                    std::vector<uint8_t>* output,
++                                    std::map<std::string,
++                                             std::vector<uint8_t>>* originals) {
++  if (!usable() || max_bytes <= 256)
++    return "WebGL command delivery unavailable or cursor invalid";
++  uint64_t end = cursor;
++  std::string commands;
++  std::string error =
++      commands_.Read(generation_, cursor, max_bytes - 256, &commands, &end);
++  if (!error.empty())
++    return error;
++  std::string json = "{\"version\":2,\"stream\":\"" + base::NumberToString(id_) +
++                     "\",\"generation\":\"" + base::NumberToString(generation_) +
 +                     "\",\"from\":\"" + base::NumberToString(cursor) +
 +                     "\",\"next\":\"" + base::NumberToString(end) +
-+                     "\",\"commands\":[";
-+  for (size_t index = static_cast<size_t>(cursor); index < end; ++index) {
-+    if (index != cursor)
-+      json += ',';
-+    json += commands_[index];
-+  }
-+  json += "]}";
++                     "\",\"commands\":" + commands + "}";
 +  if (json.size() > max_bytes)
 +    return "WebGL command response exceeds its byte budget";
++  for (const auto& [hash, original] : originals_) {
++    if (commands.find("\"image\":\"" + hash + "\"") == std::string::npos)
++      continue;
++    const auto* begin = static_cast<const uint8_t*>(original.data->data());
++    originals->emplace("image:" + hash,
++        UNSAFE_BUFFERS(std::vector<uint8_t>(
++            begin, begin + original.data->size())));
++  }
 +  output->assign(json.begin(), json.end());
++  return {};
++}
++
++std::string ReachWebGLJournal::Applied(uint64_t generation, uint64_t through) {
++  if (!usable() || generation != generation_)
++    return "WebGL applied generation is stale or unavailable";
++  const auto error = commands_.Applied(generation, through);
++  if (!error.empty())
++    return error;
++  for (auto it = originals_.begin(); it != originals_.end();) {
++    if (it->second.last_next <= through) {
++      const size_t charge = it->second.data->size() + 256;
++      original_bytes_ -= charge;
++      RetainedBytes().fetch_sub(charge);
++      it = originals_.erase(it);
++    } else {
++      ++it;
++    }
++  }
 +  return {};
 +}
 +
 +}  // namespace blink
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.h third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
 new file mode 100644
-index 0000000..b17ee02
+index 0000000..ad918e9
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,258 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +
@@ -858,10 +963,12 @@ index 0000000..b17ee02
 +#include "third_party/blink/renderer/modules/modules_export.h"
 +#include "third_party/blink/renderer/modules/webgl/webgl_extension.h"
 +#include "third_party/blink/renderer/modules/webgl/webgl_object.h"
++#include "third_party/blink/renderer/modules/webgl/reach_webgl_pending.h"
 +#include "third_party/blink/renderer/modules/webgl/webgl_uniform_location.h"
 +#include "third_party/blink/renderer/platform/bindings/exception_state.h"
 +#include "third_party/blink/renderer/platform/heap/persistent.h"
 +#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
++#include "third_party/skia/include/core/SkData.h"
 +
 +namespace v8 {
 +class Isolate;
@@ -879,6 +986,8 @@ index 0000000..b17ee02
 +  std::string error;
 +  size_t input_bytes = 0;
 +  bool texture_source = false;
++  std::string original_hash;
++  sk_sp<const SkData> original;
 +};
 +
 +class MODULES_EXPORT ReachWebGLJournal final {
@@ -902,18 +1011,31 @@ index 0000000..b17ee02
 +  };
 +
 +  explicit ReachWebGLJournal(WebGLRenderingContextBase&);
++  static constexpr size_t kMaxOriginalBytes = 8 * 1024 * 1024 - 1024;
 +  ~ReachWebGLJournal();
 +
 +  static ReachWebGLJournal* Find(uint64_t);
++  static std::vector<ReachWebGLJournal*> Current();
++  static void SetChangeCallback(void (*callback)(HTMLCanvasElement*));
++  static void SetOriginalHasher(
++      std::string (*hasher)(base::span<const uint8_t>));
 +  static bool ShouldRecord(std::string_view);
 +  bool usable() const { return error_.empty(); }
 +  const std::string& error() const { return error_; }
 +  uint64_t generation() const { return generation_; }
++  uint64_t retired() const { return commands_.retired(); }
++  void ClearChangeNotification() { change_pending_ = false; }
 +  HTMLCanvasElement* element() const;
 +  std::string State();
 +  std::string Read(uint64_t cursor,
 +                   size_t max_bytes,
-+                   std::vector<uint8_t>* output) const;
++                   std::vector<uint8_t>* output,
++                   std::map<std::string, std::vector<uint8_t>>* originals);
++  std::string Applied(uint64_t generation, uint64_t through);
++  std::string Sent(uint64_t generation, uint64_t through) {
++    return usable() ? commands_.Sent(generation, through)
++                    : "WebGL sent stream is unavailable";
++  }
 +  void Append(ReachWebGLCommand);
 +  void Resize(int width, int height);
 +  void Discard();
@@ -927,6 +1049,10 @@ index 0000000..b17ee02
 +  }
 +  void TextureUpload(base::ListValue, unsigned, base::span<const uint8_t>);
 +  void RejectTextureUpload(std::string_view);
++  void OriginalTexture(base::ListValue,
++                       sk_sp<const SkData>,
++                       int width,
++                       int height);
 +
 +  template <typename T>
 +  void Argument(ReachWebGLCommand& command,
@@ -947,6 +1073,10 @@ index 0000000..b17ee02
 +    WeakPersistent<const ScriptWrappable> object;
 +    uint32_t id;
 +  };
++  struct Original {
++    sk_sp<const SkData> data;
++    uint64_t last_next;
++  };
 +
 +  base::Value Bytes(ReachWebGLCommand&,
 +                    std::string_view,
@@ -955,6 +1085,7 @@ index 0000000..b17ee02
 +  base::Value Reference(ReachWebGLCommand&, const ScriptWrappable*);
 +  uint32_t CreateIdentity(ReachWebGLCommand&, const ScriptWrappable*);
 +  void Fail(std::string_view);
++  void NotifyChange();
 +
 +  template <typename T>
 +  base::Value Encode(ReachWebGLCommand& command, const T& value) {
@@ -1061,16 +1192,18 @@ index 0000000..b17ee02
 +  const uint64_t generation_;
 +  std::map<const ScriptWrappable*, Identity> identities_;
 +  uint32_t next_identity_ = 1;
-+  std::vector<std::string> commands_;
-+  size_t bytes_ = 0;
++  ReachWebGLPending commands_;
++  std::map<std::string, Original> originals_;
++  size_t original_bytes_ = 0;
 +  std::string error_;
 +  ReachWebGLCommand* pending_ = nullptr;
++  bool change_pending_ = false;
 +};
 +
 +}  // namespace blink
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index b17f336..87b7661 100644
+index b17f336..466da10 100644
 --- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -44,6 +44,8 @@
@@ -1135,7 +1268,20 @@ index b17f336..87b7661 100644
      return extension;
    }
  
-@@ -5747,6 +5767,52 @@ void WebGLRenderingContextBase::TexImageSkImage(TexImageParams params,
+@@ -5609,6 +5629,12 @@ void WebGLRenderingContextBase::GetCurrentUnpackState(TexImageParams& params) {
+ void WebGLRenderingContextBase::TexImageSkImage(TexImageParams params,
+                                                 sk_sp<SkImage> image) {
+   const char* func_name = GetTexImageFunctionName(params.function_id);
++  if (reach_journal_ && reach_journal_->HasTextureSource() &&
++      image->refEncodedData()) {
++    reach_journal_->RejectTextureUpload(
++        "WebGL encoded non-element source requires explicit original "
++        "transform metadata");
++  }
+ 
+   bool selecting_sub_rectangle = false;
+   if (!ValidateTexImageSubRectangle(params, image.get(),
+@@ -5747,6 +5773,52 @@ void WebGLRenderingContextBase::TexImageSkImage(TexImageParams params,
      params.height = pixmap.height();
    if (!params.depth)
      params.depth = 1;
@@ -1188,7 +1334,60 @@ index b17f336..87b7661 100644
    TexImageBase(params, gl_data);
  }
  
-@@ -9266,6 +9332,7 @@ void WebGLRenderingContextBase::SynthesizeGLError(
+@@ -6192,6 +6264,52 @@ void WebGLRenderingContextBase::TexImageHelperHTMLImageElement(
+     SynthesizeGLError(GL_INVALID_VALUE, func_name, "bad image data");
+     return;
+   }
++  if (reach_journal_ && reach_journal_->HasTextureSource()) {
++    // Keep original encoded bytes for ordinary image-element uploads. Variants
++    // requiring reconstruction must fail explicitly, never become copied RGBA.
++    if (have_svg_image || !image_for_render->HasDefaultOrientation() ||
++        image_for_render->MaybeAnimated() || params.width || params.height ||
++        params.depth || params.unpack_skip_pixels || params.unpack_skip_rows ||
++        params.unpack_skip_images || params.unpack_image_height ||
++        unpack_row_length_ ||
++        unpack_color_space_ != PredefinedColorSpace::kSRGB ||
++        (params.function_id != kTexImage2D &&
++         params.function_id != kTexSubImage2D)) {
++      reach_journal_->RejectTextureUpload(
++          "WebGL original image crop, orientation, animation, or color space "
++          "requires explicit source reconstruction");
++    } else {
++      sk_sp<SkData> encoded;
++      if (image_for_render->HasData() &&
++          image_for_render->DataSize() <=
++              ReachWebGLJournal::kMaxOriginalBytes) {
++        const auto original = image_for_render->Data();
++        if (original && !original->empty() &&
++            original->size() <= ReachWebGLJournal::kMaxOriginalBytes) {
++          encoded = SkData::MakeUninitialized(original->size());
++          if (!original->GetBytes(UNSAFE_BUFFERS(base::span(
++                  static_cast<uint8_t*>(encoded->writable_data()),
++                  encoded->size())))) {
++            encoded.reset();
++          }
++        }
++      }
++      base::ListValue args;
++      args.Append(static_cast<int>(params.target));
++      args.Append(params.level);
++      if (params.function_id == kTexImage2D) {
++        args.Append(static_cast<int>(params.internalformat));
++      } else {
++        args.Append(params.xoffset);
++        args.Append(params.yoffset);
++      }
++      args.Append(static_cast<int>(params.format));
++      args.Append(static_cast<int>(params.type));
++      reach_journal_->OriginalTexture(
++          std::move(args), std::move(encoded), image_for_render->width(),
++          image_for_render->height());
++    }
++  }
+   TexImageSkImage(params, std::move(sk_image));
+ }
+ 
+@@ -9266,6 +9384,7 @@ void WebGLRenderingContextBase::SynthesizeGLError(
      const char* function_name,
      const char* description,
      ConsoleDisplayPreference display) {
@@ -1270,3 +1469,132 @@ index 2cb58aa..4873818 100644
    bool IsValid() const { return IsReachCommandMode() || GetSkSurface(); }
    void SetDelegate(CanvasResourceProviderDelegate* delegate) {
      delegate_ = delegate;
+diff --git third_party/blink/renderer/modules/webgl/reach_webgl_pending.h third_party/blink/renderer/modules/webgl/reach_webgl_pending.h
+new file mode 100644
+index 0000000..923c356
+--- /dev/null
++++ third_party/blink/renderer/modules/webgl/reach_webgl_pending.h
+@@ -0,0 +1,123 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
++
++#include <algorithm>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <iterator>
++#include <limits>
++#include <list>
++#include <string>
++#include <utility>
++
++namespace blink {
++
++// Delivery state only. This is deliberately not a reconstruction checkpoint.
++class ReachWebGLPending final {
++ public:
++  static constexpr size_t kLimit = 256 * 1024 * 1024;
++  explicit ReachWebGLPending(std::atomic_size_t& aggregate,
++                            uint64_t generation = 0)
++      : aggregate_(aggregate), generation_(generation) {}
++  ReachWebGLPending(const ReachWebGLPending&) = delete;
++  ReachWebGLPending& operator=(const ReachWebGLPending&) = delete;
++  ~ReachWebGLPending() { aggregate_.fetch_sub(bytes_); }
++
++  std::string Append(std::string command, size_t delivery_bytes = 0) {
++    if (next_ == std::numeric_limits<uint64_t>::max())
++      return "WebGL absolute sequence exhausted";
++    // Include node/string storage; never charge only a context's payload.
++    const size_t overhead = sizeof(Entry) + 2 * sizeof(void*) + 1;
++    if (command.capacity() > kLimit - overhead)
++      return "Combined WebGL pending delivery budget exceeded";
++    const size_t charge = command.capacity() + overhead;
++    size_t previous = aggregate_.load();
++    do {
++      if (previous > kLimit - charge)
++        return "Combined WebGL pending delivery budget exceeded";
++    } while (!aggregate_.compare_exchange_weak(previous, previous + charge));
++    commands_.push_back({std::move(command), delivery_bytes});
++    bytes_ += charge;
++    ++next_;
++    return {};
++  }
++
++  std::string Read(uint64_t generation,
++                   uint64_t cursor,
++                   size_t max_bytes,
++                   std::string* commands,
++                   uint64_t* end) {
++    if (generation != generation_)
++      return "WebGL read generation is stale";
++    if (cursor < retired_ || cursor > read_through_ || max_bytes <= 2)
++      return "WebGL cursor is retired, future, or skips an unread prefix";
++    auto it = commands_.begin();
++    std::advance(it, cursor - retired_);
++    *commands = "[";
++    *end = cursor;
++    size_t delivery = 0;
++    for (; it != commands_.end(); ++it) {
++      const size_t separator = *end == cursor ? 0 : 1;
++      if (it->value.size() + separator + 1 + it->delivery_bytes >
++          max_bytes - commands->size() - delivery)
++        break;
++      if (separator)
++        *commands += ',';
++      *commands += it->value;
++      delivery += it->delivery_bytes;
++      ++*end;
++    }
++    if (*end == cursor && cursor < next_)
++      return "WebGL command does not fit the bounded response";
++    *commands += ']';
++    read_through_ = std::max(read_through_, *end);
++    return {};
++  }
++
++  std::string Sent(uint64_t generation, uint64_t through) {
++    if (generation != generation_)
++      return "WebGL sent generation is stale";
++    if (through > read_through_)
++      return "WebGL sent prefix is future or unread";
++    sent_through_ = std::max(sent_through_, through);
++    return {};
++  }
++
++  std::string Applied(uint64_t generation, uint64_t through) {
++    if (generation != generation_)
++      return "WebGL applied generation is stale";
++    if (through > sent_through_)
++      return "WebGL applied prefix is future or unsent";
++    while (retired_ < through) {
++      const auto& command = commands_.front().value;
++      const size_t charge = command.capacity() + sizeof(Entry) +
++                            2 * sizeof(void*) + 1;
++      bytes_ -= charge;
++      aggregate_.fetch_sub(charge);
++      commands_.pop_front();
++      ++retired_;
++    }
++    return {};
++  }
++
++  uint64_t next() const { return next_; }
++  uint64_t retired() const { return retired_; }
++
++ private:
++  struct Entry {
++    std::string value;
++    size_t delivery_bytes;
++  };
++  std::atomic_size_t& aggregate_;
++  const uint64_t generation_;
++  std::list<Entry> commands_;
++  size_t bytes_ = 0;
++  uint64_t retired_ = 0;
++  uint64_t next_ = 0;
++  uint64_t read_through_ = 0;
++  uint64_t sent_through_ = 0;
++};
++
++}  // namespace blink
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_

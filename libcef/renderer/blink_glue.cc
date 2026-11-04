@@ -208,6 +208,144 @@ void SetDrawingFrameRequestCallback(
   blink::ReachMediaJournal::Enable(&OnFrameRequested);
 }
 
+namespace {
+
+std::function<void(blink::WebLocalFrame*)>& WebGlChangeCallback() {
+  static base::NoDestructor<std::function<void(blink::WebLocalFrame*)>> callback;
+  return *callback;
+}
+
+void OnWebGlChanged(blink::HTMLCanvasElement* element) {
+  auto* frame = element ? element->GetDocument().GetFrame() : nullptr;
+  if (!frame || !frame->IsAttached())
+    return;
+  auto& root = frame->LocalFrameRoot();
+  if (WebGlChangeCallback()) {
+    if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
+      WebGlChangeCallback()(web_frame);
+  }
+}
+
+bool WebGlDecimal(const std::string& text, uint64_t* value) {
+  return !text.empty() && text.size() <= 20 &&
+         base::StringToUint64(text, value) &&
+         base::NumberToString(*value) == text;
+}
+
+}  // namespace
+
+void SetWebGlChangeCallback(
+    std::function<void(blink::WebLocalFrame*)> callback) {
+  if (!blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode())
+    return;
+  WebGlChangeCallback() = std::move(callback);
+  blink::ReachWebGLJournal::SetChangeCallback(&OnWebGlChanged);
+  blink::ReachWebGLJournal::SetOriginalHasher(
+      [](base::span<const uint8_t> bytes) {
+        return sk_reach::Hex(crypto::hash::Sha256(std::string_view(
+            reinterpret_cast<const char*>(bytes.data()), bytes.size())));
+      });
+}
+
+std::string WebGlRequest(
+    blink::WebLocalFrame* web_frame,
+    const std::string& operation,
+    const std::string& document,
+    const std::string& stream,
+    const std::string& generation,
+    const std::string& position,
+    int max_bytes,
+    std::vector<uint8_t>* output,
+    std::map<std::string, std::vector<uint8_t>>* originals) {
+  auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
+  if (!frame || !frame->IsAttached() || !frame->GetDocument() ||
+      !blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode()) {
+    return "WebGL request frame is detached or disabled";
+  }
+  if (operation != "Reach.WebGlStreams.v2" &&
+      operation != "Reach.WebGlTick.v2" &&
+      frame->GetDocument()->Token().ToString() != document) {
+    return "WebGL native document identity is stale";
+  }
+  auto owned = [frame](blink::ReachWebGLJournal* journal) {
+    auto* element = journal ? journal->element() : nullptr;
+    auto* owner = element ? element->GetDocument().GetFrame() : nullptr;
+    return owner && owner->IsAttached() &&
+           owner->GetDocument() == &element->GetDocument() &&
+           &owner->LocalFrameRoot() == frame;
+  };
+  // Command mode holds compositor begin frames. Service animation script
+  // explicitly without capturing a picture or enabling compositor raster.
+  blink::Persistent<blink::LocalFrame> retained_frame = frame;
+  if (operation == "Reach.WebGlTick.v2") {
+    blink::Persistent<blink::Document> document = frame->GetDocument();
+    blink::Persistent<blink::Page> page = frame->GetPage();
+    if (!page || !frame->View())
+      return "WebGL animation frame is unavailable";
+    static_cast<blink::scheduler::MainThreadSchedulerImpl&>(
+        blink::scheduler::WebThreadScheduler::MainThreadScheduler())
+        .BeginFrameNotExpectedSoon();
+    page->Animator().ServiceScriptedAnimations(base::TimeTicks::Now());
+    if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
+        frame->GetPage() != page.Get() || !frame->View())
+      return "WebGL animation document changed";
+    page->Animator().UpdateAllLifecyclePhasesExceptPaint(
+        *frame, blink::DocumentUpdateReason::kInspector);
+    if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
+        frame->GetPage() != page.Get() || !frame->View())
+      return "WebGL animation document changed";
+  }
+  if (operation == "Reach.WebGlStreams.v2" ||
+      operation == "Reach.WebGlTick.v2") {
+    std::string json = "{\"document\":\"" +
+                       frame->GetDocument()->Token().ToString() +
+                       "\",\"streams\":[";
+    bool first = true;
+    for (auto* journal : blink::ReachWebGLJournal::Current()) {
+      if (!owned(journal))
+        continue;
+      journal->ClearChangeNotification();
+      const auto state = journal->State();
+      if (state.empty())
+        return "WebGL stream is unavailable: " + journal->error();
+      if (!first)
+        json += ',';
+      first = false;
+      json += "{\"state\":" + state + ",\"retired\":\"" +
+              base::NumberToString(journal->retired()) + "\"}";
+    }
+    json += "]}";
+    output->assign(json.begin(), json.end());
+    return {};
+  }
+  uint64_t id = 0, context_generation = 0, cursor = 0;
+  if (!WebGlDecimal(stream, &id) ||
+      !WebGlDecimal(generation, &context_generation) ||
+      !WebGlDecimal(position, &cursor)) {
+    return "Invalid WebGL stream identity or sequence";
+  }
+  auto* journal = blink::ReachWebGLJournal::Find(id);
+  if (!owned(journal) || journal->generation() != context_generation)
+    return "WebGL stream unavailable or generation stale";
+  if (operation == "Reach.WebGlApplied.v2" ||
+      operation == "Reach.WebGlSent.v2") {
+    const auto error = operation == "Reach.WebGlApplied.v2"
+                           ? journal->Applied(context_generation, cursor)
+                           : journal->Sent(context_generation, cursor);
+    if (!error.empty())
+      return error;
+    const std::string json = "{\"stream\":\"" + stream +
+                             "\",\"generation\":\"" + generation +
+                             "\",\"through\":\"" + position + "\"}";
+    output->assign(json.begin(), json.end());
+    return {};
+  }
+  if (operation != "Reach.WebGlRead.v2" || max_bytes <= 256 ||
+      max_bytes > 8 * 1024 * 1024)
+    return "Invalid WebGL read budget";
+  return journal->Read(cursor, static_cast<size_t>(max_bytes), output, originals);
+}
+
 std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
                                     const std::string& journal_id,
                                     const std::string& cursor_text,
@@ -224,12 +362,7 @@ std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
     return "Invalid media journal request";
   }
   if (id & (uint64_t{1} << 63)) {
-    auto* journal = blink::ReachWebGLJournal::Find(id);
-    auto* element = journal ? journal->element() : nullptr;
-    auto* owner = element ? element->GetDocument().GetFrame() : nullptr;
-    if (!owner || !owner->IsAttached() || &owner->LocalFrameRoot() != frame)
-      return "WebGL journal unavailable";
-    return journal->Read(cursor, static_cast<size_t>(max_bytes), out);
+    return "WebGL streams require the distinct v2 live API";
   }
   auto* journal = blink::ReachMediaJournal::Find(id);
   auto* element = journal ? journal->element() : nullptr;

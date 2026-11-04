@@ -96,6 +96,18 @@ GetDrawingFrameInfo(blink::WebLocalFrame* frame, bool raster = false);
 // update, then again only after that root's next drawing-command capture.
 BLINK_EXPORT void SetDrawingFrameRequestCallback(
     std::function<void(blink::WebLocalFrame*)> callback);
+BLINK_EXPORT void SetWebGlChangeCallback(
+    std::function<void(blink::WebLocalFrame*)> callback);
+BLINK_EXPORT std::string WebGlRequest(
+    blink::WebLocalFrame* frame,
+    const std::string& operation,
+    const std::string& document,
+    const std::string& stream,
+    const std::string& generation,
+    const std::string& position,
+    int max_bytes,
+    std::vector<uint8_t>* output,
+    std::map<std::string, std::vector<uint8_t>>* originals);
 
 // Resolves where input at (x, y) (or keyboard input) lands. When it lands in
 // |frame| itself and |apply| is set, |apply| dispatches the input in the same
