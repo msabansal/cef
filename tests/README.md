@@ -52,6 +52,12 @@ It covers 150,000 commands with applied-prefix retirement, non-destructive
 reads, duplicate/delayed/future/unread/unsent/stale-generation acknowledgements,
 original-byte delivery budgeting and the shared 256 MiB pending-memory bound.
 Marking a sent prefix is separate from application and does not release memory.
+The UTF-16 bound test instantiates both Blink-equivalent 32-bit length/index
+signatures and the standard library's native-width string, including escaped
+text, surrogate pairs and unpaired surrogates. Add
+`--clang-tidy <clang-tidy>` to run Clang's `-Wshorten-64-to-32` diagnostics as
+errors before compilation. With the current test, `--baseline dd13d76c5`
+reproduces the native Blink-index narrowing failure.
 It also slices a 20 MiB command and 12 MiB original into at most 96 KiB
 pieces, rejecting byte gaps/stale generations/future cursors and preserving
 active read progress across retries of older commands. Neither sent nor applied

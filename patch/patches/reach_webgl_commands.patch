@@ -1636,7 +1636,7 @@ index 0000000..9ed0ad2
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_pending.h third_party/blink/renderer/modules/webgl/reach_webgl_pending.h
 new file mode 100644
-index 0000000..da5b78d
+index 0000000..6d4db0f
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_pending.h
 @@ -0,0 +1,258 @@
@@ -1720,7 +1720,7 @@ index 0000000..da5b78d
 +  template <typename Text>
 +  static size_t JSONStringBound(const Text& value) {
 +    size_t size = 2;
-+    for (size_t i = 0; i < value.length(); ++i) {
++    for (decltype(value.length()) i = 0; i < value.length(); ++i) {
 +      const uint32_t c = value[i];
 +      size_t add = c <= 0x7f ? 1 : c <= 0x7ff ? 2 : 3;
 +      if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t' ||

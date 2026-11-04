@@ -8,6 +8,9 @@ import subprocess
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", default="c++")
+    parser.add_argument("--clang-tidy",
+                        help="Also reject Chromium's 64-to-32 narrowing "
+                             "diagnostics with this Clang frontend.")
     parser.add_argument("--baseline",
                         help="Read the native patch from this Git revision "
                              "(the oversized-command regression must fail).")
@@ -32,6 +35,13 @@ def main():
     ) + "\n"
     (output / "reach_webgl_pending.h").write_text(header, encoding="utf-8")
     source = root / "tests" / "reach_webgl_pending_test.cc"
+    if args.clang_tidy:
+        subprocess.run([
+            args.clang_tidy, str(source),
+            "-checks=-*,clang-diagnostic-*,clang-analyzer-core.CallAndMessage",
+            "-header-filter=.*", "-warnings-as-errors=*", "--", "-std=c++20",
+            "-Werror", "-Wshorten-64-to-32", "-I" + str(output),
+        ], cwd=root, check=True)
     executable = output / "pending-test.exe"
     if Path(args.compiler).stem.lower() == "cl":
         command = [

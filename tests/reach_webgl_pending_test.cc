@@ -3,6 +3,19 @@
 #include <cassert>
 #include <iostream>
 
+// Chromium 9ce0cc67: String::size_type = wtf_size_t = uint32_t.
+struct BlinkStringIndexFixture {
+  using size_type = uint32_t;
+  size_type units;
+  const char16_t* data;
+
+  size_type length() const { return units; }
+  char16_t operator[](size_type index) const {
+    assert(index < units);
+    return data[index];
+  }
+};
+
 template <typename Pending>
 void CheckLargeRead(std::atomic_size_t& bytes) {
   Pending queue(bytes, 9);
@@ -74,6 +87,16 @@ void CheckAccounting(std::atomic_size_t& bytes) {
     assert(Pending::JSONStringBound(std::u16string(2 * 1024 * 1024, u'x')) ==
            2 * 1024 * 1024 + 2);
     assert(Pending::JSONStringBound(std::u16string(u"\n\"<\U0001f600")) == 16);
+    assert(Pending::JSONStringBound(BlinkStringIndexFixture{0, u""}) == 2);
+    assert(Pending::JSONStringBound(BlinkStringIndexFixture{3, u"abc"}) == 5);
+    assert(Pending::JSONStringBound(
+               BlinkStringIndexFixture{5, u"\n\"<\U0001f600"}) == 16);
+    assert(Pending::JSONStringBound(
+               BlinkStringIndexFixture{1, u"\xd800"}) == 8);
+    assert(Pending::JSONStringBound(
+               BlinkStringIndexFixture{1, u"\xdc00"}) == 8);
+    assert(Pending::JSONStringBound(
+               BlinkStringIndexFixture{3, u"\U0001f600X"}) == 7);
     std::string command;
     uint64_t end = 0;
     assert(queue.Append(std::string(200000, 'x')).empty());
