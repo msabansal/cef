@@ -8,11 +8,17 @@ import subprocess
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", default="c++")
+    parser.add_argument("--baseline",
+                        help="Read the native patch from this Git revision "
+                             "(the oversized-command regression must fail).")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     output = root / ".artifacts" / "reach-webgl-test"
     output.mkdir(parents=True, exist_ok=True)
-    patch = (root / "patch" / "patches" / "reach_webgl_commands.patch").read_text(
+    patch = subprocess.check_output(
+        ["git", "show", args.baseline + ":patch/patches/reach_webgl_commands.patch"],
+        cwd=root, text=True,
+    ) if args.baseline else (root / "patch" / "patches" / "reach_webgl_commands.patch").read_text(
         encoding="utf-8"
     )
     name = "third_party/blink/renderer/modules/webgl/reach_webgl_pending.h"

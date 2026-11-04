@@ -172,7 +172,7 @@ index 2e99b4a..c6b3332 100644
        IsRenderingContext2D()) {
      RenderingContext()->FlushCanvas(FlushReason::kPrinting);
 diff --git third_party/blink/renderer/core/imagebitmap/image_bitmap.cc third_party/blink/renderer/core/imagebitmap/image_bitmap.cc
-index 828f244..38aadeb 100644
+index 828f244..dba4667 100644
 --- third_party/blink/renderer/core/imagebitmap/image_bitmap.cc
 +++ third_party/blink/renderer/core/imagebitmap/image_bitmap.cc
 @@ -31,6 +31,7 @@
@@ -191,7 +191,7 @@ index 828f244..38aadeb 100644
    auto static_input = UnacceleratedStaticBitmapImage::Create(
        std::move(paint_image), input->Orientation());
  
-@@ -336,6 +338,36 @@ ImageBitmap::ImageBitmap(ImageElementBase* image,
+@@ -336,6 +338,38 @@ ImageBitmap::ImageBitmap(ImageElementBase* image,
      return;
  
    image_->SetOriginClean(!image->WouldTaintOrigin());
@@ -213,14 +213,16 @@ index 828f244..38aadeb 100644
 +      const auto encoded = input->Data();
 +      if (encoded && !encoded->empty() &&
 +          encoded->size() <= ReachImageBitmapOriginal::kMaxBytes) {
-+        std::vector<uint8_t> bytes(encoded->size());
-+        if (encoded->GetBytes(base::span(bytes))) {
-+          original = ReachImageBitmapOriginal::Create(
-+              Canvas2DBitmapProvider::ReachWebGLPendingBytes(),
-+              std::move(bytes),
-+              {parsed_options.flip_y, parsed_options.premultiply_alpha,
-+               parsed_options.has_color_space_conversion ? 37444 : 0});
-+        }
++        original = ReachImageBitmapOriginal::CreateCopied(
++            Canvas2DBitmapProvider::ReachWebGLPendingBytes(), encoded->size(),
++            {parsed_options.flip_y, parsed_options.premultiply_alpha,
++             parsed_options.has_color_space_conversion ? 37444 : 0},
++            [encoded] {
++              std::vector<uint8_t> bytes(encoded->size());
++              if (!encoded->GetBytes(base::span(bytes)))
++                bytes.clear();
++              return bytes;
++            });
 +      }
 +    }
 +    image_->SetReachOriginal(std::move(original), std::move(error));
@@ -228,7 +230,7 @@ index 828f244..38aadeb 100644
    UpdateImageBitmapMemoryUsage();
  }
  
-@@ -508,6 +540,10 @@ scoped_refptr<StaticBitmapImage> ImageBitmap::Transfer() {
+@@ -508,6 +542,10 @@ scoped_refptr<StaticBitmapImage> ImageBitmap::Transfer() {
        if (!copy) {
          return nullptr;
        }
@@ -239,7 +241,7 @@ index 828f244..38aadeb 100644
        image_ = std::move(copy);
      }
    }
-@@ -530,6 +566,8 @@ void ImageBitmap::UpdateImageBitmapMemoryUsage() {
+@@ -530,6 +568,8 @@ void ImageBitmap::UpdateImageBitmapMemoryUsage() {
      base::CheckedNumeric<int32_t> memory_usage_checked = bytes_per_pixel;
      memory_usage_checked *= image_->width();
      memory_usage_checked *= image_->height();
@@ -347,7 +349,7 @@ index db92058..c703baa 100644
  class LayoutVideo;
  struct PaintInfo;
 diff --git third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.cc third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.cc
-index 01098ab..3bf974e 100644
+index 01098ab..48d2799 100644
 --- third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.cc
 +++ third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.cc
 @@ -56,6 +56,7 @@
@@ -421,15 +423,15 @@ index 01098ab..3bf974e 100644
 +               contents.DataLength() <= ReachImageBitmapOriginal::kMaxBytes) {
 +      const auto bytes = UNSAFE_BUFFERS(base::span(
 +          static_cast<const uint8_t*>(contents.Data()), contents.DataLength()));
-+      reach_original_ = ReachImageBitmapOriginal::Create(
-+          Canvas2DBitmapProvider::ReachWebGLPendingBytes(),
-+          std::vector<uint8_t>(bytes.begin(), bytes.end()),
++      reach_original_ = ReachImageBitmapOriginal::CreateCopied(
++          Canvas2DBitmapProvider::ReachWebGLPendingBytes(), bytes.size(),
 +          {options_->imageOrientation() == V8ImageOrientation::Enum::kFlipY,
 +           options_->premultiplyAlpha() != V8PremultiplyAlpha::Enum::kNone,
 +           options_->colorSpaceConversion() ==
 +                   V8ColorSpaceConversion::Enum::kNone
 +               ? 0
-+               : 37444});
++               : 37444},
++          [bytes] { return std::vector<uint8_t>(bytes.begin(), bytes.end()); });
 +    }
 +  }
    worker_pool::PostTask(
@@ -630,10 +632,10 @@ index e69de29..6a04ffa 100644
 +}  // namespace blink
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-index e69de29..0c24d4e 100644
+index e69de29..ec30ad3 100644
 --- third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,694 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -655,7 +657,7 @@ index e69de29..0c24d4e 100644
 +namespace {
 +
 +constexpr uint64_t kJournalBit = uint64_t{1} << 63;
-+constexpr size_t kMaxCommandBytes = 4 * 1024 * 1024;
++constexpr size_t kMaxCommandBytes = ReachWebGLPending::kLimit;
 +constexpr uint32_t kMaxObjects = 65536;
 +static_assert(ReachWebGLPending::kLimit == ReachImageBitmapOriginal::kLimit);
 +
@@ -682,6 +684,10 @@ index e69de29..0c24d4e 100644
 +}
 +
 +}  // namespace
++
++std::atomic_size_t& ReachWebGLJournal::Budget() {
++  return RetainedBytes();
++}
 +
 +ReachWebGLJournal::ReachWebGLJournal(WebGLRenderingContextBase& context)
 +    : context_(&context),
@@ -780,12 +786,19 @@ index e69de29..0c24d4e 100644
 +base::Value ReachWebGLJournal::Bytes(ReachWebGLCommand& command,
 +                                     std::string_view type,
 +                                     base::span<const uint8_t> bytes) {
-+  if (bytes.size() > 3 * 1024 * 1024 ||
-+      command.input_bytes > kMaxCommandBytes - bytes.size()) {
++  const size_t available = kMaxCommandBytes - command.input_bytes;
++  // Base64 is the retained representation. Bound expansion before allocating,
++  // not by an unrelated raw-upload or IPC-sized individual-command limit.
++  if (bytes.size() > (available / 4) * 3) {
 +    command.error = "WebGL copied upload budget exceeded";
 +    return base::Value();
 +  }
-+  command.input_bytes += bytes.size();
++  command.input_bytes += ((bytes.size() + 2) / 3) * 4;
++  if (!command.reservation.Grow(RetainedBytes(),
++                                ((bytes.size() + 2) / 3) * 4 + 128)) {
++    command.error = "Combined WebGL pending upload budget exceeded";
++    return base::Value();
++  }
 +  base::DictValue upload;
 +  upload.Set("type", type);
 +  upload.Set("data", base::Base64Encode(bytes));
@@ -855,7 +868,17 @@ index e69de29..0c24d4e 100644
 +  if (!pending_->texture_source && pending_->error.empty()) {
 +    pending_->unpack_before = original->unpack();
 +    pending_->unpack_after = restore;
++    pending_->original_precharged = true;
 +  }
++}
++
++bool ReachWebGLJournal::ReserveOriginalBytes(size_t size) {
++  if (!HasTextureSource() || size > kMaxOriginalBytes ||
++      !pending_->original_reservation.Reserve(RetainedBytes(), size + 256)) {
++    RejectTextureUpload("Combined WebGL pending original budget exceeded");
++    return false;
++  }
++  return true;
 +}
 +
 +void ReachWebGLJournal::OriginalTexture(base::ListValue args,
@@ -883,7 +906,7 @@ index e69de29..0c24d4e 100644
 +  }
 +  base::DictValue reference;
 +  reference.Set("image", hash);
-+  reference.Set("length", static_cast<double>(encoded->size()));
++  reference.Set("length", static_cast<int>(encoded->size()));
 +  reference.Set("width", width);
 +  reference.Set("height", height);
 +  args.Append(std::move(reference));
@@ -1104,26 +1127,41 @@ index e69de29..0c24d4e 100644
 +        return;
 +    }
 +  }
-+  auto json = base::WriteJson(command.value);
++  if (command.input_bytes > kMaxCommandBytes - 512 ||
++      !command.reservation.Reserve(RetainedBytes(),
++                                   command.input_bytes + 512)) {
++    Fail("Combined WebGL pending command budget exceeded");
++    return;
++  }
++  std::optional<std::string> json(std::in_place);
++  json->reserve(command.input_bytes + 512);
++  if (json->capacity() > kMaxCommandBytes - 512 ||
++      !command.reservation.Reserve(RetainedBytes(), json->capacity() + 512)) {
++    Fail("Combined WebGL pending serialization budget exceeded");
++    return;
++  }
++  if (!base::JSONWriter::Write(command.value, &*json))
++    json.reset();
 +  if (!json || json->size() > kMaxCommandBytes) {
 +    Fail("WebGL command delivery size exceeded");
 +    return;
 +  }
 +  if (command.original && !originals_.contains(command.original_hash)) {
-+    const size_t charge = command.original->size() + 256;
-+    size_t previous = RetainedBytes().load();
-+    do {
-+      if (previous > ReachWebGLPending::kLimit - charge) {
-+        Fail("Combined WebGL pending original budget exceeded");
-+        return;
-+      }
-+    } while (!RetainedBytes().compare_exchange_weak(previous, previous + charge));
++    const size_t charge =
++        (command.original_precharged ? 0 : command.original->size()) + 256;
++    if (!command.original_reservation.Reserve(RetainedBytes(), charge)) {
++      Fail("Combined WebGL pending original budget exceeded");
++      return;
++    }
++    originals_.emplace(
++        command.original_hash,
++        Original{command.original, commands_.next() + 1, charge});
++    command.original_reservation.Transfer();
 +    original_bytes_ += charge;
-+    originals_.emplace(command.original_hash,
-+                       Original{command.original, commands_.next() + 1});
 +  }
 +  const std::string error = commands_.Append(
-+      std::move(*json), command.original ? command.original->size() : 0);
++      std::move(*json), command.original ? command.original->size() : 0,
++      command.original_hash, &command.reservation);
 +  if (error.empty() && command.original)
 +    originals_.at(command.original_hash).last_next = commands_.next();
 +  if (!error.empty())
@@ -1230,6 +1268,48 @@ index e69de29..0c24d4e 100644
 +  return {};
 +}
 +
++std::string ReachWebGLJournal::ReadSlice(
++    uint64_t cursor,
++    size_t offset,
++    size_t max_bytes,
++    bool original,
++    std::vector<uint8_t>* output,
++    std::map<std::string, std::vector<uint8_t>>* data) {
++  if (!usable())
++    return "WebGL slice stream is unavailable";
++  ReachWebGLPending::Slice slice;
++  std::string command;
++  auto error = commands_.ReadSlice(generation_, cursor, offset, max_bytes,
++                                   original, &command, &slice);
++  if (!error.empty())
++    return error;
++  base::DictValue header;
++  header.Set("stream", base::NumberToString(id_));
++  header.Set("generation", base::NumberToString(generation_));
++  header.Set("command", base::NumberToString(cursor));
++  header.Set("offset", static_cast<int>(offset));
++  header.Set("total", static_cast<int>(slice.total));
++  header.Set("original", original);
++  header.Set("image", slice.original_hash);
++  header.Set("length", static_cast<int>(slice.original_bytes));
++  auto json = base::WriteJson(header);
++  if (!json)
++    return "WebGL slice header serialization failed";
++  output->assign(json->begin(), json->end());
++  if (original) {
++    const auto it = originals_.find(slice.original_hash);
++    if (it == originals_.end() || it->second.data->size() != slice.total)
++      return "WebGL slice original is unavailable";
++    const auto* begin = static_cast<const uint8_t*>(it->second.data->data());
++    data->emplace("chunk", UNSAFE_BUFFERS(std::vector<uint8_t>(
++                               begin + offset, begin + offset + slice.length)));
++  } else {
++    data->emplace("chunk",
++                  std::vector<uint8_t>(command.begin(), command.end()));
++  }
++  return {};
++}
++
 +std::string ReachWebGLJournal::Applied(uint64_t generation, uint64_t through) {
 +  if (!usable() || generation != generation_)
 +    return "WebGL applied generation is stale or unavailable";
@@ -1238,7 +1318,7 @@ index e69de29..0c24d4e 100644
 +    return error;
 +  for (auto it = originals_.begin(); it != originals_.end();) {
 +    if (it->second.last_next <= through) {
-+      const size_t charge = it->second.data->size() + 256;
++      const size_t charge = it->second.charge;
 +      original_bytes_ -= charge;
 +      RetainedBytes().fetch_sub(charge);
 +      it = originals_.erase(it);
@@ -1251,10 +1331,10 @@ index e69de29..0c24d4e 100644
 +
 +}  // namespace blink
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.h third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
-index e69de29..da09af8 100644
+index e69de29..9ed0ad2 100644
 --- third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,285 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +
@@ -1298,9 +1378,12 @@ index e69de29..da09af8 100644
 +  base::DictValue value;
 +  std::string error;
 +  size_t input_bytes = 0;
++  ReachWebGLPending::Reservation reservation;
++  ReachWebGLPending::Reservation original_reservation;
 +  bool texture_source = false;
 +  std::string original_hash;
 +  sk_sp<const SkData> original;
++  bool original_precharged = false;
 +  std::optional<ReachImageBitmapOriginal::Unpack> unpack_before;
 +  std::optional<ReachImageBitmapOriginal::Unpack> unpack_after;
 +};
@@ -1326,7 +1409,7 @@ index e69de29..da09af8 100644
 +  };
 +
 +  explicit ReachWebGLJournal(WebGLRenderingContextBase&);
-+  static constexpr size_t kMaxOriginalBytes = 8 * 1024 * 1024 - 1024;
++  static constexpr size_t kMaxOriginalBytes = ReachWebGLPending::kLimit - 256;
 +  ~ReachWebGLJournal();
 +
 +  static ReachWebGLJournal* Find(uint64_t);
@@ -1335,6 +1418,7 @@ index e69de29..da09af8 100644
 +  static void SetOriginalHasher(
 +      std::string (*hasher)(base::span<const uint8_t>));
 +  static bool ShouldRecord(std::string_view);
++  static std::atomic_size_t& Budget();
 +  bool usable() const { return error_.empty(); }
 +  const std::string& error() const { return error_; }
 +  uint64_t generation() const { return generation_; }
@@ -1347,6 +1431,12 @@ index e69de29..da09af8 100644
 +                   std::vector<uint8_t>* output,
 +                   std::map<std::string, std::vector<uint8_t>>* originals);
 +  std::string Applied(uint64_t generation, uint64_t through);
++  std::string ReadSlice(uint64_t cursor,
++                        size_t offset,
++                        size_t max_bytes,
++                        bool original,
++                        std::vector<uint8_t>* output,
++                        std::map<std::string, std::vector<uint8_t>>* data);
 +  std::string Sent(uint64_t generation, uint64_t through) {
 +    return usable() ? commands_.Sent(generation, through)
 +                    : "WebGL sent stream is unavailable";
@@ -1368,6 +1458,7 @@ index e69de29..da09af8 100644
 +                       sk_sp<const SkData>,
 +                       int width,
 +                       int height);
++  bool ReserveOriginalBytes(size_t);
 +  void OriginalImageBitmapTexture(
 +      base::ListValue,
 +      std::shared_ptr<const ReachImageBitmapOriginal>,
@@ -1397,6 +1488,7 @@ index e69de29..da09af8 100644
 +  struct Original {
 +    sk_sp<const SkData> data;
 +    uint64_t last_next;
++    size_t charge;
 +  };
 +
 +  base::Value Bytes(ReachWebGLCommand&,
@@ -1423,13 +1515,15 @@ index e69de29..da09af8 100644
 +      }
 +      return base::Value(number);
 +    } else if constexpr (std::is_convertible_v<const V&, String>) {
-+      std::string text = static_cast<String>(value).Utf8();
-+      command.input_bytes += text.size();
-+      if (text.size() > 1024 * 1024 || command.input_bytes > 4 * 1024 * 1024) {
++      const String text = static_cast<String>(value);
++      const size_t encoded = ReachWebGLPending::JSONStringBound(text);
++      if (encoded > ReachWebGLPending::kLimit - command.input_bytes ||
++          !command.reservation.Grow(Budget(), encoded + 128)) {
 +        command.error = "WebGL string budget exceeded";
 +        return base::Value();
 +      }
-+      return base::Value(std::move(text));
++      command.input_bytes += encoded;
++      return base::Value(text.Utf8());
 +    } else if constexpr (std::is_pointer_v<V>) {
 +      using Element = std::remove_cv_t<std::remove_pointer_t<V>>;
 +      if (!value)
@@ -1497,10 +1591,13 @@ index e69de29..da09af8 100644
 +
 +  template <typename T>
 +  base::Value Sequence(ReachWebGLCommand& command, const T& values) {
-+    if (values.size() > 16384) {
++    if (values.size() >
++            (ReachWebGLPending::kLimit - command.input_bytes) / 128 ||
++        !command.reservation.Grow(Budget(), values.size() * 128)) {
 +      command.error = "WebGL argument list budget exceeded";
 +      return base::Value();
 +    }
++    command.input_bytes += values.size() * 128;
 +    base::ListValue result;
 +    for (const auto& value : values)
 +      result.Append(Encode(command, value));
@@ -1525,10 +1622,10 @@ index e69de29..da09af8 100644
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_pending.h third_party/blink/renderer/modules/webgl/reach_webgl_pending.h
 new file mode 100644
-index 0000000..923c356
+index 0000000..da5b78d
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_pending.h
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,258 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
 +
@@ -1548,6 +1645,88 @@ index 0000000..923c356
 +class ReachWebGLPending final {
 + public:
 +  static constexpr size_t kLimit = 256 * 1024 * 1024;
++  static constexpr size_t kMaxSlice = 96 * 1024;
++  struct Slice {
++    size_t total = 0;
++    size_t length = 0;
++    std::string original_hash;
++    size_t original_bytes = 0;
++  };
++  class Reservation {
++   public:
++    Reservation() = default;
++    Reservation(const Reservation&) = delete;
++    Reservation& operator=(const Reservation&) = delete;
++    Reservation(Reservation&& other) noexcept { *this = std::move(other); }
++    Reservation& operator=(Reservation&& other) noexcept {
++      if (this != &other) {
++        Reset();
++        aggregate_ = std::exchange(other.aggregate_, nullptr);
++        bytes_ = std::exchange(other.bytes_, 0);
++      }
++      return *this;
++    }
++    ~Reservation() { Reset(); }
++    bool Reserve(std::atomic_size_t& aggregate, size_t bytes) {
++      if (bytes > kLimit || (aggregate_ && aggregate_ != &aggregate))
++        return false;
++      if (bytes > bytes_) {
++        const size_t extra = bytes - bytes_;
++        size_t previous = aggregate.load();
++        do {
++          if (previous > kLimit - extra)
++            return false;
++        } while (!aggregate.compare_exchange_weak(previous, previous + extra));
++      } else {
++        aggregate.fetch_sub(bytes_ - bytes);
++      }
++      aggregate_ = &aggregate;
++      bytes_ = bytes;
++      return true;
++    }
++    bool Grow(std::atomic_size_t& aggregate, size_t bytes) {
++      return bytes <= kLimit - bytes_ && Reserve(aggregate, bytes_ + bytes);
++    }
++    void Transfer() {
++      aggregate_ = nullptr;
++      bytes_ = 0;
++    }
++
++   private:
++    void Reset() {
++      if (aggregate_)
++        aggregate_->fetch_sub(bytes_);
++      Transfer();
++    }
++    std::atomic_size_t* aggregate_ = nullptr;
++    size_t bytes_ = 0;
++  };
++
++  // Count escaped UTF-16 before allocating the UTF-8/JSON representation.
++  template <typename Text>
++  static size_t JSONStringBound(const Text& value) {
++    size_t size = 2;
++    for (size_t i = 0; i < value.length(); ++i) {
++      const uint32_t c = value[i];
++      size_t add = c <= 0x7f ? 1 : c <= 0x7ff ? 2 : 3;
++      if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t' ||
++          c == '\b' || c == '\f')
++        add = 2;
++      else if (c < 32 || c == '<' || c == 0x2028 || c == 0x2029)
++        add = 6;
++      else if (c >= 0xd800 && c <= 0xdbff && value.length() - i >= 2 &&
++               value[i + 1] >= 0xdc00 && value[i + 1] <= 0xdfff) {
++        add = 4;
++        ++i;
++      } else if (c >= 0xd800 && c <= 0xdfff) {
++        add = 6;
++      }
++      if (add > kLimit - size)
++        return kLimit + 1;
++      size += add;
++    }
++    return size;
++  }
 +  explicit ReachWebGLPending(std::atomic_size_t& aggregate,
 +                            uint64_t generation = 0)
 +      : aggregate_(aggregate), generation_(generation) {}
@@ -1555,22 +1734,70 @@ index 0000000..923c356
 +  ReachWebGLPending& operator=(const ReachWebGLPending&) = delete;
 +  ~ReachWebGLPending() { aggregate_.fetch_sub(bytes_); }
 +
-+  std::string Append(std::string command, size_t delivery_bytes = 0) {
++  std::string Append(std::string command,
++                     size_t delivery_bytes = 0,
++                     std::string original_hash = {},
++                     Reservation* reservation = nullptr) {
 +    if (next_ == std::numeric_limits<uint64_t>::max())
 +      return "WebGL absolute sequence exhausted";
 +    // Include node/string storage; never charge only a context's payload.
-+    const size_t overhead = sizeof(Entry) + 2 * sizeof(void*) + 1;
++    if (original_hash.capacity() > kLimit / 2 || delivery_bytes > kLimit)
++      return "Combined WebGL pending delivery budget exceeded";
++    const size_t overhead =
++        sizeof(Entry) + 2 * sizeof(void*) + 2 + original_hash.capacity();
 +    if (command.capacity() > kLimit - overhead)
 +      return "Combined WebGL pending delivery budget exceeded";
 +    const size_t charge = command.capacity() + overhead;
-+    size_t previous = aggregate_.load();
-+    do {
-+      if (previous > kLimit - charge)
-+        return "Combined WebGL pending delivery budget exceeded";
-+    } while (!aggregate_.compare_exchange_weak(previous, previous + charge));
-+    commands_.push_back({std::move(command), delivery_bytes});
++    Reservation own;
++    Reservation* held = reservation ? reservation : &own;
++    if (!held->Reserve(aggregate_, charge))
++      return "Combined WebGL pending delivery budget exceeded";
++    commands_.push_back(
++        {std::move(command), delivery_bytes, std::move(original_hash)});
++    held->Transfer();
 +    bytes_ += charge;
 +    ++next_;
++    return {};
++  }
++
++  // Only immutable pending storage is sliced. No response snapshot or delivered
++  // command archive survives a request. Original bytes remain journal-owned.
++  std::string ReadSlice(uint64_t generation,
++                        uint64_t cursor,
++                        size_t offset,
++                        size_t max_bytes,
++                        bool original,
++                        std::string* data,
++                        Slice* slice) {
++    if (generation != generation_ || cursor < retired_ ||
++        cursor > read_through_ || max_bytes == 0 || max_bytes > kMaxSlice)
++      return "WebGL slice generation, cursor, or budget is invalid";
++    *slice = {};
++    data->clear();
++    if (cursor == next_)
++      return offset || original ? "WebGL empty slice offset is invalid" : "";
++    auto it = commands_.begin();
++    std::advance(it, cursor - retired_);
++    slice->total = original ? it->delivery_bytes : it->value.size();
++    slice->original_hash = it->original_hash;
++    slice->original_bytes = it->delivery_bytes;
++    if (offset >= slice->total || (original && it->original_hash.empty()))
++      return "WebGL slice offset or original membership is invalid";
++    if (cursor == read_through_ && slice_cursor_ != cursor) {
++      slice_cursor_ = cursor;
++      command_read_ = original_read_ = 0;
++    }
++    size_t& frontier = original ? original_read_ : command_read_;
++    if (cursor == read_through_ && offset > frontier)
++      return "WebGL slice skips an unread byte prefix";
++    slice->length = std::min(max_bytes, slice->total - offset);
++    if (!original)
++      data->assign(it->value, offset, slice->length);
++    if (cursor == read_through_)
++      frontier = std::max(frontier, offset + slice->length);
++    if (cursor == read_through_ && command_read_ == it->value.size() &&
++        original_read_ == it->delivery_bytes)
++      ++read_through_;
 +    return {};
 +  }
 +
@@ -1623,7 +1850,8 @@ index 0000000..923c356
 +    while (retired_ < through) {
 +      const auto& command = commands_.front().value;
 +      const size_t charge = command.capacity() + sizeof(Entry) +
-+                            2 * sizeof(void*) + 1;
++                            2 * sizeof(void*) + 2 +
++                            commands_.front().original_hash.capacity();
 +      bytes_ -= charge;
 +      aggregate_.fetch_sub(charge);
 +      commands_.pop_front();
@@ -1639,6 +1867,7 @@ index 0000000..923c356
 +  struct Entry {
 +    std::string value;
 +    size_t delivery_bytes;
++    std::string original_hash;
 +  };
 +  std::atomic_size_t& aggregate_;
 +  const uint64_t generation_;
@@ -1648,12 +1877,15 @@ index 0000000..923c356
 +  uint64_t next_ = 0;
 +  uint64_t read_through_ = 0;
 +  uint64_t sent_through_ = 0;
++  uint64_t slice_cursor_ = std::numeric_limits<uint64_t>::max();
++  size_t command_read_ = 0;
++  size_t original_read_ = 0;
 +};
 +
 +}  // namespace blink
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
 diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index b17f336..0c6ad01 100644
+index b17f336..af26033 100644
 --- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -44,6 +44,8 @@
@@ -1784,7 +2016,7 @@ index b17f336..0c6ad01 100644
    TexImageBase(params, gl_data);
  }
  
-@@ -6192,6 +6264,52 @@ void WebGLRenderingContextBase::TexImageHelperHTMLImageElement(
+@@ -6192,6 +6264,59 @@ void WebGLRenderingContextBase::TexImageHelperHTMLImageElement(
      SynthesizeGLError(GL_INVALID_VALUE, func_name, "bad image data");
      return;
    }
@@ -1804,17 +2036,22 @@ index b17f336..0c6ad01 100644
 +          "requires explicit source reconstruction");
 +    } else {
 +      sk_sp<SkData> encoded;
++      bool budget_available = true;
 +      if (image_for_render->HasData() &&
 +          image_for_render->DataSize() <=
 +              ReachWebGLJournal::kMaxOriginalBytes) {
 +        const auto original = image_for_render->Data();
 +        if (original && !original->empty() &&
 +            original->size() <= ReachWebGLJournal::kMaxOriginalBytes) {
-+          encoded = SkData::MakeUninitialized(original->size());
-+          if (!original->GetBytes(UNSAFE_BUFFERS(base::span(
-+                  static_cast<uint8_t*>(encoded->writable_data()),
-+                  encoded->size())))) {
-+            encoded.reset();
++          budget_available =
++              reach_journal_->ReserveOriginalBytes(original->size());
++          if (budget_available) {
++            encoded = SkData::MakeUninitialized(original->size());
++            if (!original->GetBytes(UNSAFE_BUFFERS(
++                    base::span(static_cast<uint8_t*>(encoded->writable_data()),
++                               encoded->size())))) {
++              encoded.reset();
++            }
 +          }
 +        }
 +      }
@@ -1829,15 +2066,17 @@ index b17f336..0c6ad01 100644
 +      }
 +      args.Append(static_cast<int>(params.format));
 +      args.Append(static_cast<int>(params.type));
-+      reach_journal_->OriginalTexture(
-+          std::move(args), std::move(encoded), image_for_render->width(),
-+          image_for_render->height());
++      if (budget_available) {
++        reach_journal_->OriginalTexture(std::move(args), std::move(encoded),
++                                        image_for_render->width(),
++                                        image_for_render->height());
++      }
 +    }
 +  }
    TexImageSkImage(params, std::move(sk_image));
  }
  
-@@ -6824,6 +6942,7 @@ void WebGLRenderingContextBase::TexImageHelperImageBitmap(
+@@ -6824,6 +6949,7 @@ void WebGLRenderingContextBase::TexImageHelperImageBitmap(
    if (!ValidateTexImageBinding(params))
      return;
  
@@ -1845,7 +2084,7 @@ index b17f336..0c6ad01 100644
    if (!params.width)
      params.width = bitmap->width();
    if (!params.height)
-@@ -6842,6 +6961,41 @@ void WebGLRenderingContextBase::TexImageHelperImageBitmap(
+@@ -6842,6 +6968,41 @@ void WebGLRenderingContextBase::TexImageHelperImageBitmap(
    auto static_bitmap_image = bitmap->BitmapImage();
    DCHECK(static_bitmap_image);
  
@@ -1887,7 +2126,7 @@ index b17f336..0c6ad01 100644
    // When TexImage is called with an ImageBitmap, the values of UNPACK_FLIP_Y,
    // UNPACK_PREMULTIPLY_ALPHA, and UNPACK_COLORSPACE_CONVERSION are to be
    // ignored. Set `adjusted_params` such that no conversions will be made using
-@@ -9266,6 +9420,7 @@ void WebGLRenderingContextBase::SynthesizeGLError(
+@@ -9266,6 +9427,7 @@ void WebGLRenderingContextBase::SynthesizeGLError(
      const char* function_name,
      const char* description,
      ConsoleDisplayPreference display) {
@@ -1997,10 +2236,10 @@ index 2cb58aa..a5974e6 100644
      delegate_ = delegate;
 diff --git third_party/blink/renderer/platform/graphics/reach_image_bitmap_original.h third_party/blink/renderer/platform/graphics/reach_image_bitmap_original.h
 new file mode 100644
-index 0000000..fbfe224
+index 0000000..ab064b2
 --- /dev/null
 +++ third_party/blink/renderer/platform/graphics/reach_image_bitmap_original.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,96 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_IMAGE_BITMAP_ORIGINAL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_IMAGE_BITMAP_ORIGINAL_H_
 +
@@ -2018,28 +2257,57 @@ index 0000000..fbfe224
 +class ReachImageBitmapOriginal final {
 + public:
 +  static constexpr size_t kLimit = 256 * 1024 * 1024;
-+  static constexpr size_t kMaxBytes = 8 * 1024 * 1024 - 1024;
++  static constexpr size_t kMaxBytes = kLimit - 256;
 +  using Unpack = std::array<int, 3>;
 +
 +  static std::shared_ptr<const ReachImageBitmapOriginal> Create(
 +      std::atomic_size_t& budget,
 +      std::vector<uint8_t> bytes,
 +      Unpack unpack) {
-+    if (bytes.empty() || bytes.size() > kMaxBytes ||
-+        bytes.capacity() > kMaxBytes || (unpack[0] != 0 && unpack[0] != 1) ||
++    const size_t size = bytes.size();
++    return CreateCopied(budget, size, unpack,
++                        [&bytes] { return std::move(bytes); });
++  }
++
++  // Reserve ownership before copying browser-owned encoded data.
++  template <typename Copy>
++  static std::shared_ptr<const ReachImageBitmapOriginal> CreateCopied(
++      std::atomic_size_t& budget,
++      size_t size,
++      Unpack unpack,
++      Copy copy) {
++    if (!size || size > kMaxBytes || (unpack[0] != 0 && unpack[0] != 1) ||
 +        (unpack[1] != 0 && unpack[1] != 1) ||
 +        (unpack[2] != 0 && unpack[2] != 37444)) {
 +      return nullptr;
 +    }
-+    const size_t charge = bytes.capacity() + 256;
++    const size_t charge = size + 256;
 +    size_t previous = budget.load(std::memory_order_relaxed);
 +    do {
 +      if (previous > kLimit - charge)
 +        return nullptr;
 +    } while (!budget.compare_exchange_weak(previous, previous + charge,
 +                                           std::memory_order_relaxed));
-+    return std::shared_ptr<const ReachImageBitmapOriginal>(
-+        new ReachImageBitmapOriginal(budget, std::move(bytes), unpack, charge));
++    struct Release {
++      std::atomic_size_t& budget;
++      size_t charge;
++      ~Release() { budget.fetch_sub(charge, std::memory_order_relaxed); }
++    } release{budget, charge};
++    auto bytes = copy();
++    if (bytes.size() != size || bytes.capacity() > kMaxBytes)
++      return nullptr;
++    const size_t extra = bytes.capacity() - size;
++    previous = budget.load(std::memory_order_relaxed);
++    do {
++      if (previous > kLimit - extra)
++        return nullptr;
++    } while (!budget.compare_exchange_weak(previous, previous + extra,
++                                           std::memory_order_relaxed));
++    release.charge += extra;
++    auto* original = new ReachImageBitmapOriginal(budget, std::move(bytes),
++                                                  unpack, release.charge);
++    release.charge = 0;
++    return std::shared_ptr<const ReachImageBitmapOriginal>(original);
 +  }
 +
 +  ReachImageBitmapOriginal(const ReachImageBitmapOriginal&) = delete;

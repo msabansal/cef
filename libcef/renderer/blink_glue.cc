@@ -254,6 +254,7 @@ std::string WebGlRequest(
     const std::string& stream,
     const std::string& generation,
     const std::string& position,
+    const std::string& offset,
     int max_bytes,
     std::vector<uint8_t>* output,
     std::map<std::string, std::vector<uint8_t>>* originals) {
@@ -339,6 +340,17 @@ std::string WebGlRequest(
                              "\",\"through\":\"" + position + "\"}";
     output->assign(json.begin(), json.end());
     return {};
+  }
+  if (operation == "Reach.WebGlCommandSlice.v2" ||
+      operation == "Reach.WebGlOriginalSlice.v2") {
+    uint64_t start = 0;
+    if (!WebGlDecimal(offset, &start) || start > 256 * 1024 * 1024 ||
+        max_bytes <= 0 ||
+        max_bytes > static_cast<int>(blink::ReachWebGLPending::kMaxSlice))
+      return "Invalid WebGL byte slice offset or budget";
+    return journal->ReadSlice(
+        cursor, static_cast<size_t>(start), static_cast<size_t>(max_bytes),
+        operation == "Reach.WebGlOriginalSlice.v2", output, originals);
   }
   if (operation != "Reach.WebGlRead.v2" || max_bytes <= 256 ||
       max_bytes > 8 * 1024 * 1024)

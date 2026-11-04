@@ -963,30 +963,37 @@ void CefFrameImpl::SendMessage(const std::string& name,
     return;
   }
   if (name == "Reach.WebGlStreams.v2" || name == "Reach.WebGlTick.v2" ||
-      name == "Reach.WebGlRead.v2" ||
+      name == "Reach.WebGlRead.v2" || name == "Reach.WebGlCommandSlice.v2" ||
+      name == "Reach.WebGlOriginalSlice.v2" ||
       name == "Reach.WebGlApplied.v2" || name == "Reach.WebGlSent.v2") {
     CefRefPtr<CefFrameImpl> retain(this);
-    auto response = CefProcessMessage::Create("Reach.WebGlResult.v2");
+    const bool slice = name == "Reach.WebGlCommandSlice.v2" ||
+                       name == "Reach.WebGlOriginalSlice.v2";
+    auto response = CefProcessMessage::Create(
+        slice ? "Reach.WebGlSliceResult.v2" : "Reach.WebGlResult.v2");
     auto values = response->GetArgumentList();
-    const bool valid = arguments.size() == 6 && arguments[0].is_int() &&
-                       arguments[0].GetInt() > 0 && arguments[1].is_string() &&
-                       arguments[1].GetString().size() <= 128 &&
-                       arguments[2].is_string() &&
-                       arguments[2].GetString().size() <= 20 &&
-                       arguments[3].is_string() &&
-                       arguments[3].GetString().size() <= 20 &&
-                       arguments[4].is_string() &&
-                       arguments[4].GetString().size() <= 20 &&
-                       arguments[5].is_int();
+    const bool valid =
+        arguments.size() == (slice ? 7u : 6u) &&
+        (!slice ||
+         (arguments[6].is_string() && arguments[6].GetString().size() <= 20)) &&
+        arguments[0].is_int() && arguments[0].GetInt() > 0 &&
+        arguments[1].is_string() && arguments[1].GetString().size() <= 128 &&
+        arguments[2].is_string() && arguments[2].GetString().size() <= 20 &&
+        arguments[3].is_string() && arguments[3].GetString().size() <= 20 &&
+        arguments[4].is_string() && arguments[4].GetString().size() <= 20 &&
+        arguments[5].is_int();
     values->SetInt(0, valid ? arguments[0].GetInt() : 0);
     std::vector<uint8_t> bytes;
     std::map<std::string, std::vector<uint8_t>> originals;
-    const std::string error = !valid || !frame_
-        ? "Invalid or detached WebGL request"
-        : blink_glue::WebGlRequest(
-              frame_, name, arguments[1].GetString(), arguments[2].GetString(),
-              arguments[3].GetString(), arguments[4].GetString(),
-              arguments[5].GetInt(), &bytes, &originals);
+    const std::string error =
+        !valid || !frame_
+            ? "Invalid or detached WebGL request"
+            : blink_glue::WebGlRequest(
+                  frame_, name, arguments[1].GetString(),
+                  arguments[2].GetString(), arguments[3].GetString(),
+                  arguments[4].GetString(),
+                  slice ? arguments[6].GetString() : "", arguments[5].GetInt(),
+                  &bytes, &originals);
     values->SetString(1, error);
     if (error.empty()) {
       values->SetBinary(2, CefBinaryValue::Create(bytes.data(), bytes.size()));

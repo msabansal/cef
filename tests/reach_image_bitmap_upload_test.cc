@@ -2,9 +2,11 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include "reach_image_bitmap_original.h"
 #include "reach_webgl_pending.h"
@@ -21,22 +23,39 @@ using sk_sp = std::shared_ptr<T>;
 namespace base {
 template <typename T>
 using span = std::span<T>;
+std::string NumberToString(uint64_t value) { return std::to_string(value); }
 struct DictValue;
+struct Value;
 struct ListValue {
   std::vector<int> values;
   std::vector<DictValue> references;
   void Append(int value) { values.push_back(value); }
   void Append(DictValue);
+  void Append(Value);
 };
 struct DictValue {
   std::map<std::string, std::string> strings;
   std::map<std::string, double> numbers;
   std::map<std::string, ListValue> lists;
+  std::map<std::string, bool> booleans;
+  std::set<std::string> doubles;
+  void Set(std::string key, const char* value) {
+    Set(std::move(key), std::string(value));
+  }
+  void Set(std::string key, bool value) {
+    booleans.emplace(std::move(key), value);
+  }
   void Set(std::string key, std::string value) {
     strings.emplace(std::move(key), std::move(value));
   }
-  void Set(std::string key, double value) {
-    numbers.emplace(std::move(key), value);
+  void Set(std::string key, std::string_view value) {
+    Set(std::move(key), std::string(value));
+  }
+  template <typename T>
+    requires(std::is_arithmetic_v<T> && !std::is_same_v<T, bool>)
+  void Set(std::string key, T value) {
+    if constexpr (std::is_floating_point_v<T>) doubles.insert(key);
+    numbers.emplace(std::move(key), static_cast<double>(value));
   }
   void Set(std::string key, ListValue value) {
     lists.emplace(std::move(key), std::move(value));
@@ -46,19 +65,57 @@ struct DictValue {
     return it == strings.end() ? nullptr : &it->second;
   }
 };
+struct Value {
+  std::optional<DictValue> dictionary;
+  Value() = default;
+  explicit Value(DictValue value) : dictionary(std::move(value)) {}
+};
+void ListValue::Append(Value value) {
+  assert(value.dictionary);
+  Append(std::move(*value.dictionary));
+}
+std::string Base64Encode(span<const uint8_t> bytes) {
+  return std::string(((bytes.size() + 2) / 3) * 4, 'A');
+}
 void ListValue::Append(DictValue value) {
   references.push_back(std::move(value));
 }
 std::optional<std::string> WriteJson(const DictValue& value) {
+  if (!value.lists.contains("args")) {
+    std::string json = "{";
+    for (const auto& [key, text] : value.strings)
+      json += (json.size() == 1 ? "" : ",") + std::string("\"") + key +
+              "\":\"" + text + "\"";
+    for (const auto& [key, number] : value.numbers)
+      json += ",\"" + key +
+              "\":" + std::to_string(static_cast<uint64_t>(number)) +
+              (value.doubles.contains(key) ? ".0" : "");
+    for (const auto& [key, boolean] : value.booleans)
+      json += ",\"" + key + "\":" + (boolean ? "true" : "false");
+    return json + "}";
+  }
   const auto& args = value.lists.at("args");
   std::string json = "{\"op\":\"" + value.strings.at("op") + "\",\"args\":[";
   for (int number : args.values)
     json += (json.back() == '[' ? "" : ",") + std::to_string(number);
   for (const auto& reference : args.references) {
-    json += ",{\"image\":\"" + reference.strings.at("image") + "\"}";
+    if (reference.strings.contains("image")) {
+      json += ",{\"image\":\"" + reference.strings.at("image") + "\"}";
+    } else {
+      json += ",{\"type\":\"" + reference.strings.at("type") +
+              "\",\"data\":\"" + reference.strings.at("data") + "\"}";
+    }
   }
   return json + "]}";
 }
+struct JSONWriter {
+  static bool Write(const DictValue& value, std::string* output) {
+    const auto json = WriteJson(value);
+    if (!json) return false;
+    output->assign(*json);
+    return true;
+  }
+};
 }  // namespace base
 
 class SkData {
@@ -85,18 +142,23 @@ class SkData {
 std::atomic_size_t aggregate{0};
 std::atomic_size_t& RetainedBytes() { return aggregate; }
 std::string Hash(base::span<const uint8_t> bytes) {
-  assert((std::vector<uint8_t>(bytes.begin(), bytes.end()) ==
+  assert(bytes.size() >= 4 &&
+         (std::vector<uint8_t>(bytes.begin(), bytes.begin() + 4) ==
           std::vector<uint8_t>{137, 80, 78, 71}));
   return std::string(64, 'a');
 }
 auto original_hasher = &Hash;
-constexpr size_t kMaxCommandBytes = 4 * 1024 * 1024;
+constexpr size_t kMaxCommandBytes = ReachWebGLPending::kLimit;
 struct ReachWebGLCommand {
   base::DictValue value;
   std::string error;
+  size_t input_bytes = 0;
+  ReachWebGLPending::Reservation reservation;
+  ReachWebGLPending::Reservation original_reservation;
   bool texture_source = false;
   std::string original_hash;
   sk_sp<const SkData> original;
+  bool original_precharged = false;
   std::optional<ReachImageBitmapOriginal::Unpack> unpack_before, unpack_after;
 };
 class ReachWebGLJournal {
@@ -104,6 +166,7 @@ class ReachWebGLJournal {
   struct Original {
     sk_sp<const SkData> data;
     uint64_t last_next;
+    size_t charge;
   };
   static constexpr size_t kMaxOriginalBytes =
       ReachImageBitmapOriginal::kMaxBytes;
@@ -113,6 +176,7 @@ class ReachWebGLJournal {
   std::map<std::string, Original> originals_;
   size_t original_bytes_ = 0;
   uint64_t generation_ = 5;
+  uint64_t id_ = 7;
   std::string error_;
   ReachWebGLJournal() { Reset("texImage2D"); }
   ~ReachWebGLJournal() { RetainedBytes().fetch_sub(original_bytes_); }
@@ -129,11 +193,16 @@ class ReachWebGLJournal {
   bool HasTextureSource() const { return pending_->texture_source; }
   void RejectTextureUpload(std::string_view);
   void OriginalTexture(base::ListValue, sk_sp<const SkData>, int, int);
+  bool ReserveOriginalBytes(size_t);
   void OriginalImageBitmapTexture(
       base::ListValue, std::shared_ptr<const ReachImageBitmapOriginal>, int,
       int, ReachImageBitmapOriginal::Unpack);
   void Append(ReachWebGLCommand);
   std::string Applied(uint64_t, uint64_t);
+  base::Value Bytes(ReachWebGLCommand&, std::string_view,
+                    base::span<const uint8_t>);
+  std::string ReadSlice(uint64_t, size_t, size_t, bool, std::vector<uint8_t>*,
+                        std::map<std::string, std::vector<uint8_t>>*);
 };
 
 // NATIVE_JOURNAL_METHODS
@@ -216,6 +285,135 @@ class WebGLRenderingContextBase {
 // NATIVE_UPLOAD_METHOD
 
 int main() {
+  {
+    aggregate.store(ReachImageBitmapOriginal::kLimit - 100);
+    bool copied = false;
+    auto source = ReachImageBitmapOriginal::CreateCopied(
+        aggregate, 4, {0, 0, 0}, [&copied] {
+          copied = true;
+          return std::vector<uint8_t>{137, 80, 78, 71};
+        });
+    assert(!source && !copied);
+    aggregate.store(0);
+    source =
+        ReachImageBitmapOriginal::CreateCopied(aggregate, 4, {0, 0, 0}, [] {
+          assert(aggregate.load() >= 260);
+          return std::vector<uint8_t>{137, 80, 78, 71};
+        });
+    assert(source);
+  }
+  assert(aggregate.load() == 0);
+  {
+    ReachWebGLJournal producer;
+    producer.Reset("bufferData");
+    producer.captured_command.error.clear();
+    producer.captured_command.texture_source = false;
+    std::vector<uint8_t> input(9 * 1024 * 1024);
+    auto encoded =
+        producer.Bytes(producer.captured_command, "Uint8Array", input);
+    assert(producer.captured_command.error.empty());
+    assert(aggregate.load() >= 12 * 1024 * 1024);
+    base::ListValue args;
+    args.Append(34962);
+    args.Append(std::move(encoded));
+    producer.captured_command.value.Set("args", std::move(args));
+    producer.Append(std::move(producer.captured_command));
+    assert(producer.usable());
+    std::string legacy;
+    uint64_t end = 0;
+    assert(
+        !producer.commands_.Read(5, 0, 8 * 1024 * 1024, &legacy, &end).empty());
+    std::vector<uint8_t> header;
+    std::map<std::string, std::vector<uint8_t>> data;
+    size_t offset = 0;
+    std::string result;
+    while (!producer.commands_.Sent(5, 1).empty()) {
+      data.clear();
+      assert(
+          producer.ReadSlice(0, offset, 98304, false, &header, &data).empty());
+      const auto& chunk = data.at("chunk");
+      assert(chunk.size() <= 98304 && !chunk.empty());
+      result.append(chunk.begin(), chunk.end());
+      offset += chunk.size();
+      assert(!producer.Applied(5, 1).empty());
+    }
+    assert(result.find(std::string(12 * 1024 * 1024, 'A')) !=
+           std::string::npos);
+    assert(producer.Applied(5, 1).empty());
+    assert(aggregate.load() == 0);
+  }
+  assert(aggregate.load() == 0);
+  {
+    ReachWebGLJournal journal;
+    aggregate.store(ReachWebGLPending::kLimit - 100);
+    assert(!journal.ReserveOriginalBytes(4));
+    aggregate.store(0);
+    journal.Reset("texImage2D");
+    assert(journal.ReserveOriginalBytes(4));
+    assert(aggregate.load() == 260);  // Charged before copying HTML bytes.
+    const std::vector<uint8_t> bytes{137, 80, 78, 71};
+    auto encoded = SkData::MakeWithProc(
+        bytes.data(), bytes.size(), [](const void*, void*) {}, nullptr);
+    journal.OriginalTexture({}, std::move(encoded), 2, 2);
+    journal.Append(std::move(journal.captured_command));
+    assert(journal.usable() && journal.original_bytes_ == 260);
+    std::string read;
+    uint64_t end = 0;
+    assert(journal.commands_.Read(5, 0, 4096, &read, &end).empty());
+    assert(journal.commands_.Sent(5, end).empty());
+    assert(journal.Applied(5, end).empty());
+    assert(aggregate.load() == 0);
+  }
+  assert(aggregate.load() == 0);
+  {
+    ReachWebGLJournal journal;
+    std::vector<uint8_t> encoded(12 * 1024 * 1024);
+    std::copy_n(std::vector<uint8_t>{137, 80, 78, 71}.begin(), 4,
+                encoded.begin());
+    auto source =
+        ReachImageBitmapOriginal::Create(aggregate, encoded, {0, 0, 0});
+    assert(source);
+    journal.OriginalImageBitmapTexture({}, source, 2, 2, {0, 0, 0});
+    assert(!journal.captured_command.value.lists.at("args")
+                .references[0]
+                .doubles.contains("length"));
+    journal.Append(std::move(journal.captured_command));
+    assert(journal.usable());
+    // The pending SkData shares the precharged immutable encoded allocation.
+    assert(aggregate.load() < encoded.size() + 8192);
+    std::string prefix;
+    uint64_t end = 0;
+    assert(journal.commands_.Read(5, 0, 4096, &prefix, &end).empty());
+    assert(end == 3);
+    std::vector<uint8_t> header;
+    std::map<std::string, std::vector<uint8_t>> data;
+    assert(!journal.ReadSlice(0, 0, 98304, true, &header, &data).empty());
+    assert(!journal.ReadSlice(4, 0, 98304, false, &header, &data).empty());
+    assert(journal.ReadSlice(3, 0, 98304, false, &header, &data).empty());
+    assert(std::string(header.begin(), header.end()).find(".0") ==
+           std::string::npos);
+    assert(std::string(header.begin(), header.end())
+               .find("\"image\":\"" + std::string(64, 'a') + "\"") !=
+           std::string::npos);
+    assert(!journal.commands_.Sent(5, 4).empty());
+    size_t offset = 0;
+    while (offset < encoded.size()) {
+      data.clear();
+      assert(journal.ReadSlice(3, offset, 98304, true, &header, &data).empty());
+      const auto& chunk = data.at("chunk");
+      assert(chunk.size() <= 98304 && !chunk.empty());
+      assert(std::equal(chunk.begin(), chunk.end(), encoded.begin() + offset));
+      offset += chunk.size();
+      if (offset < encoded.size())
+        assert(!journal.commands_.Sent(5, 4).empty());
+      assert(!journal.Applied(5, 4).empty());
+    }
+    assert(journal.commands_.Sent(5, 4).empty());
+    assert(journal.Applied(5, 4).empty());
+    assert(journal.originals_.empty());
+    assert(!journal.ReadSlice(3, 0, 98304, true, &header, &data).empty());
+  }
+  assert(aggregate.load() == 0);
   ExceptionState exception;
   for (const int function : {kTexImage2D, kTexSubImage2D}) {
     for (int bits = 0; bits < 64; ++bits) {

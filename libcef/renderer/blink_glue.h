@@ -105,6 +105,7 @@ BLINK_EXPORT std::string WebGlRequest(
     const std::string& stream,
     const std::string& generation,
     const std::string& position,
+    const std::string& offset,
     int max_bytes,
     std::vector<uint8_t>* output,
     std::map<std::string, std::vector<uint8_t>>* originals);

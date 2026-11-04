@@ -3,8 +3,96 @@
 #include <cassert>
 #include <iostream>
 
+template <typename Pending>
+void CheckLargeRead(std::atomic_size_t& bytes) {
+  Pending queue(bytes, 9);
+  const std::string payload(20 * 1024 * 1024, 'x');
+  if constexpr (!requires { typename Pending::Slice; }) {
+    assert(queue.Append(payload).empty());
+    std::string result;
+    uint64_t end = 0;
+    assert(queue.Read(9, 0, 8 * 1024 * 1024, &result, &end).empty());
+  } else {
+    const size_t original_bytes = 12 * 1024 * 1024;
+    const std::string hash(64, 'a');
+    assert(queue.Append(payload, original_bytes, hash).empty());
+    typename Pending::Slice slice;
+    std::string chunk;
+    assert(!queue.ReadSlice(8, 0, 0, 98304, false, &chunk, &slice).empty());
+    assert(!queue.ReadSlice(9, 1, 0, 98304, false, &chunk, &slice).empty());
+    assert(!queue.ReadSlice(9, 0, 1, 98304, false, &chunk, &slice).empty());
+    assert(!queue.ReadSlice(9, 0, 0, 98305, false, &chunk, &slice).empty());
+    std::string result;
+    size_t offset = 0;
+    while (offset < payload.size()) {
+      assert(
+          queue.ReadSlice(9, 0, offset, 98304, false, &chunk, &slice).empty());
+      assert(slice.total == payload.size() && slice.length == chunk.size());
+      assert(slice.original_hash == hash &&
+             slice.original_bytes == original_bytes);
+      assert(slice.length <= 98304 && slice.length > 0);
+      const auto first = chunk;
+      assert(
+          queue.ReadSlice(9, 0, offset, 98304, false, &chunk, &slice).empty());
+      assert(chunk == first);
+      assert(!queue.Sent(9, 1).empty());
+      assert(!queue.Applied(9, 1).empty());
+      result += chunk;
+      offset += chunk.size();
+    }
+    assert(result == payload);
+    assert(!queue.Sent(9, 1).empty());  // The original is still unread.
+    assert(!queue.ReadSlice(9, 0, 1, 98304, true, &chunk, &slice).empty());
+    offset = 0;
+    while (offset < original_bytes) {
+      assert(
+          queue.ReadSlice(9, 0, offset, 98304, true, &chunk, &slice).empty());
+      assert(chunk.empty() && slice.total == original_bytes &&
+             slice.length > 0);
+      offset += slice.length;
+      if (offset < original_bytes) assert(!queue.Sent(9, 1).empty());
+    }
+    assert(queue.Sent(9, 1).empty());
+    assert(queue.Applied(9, 1).empty());
+    assert(!queue.ReadSlice(9, 0, 0, 98304, false, &chunk, &slice).empty());
+    assert(queue.ReadSlice(9, 1, 0, 98304, false, &chunk, &slice).empty());
+    assert(slice.total == 0 && slice.length == 0 && chunk.empty());
+  }
+}
+
+template <typename Pending>
+void CheckAccounting(std::atomic_size_t& bytes) {
+  if constexpr (requires { typename Pending::Reservation; }) {
+    Pending queue(bytes);
+    typename Pending::Reservation held;
+    assert(held.Reserve(bytes, Pending::kLimit - 16));
+    assert(!held.Grow(bytes, 17));
+    assert(!queue.Append("{}").empty());
+    typename Pending::Reservation moved = std::move(held);
+    assert(queue.Append("{}", 0, {}, &moved).empty());
+    assert(bytes.load() < 1024);
+    assert(Pending::JSONStringBound(std::u16string(2 * 1024 * 1024, u'x')) ==
+           2 * 1024 * 1024 + 2);
+    assert(Pending::JSONStringBound(std::u16string(u"\n\"<\U0001f600")) == 16);
+    std::string command;
+    uint64_t end = 0;
+    assert(queue.Append(std::string(200000, 'x')).empty());
+    assert(queue.Read(0, 0, 1024, &command, &end).empty() && end == 1);
+    typename Pending::Slice slice;
+    assert(queue.ReadSlice(0, 1, 0, 98304, false, &command, &slice).empty());
+    assert(queue.ReadSlice(0, 0, 0, 98304, false, &command, &slice).empty());
+    assert(
+        queue.ReadSlice(0, 1, 98304, 98304, false, &command, &slice).empty());
+    assert(!queue.Sent(0, 2).empty());
+  }
+}
+
 int main() {
   std::atomic_size_t bytes{0};
+  CheckLargeRead<blink::ReachWebGLPending>(bytes);
+  assert(bytes.load() == 0);
+  CheckAccounting<blink::ReachWebGLPending>(bytes);
+  assert(bytes.load() == 0);
   {
     blink::ReachWebGLPending queue(bytes);
     std::string commands;
@@ -74,5 +162,6 @@ int main() {
     assert(queue.Sent(9, 1).empty());
     assert(queue.Applied(9, 1).empty());
   }
-  std::cout << "WebGL pending FIFO: lifetime, reads, applied prefixes, aggregate PASS\n";
+  std::cout << "WebGL pending FIFO: lifetime, reads, applied prefixes, "
+               "aggregate PASS\n";
 }

@@ -52,6 +52,11 @@ It covers 150,000 commands with applied-prefix retirement, non-destructive
 reads, duplicate/delayed/future/unread/unsent/stale-generation acknowledgements,
 original-byte delivery budgeting and the shared 256 MiB pending-memory bound.
 Marking a sent prefix is separate from application and does not release memory.
+It also slices a 20 MiB command and 12 MiB original into at most 96 KiB
+pieces, rejecting byte gaps/stale generations/future cursors and preserving
+active read progress across retries of older commands. Neither sent nor applied
+may advance until the entire command **and** original are read. To reproduce
+the pre-slice failure, pass `--baseline 01f14d554`.
 
 These are queue tests, not browser pixel, source-cookie isolation, renderer IPC
 or reload/context-loss qualification. Full CEF builds remain on the canonical
@@ -72,6 +77,15 @@ capture methods, append/retirement methods and production ownership/queue
 headers. Chromium/Skia boundary objects are substituted; no CEF build or
 browser runs. `--baseline-upload` substitutes the fixture index's pre-fix upload
 method and must fail the original-byte assertion.
+The same harness compiles production byte encoding and slicing: a 9 MiB copied
+upload becomes one 12 MiB base64-bearing GL operation, and a 12 MiB original
+is delivered only through its referencing command. It verifies pre-copy budget
+reservation, source ownership shared with pending references, and retirement.
+Direct HTML-image copies also reserve before allocation, transfer the charge
+to pending original ownership once, and release it only on applied retirement.
+`--baseline-limits 01f14d554` reproduces the old copied-upload rejection.
+The base64/JSON, Chromium and Skia boundaries are substituted; these tests
+qualify native sizing/ownership/slice logic, not the underlying codec.
 
 The regression covers 128 combinations of creation/application unpack policy
 and texture/subimage uploads: original references, temporary creation-policy
@@ -93,13 +107,21 @@ provenance and wide-gamut unpack fail explicitly. Original dimensions remain
 at most 4096 each.
 
 The shared 256 MiB budget conservatively includes current-source encoded
-ownership, pending commands and pending originals. A read remains at most
-8 MiB including original bytes; originals are at most 8 MiB minus 1024 bytes.
-Larger otherwise-valid GL inputs are **not generally supported**: copied spans
-above 3 MiB, serialized commands above 4 MiB and individual strings above
-1 MiB fail explicitly. Base64/JSON overhead can reject a copied span at the
-nominal 3 MiB boundary. No native fragmentation or silent splitting changes
-WebGL calls; transport fragments do not remove these native limits.
+ownership, construction reservations, pending serialized capacity/metadata and
+pending originals. The same ImageBitmap encoded allocation is charged once
+when shared with its pending SkData. UTF-8/JSON string expansion, base64 output
+and encoded-source copies are preflighted/reserved; allocation capacity and
+queue metadata are charged before commitment. This is a pending-ownership
+budget, not a bound on all browser heap or transient serializer/read buffers.
+
+The former 1/3/4/8 MiB individual string/span/command/original limits are removed.
+Native responses remain at most 8 MiB; oversized individual operations use
+96 KiB byte-slice IPCs. The existing Rust `read_webgl_commands` facade preserves
+small bounded batches and reassembles an oversized operation without changing
+its GL semantics. `MAX_WEBGL_READ_BYTES` is now the complete 256 MiB read budget,
+including original admission bytes; caller budgets remain enforced. Runtime
+and client complete-batch limits must match; their control-frame bounds do not
+change. Dimensions and client GPU/resource validation remain independent.
 
 Client crash/reload is a fresh-target operation: revoke/close the old target
 and load a fresh page from zero. GPU-state reconstruction is not required.
