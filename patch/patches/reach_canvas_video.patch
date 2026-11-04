@@ -274,7 +274,7 @@ index 8b09e79..6f0eb64 100644
    if (auto* layer = canvas->ContentsCcLayer()) {
      // TODO(crbug.com/705019): For a texture layer canvas, setting the layer
 diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index af26033..b703f83 100644
+index af26033..84dfd06 100644
 --- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -910,6 +910,7 @@ void WebGLRenderingContextBase::drawingBufferStorage(GLenum sizedformat,
@@ -347,7 +347,7 @@ index af26033..b703f83 100644
    }
  
    context_lost_mode_ = mode;
-+  ReachCanvasVideoChanged(true);
++  ReleaseReachCanvasVideo();
    DCHECK_NE(context_lost_mode_, kNotLostContext);
    auto_recovery_method_ = auto_recovery_method;
  

@@ -62,6 +62,20 @@ def main():
             hooks.append(method_body(text, method))
         (output / "reach_canvas_video_hooks.inc").write_text("\n".join(hooks))
         sources.append("reach_canvas_video_hooks_test")
+        lifecycle = []
+        for path, method in [
+                ("core/html/canvas/canvas_rendering_context.cc",
+                 "CanvasRenderingContext::ReachCanvasVideoChanged"),
+                ("core/html/canvas/canvas_rendering_context.cc",
+                 "CanvasRenderingContext::ReleaseReachCanvasVideo"),
+                ("modules/webgl/webgl_rendering_context_base.cc",
+                 "WebGLRenderingContextBase::ForceLostContext")]:
+            text = (args.fixture / "third_party" / "blink" / "renderer"
+                    / path).read_text()
+            lifecycle.append(method_body(text, method))
+        (output / "reach_canvas_video_lifecycle.inc").write_text(
+            "\n".join(lifecycle))
+        sources.append("reach_canvas_video_lifecycle_test")
         mode = (args.fixture / "third_party" / "blink" / "renderer"
                 / "platform" / "graphics" / "canvas_2d_bitmap_provider.cc")
         mode = mode.read_text()
