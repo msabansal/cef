@@ -812,10 +812,10 @@ index 0000000..80b17de
 +}  // namespace blink
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.h third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
 new file mode 100644
-index 0000000..c1d69c7
+index 0000000..b17ee02
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,230 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +
@@ -974,6 +974,8 @@ index 0000000..c1d69c7
 +      return base::Value();
 +    } else if constexpr (requires { value.Get(); }) {
 +      return Encode(command, value.Get());
++    } else if constexpr (requires { value.as_span(); }) {
++      return Encode(command, value.as_span());
 +    } else if constexpr (requires {
 +                           value.has_value();
 +                           *value;
