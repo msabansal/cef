@@ -38,9 +38,15 @@ struct TaskRunner {
 struct Timer {
   void StartOneShot(int, int) {}
 };
+struct LayoutObject {
+  void SetShouldDoFullPaintInvalidation() { invalidated = true; }
+  bool invalidated = false;
+};
 struct HTMLCanvasElement {
   bool IsOffscreenCanvas() const { return false; }
   void NotifyGpuContextLost() {}
+  LayoutObject* GetLayoutObject() { return &layout; }
+  LayoutObject layout;
 };
 struct Canvas2DBitmapProvider {
   static bool IsReachWebGLVideoMode() { return true; }
@@ -104,11 +110,13 @@ int main() {
         1, 1, [] { return std::vector<uint8_t>{255, 0, 0, 255}; }));
     const auto retired_stream = original.stream();
     assert(budget->active.size() == 1);
+    assert(!context.host.layout.invalidated);
 
     context.ForceLostContext(mode, Context::kManual);
     assert(context.isContextLost());
     assert(!context.reach_canvas_video_);
     assert(budget->active.empty());
+    assert(context.host.layout.invalidated);
     context.ForceLostContext(mode, Context::kManual);
     assert(!context.reach_canvas_video_);
 

@@ -1,5 +1,5 @@
 diff --git third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
-index 9ef16aa..4a891a2 100644
+index 9ef16aa..a7efcca 100644
 --- third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
 +++ third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
 @@ -26,6 +26,7 @@
@@ -34,7 +34,7 @@ index 9ef16aa..4a891a2 100644
  #include "ui/accessibility/accessibility_features.h"
  #include "ui/gfx/geometry/rect_conversions.h"
  #include "ui/gfx/geometry/size_conversions.h"
-@@ -67,6 +71,95 @@ BASE_FEATURE(kAllowAcceleratedTexElement, base::FEATURE_ENABLED_BY_DEFAULT);
+@@ -67,6 +71,100 @@ BASE_FEATURE(kAllowAcceleratedTexElement, base::FEATURE_ENABLED_BY_DEFAULT);
  // element to update its accessibility related information. This value is chosen
  // arbitrarily and can be subject to optimization.
  constexpr base::TimeDelta kAccessibilityUkmRecordingDelay = base::Seconds(5);
@@ -63,9 +63,14 @@ index 9ef16aa..4a891a2 100644
 +void CanvasRenderingContext::ReleaseReachCanvasVideo() {
 +  if (!reach_canvas_video_)
 +    return;
-+  if (Host() && !Host()->IsOffscreenCanvas() &&
-+      reach_canvas_video_change_callback)
-+    reach_canvas_video_change_callback(static_cast<HTMLCanvasElement*>(Host()));
++  if (Host() && !Host()->IsOffscreenCanvas()) {
++    auto* canvas = static_cast<HTMLCanvasElement*>(Host());
++    // Cached paint must not retain the retired stream's marker.
++    if (auto* layout = canvas->GetLayoutObject())
++      layout->SetShouldDoFullPaintInvalidation();
++    if (reach_canvas_video_change_callback)
++      reach_canvas_video_change_callback(canvas);
++  }
 +  reach_canvas_video_.reset();
 +}
 +
@@ -130,7 +135,7 @@ index 9ef16aa..4a891a2 100644
  }
  
  CanvasRenderingContext::CanvasRenderingContext(
-@@ -90,6 +183,7 @@ CanvasRenderingContext::CanvasRenderingContext(
+@@ -90,6 +188,7 @@ CanvasRenderingContext::CanvasRenderingContext(
  }
  
  void CanvasRenderingContext::Dispose() {
