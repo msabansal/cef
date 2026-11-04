@@ -1,0 +1,587 @@
+diff --git third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
+index 9ef16aa..4a891a2 100644
+--- third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
++++ third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
+@@ -26,6 +26,7 @@
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h"
+ 
+ #include "base/byte_size.h"
++#include "base/no_destructor.h"
+ #include "base/strings/stringprintf.h"
+ #include "services/metrics/public/cpp/ukm_builders.h"
+ #include "third_party/blink/public/common/features.h"
+@@ -33,6 +34,7 @@
+ #include "third_party/blink/renderer/bindings/core/v8/v8_union_element_elementimage.h"
+ #include "third_party/blink/renderer/core/animation_frame/worker_animation_frame_provider.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_context_creation_attributes_core.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_image_source.h"
+ #include "third_party/blink/renderer/core/html/canvas/element_image.h"
+@@ -46,6 +48,7 @@
+ #include "third_party/blink/renderer/core/paint/paint_layer_painter.h"
+ #include "third_party/blink/renderer/core/workers/worker_global_scope.h"
+ #include "third_party/blink/renderer/platform/graphics/accelerated_static_bitmap_image.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
+ #include "third_party/blink/renderer/platform/graphics/canvas_non_2d_resource_provider.h"
+ #include "third_party/blink/renderer/platform/graphics/gpu/shared_gpu_context.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/paint_canvas.h"
+@@ -55,6 +58,7 @@
+ #include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ #include "third_party/blink/renderer/platform/wtf/functional.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
++#include "third_party/skia/include/core/SkColorSpace.h"
+ #include "ui/accessibility/accessibility_features.h"
+ #include "ui/gfx/geometry/rect_conversions.h"
+ #include "ui/gfx/geometry/size_conversions.h"
+@@ -67,6 +71,95 @@ BASE_FEATURE(kAllowAcceleratedTexElement, base::FEATURE_ENABLED_BY_DEFAULT);
+ // element to update its accessibility related information. This value is chosen
+ // arbitrarily and can be subject to optimization.
+ constexpr base::TimeDelta kAccessibilityUkmRecordingDelay = base::Seconds(5);
++void (*reach_canvas_video_change_callback)(HTMLCanvasElement*) = nullptr;
++}  // namespace
++
++void CanvasRenderingContext::SetReachCanvasVideoChangeCallback(
++    void (*callback)(HTMLCanvasElement*)) {
++  reach_canvas_video_change_callback = callback;
++}
++
++void CanvasRenderingContext::ReachCanvasVideoChanged(bool epoch) {
++  if (!Canvas2DBitmapProvider::IsReachWebGLVideoMode() || !IsWebGL() ||
++      !Host() || Host()->IsOffscreenCanvas())
++    return;
++  if (!reach_canvas_video_)
++    reach_canvas_video_ = std::make_unique<ReachCanvasVideo>();
++  if (epoch)
++    reach_canvas_video_->Epoch();
++  else
++    reach_canvas_video_->Dirty();
++  if (reach_canvas_video_change_callback)
++    reach_canvas_video_change_callback(static_cast<HTMLCanvasElement*>(Host()));
++}
++
++void CanvasRenderingContext::ReleaseReachCanvasVideo() {
++  if (!reach_canvas_video_)
++    return;
++  if (Host() && !Host()->IsOffscreenCanvas() &&
++      reach_canvas_video_change_callback)
++    reach_canvas_video_change_callback(static_cast<HTMLCanvasElement*>(Host()));
++  reach_canvas_video_.reset();
++}
++
++bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
++  if (!Canvas2DBitmapProvider::IsReachWebGLVideoMode() || !IsWebGL())
++    return true;
++  if (!Host() || Host()->IsOffscreenCanvas())
++    return false;
++  auto* canvas = static_cast<HTMLCanvasElement*>(Host());
++  auto* frame = canvas->GetDocument().GetFrame();
++  if (!canvas->isConnected() || !frame || !frame->IsAttached()) {
++    ReleaseReachCanvasVideo();
++    return false;
++  }
++  if (!reach_canvas_video_)
++    ReachCanvasVideoChanged();
++  auto& capture = *reach_canvas_video_;
++  if (frame->LocalFrameRoot().Tree().Parent())
++    return capture.Fail("Out-of-process WebGL video is unsupported");
++  if (isContextLost())
++    return capture.Fail("WebGL video context is lost");
++  if (!ReachCanvasVideoIsSDR())
++    return capture.Fail("HDR or F16 WebGL video is unsupported");
++  using Budgets =
++      std::map<LocalFrame*, std::weak_ptr<ReachCanvasVideo::Budget>>;
++  static base::NoDestructor<Budgets> budgets;
++  std::erase_if(*budgets,
++                [](const auto& entry) { return entry.second.expired(); });
++  auto& weak = (*budgets)[&frame->LocalFrameRoot()];
++  auto budget = weak.lock();
++  if (!budget) {
++    budget = std::make_shared<ReachCanvasVideo::Budget>();
++    weak = budget;
++  }
++  capture.SetBudget(std::move(budget));
++  const auto size = ReachCanvasVideoSize();
++  if (size != canvas->Size())
++    return capture.Fail(
++        "WebGL video drawing buffer differs from logical canvas");
++  auto* document = &canvas->GetDocument();
++  return capture.Checkpoint(size.width(), size.height(), [&] {
++    auto snapshot = GetRGBAUnacceleratedStaticBitmapImage(kBackBuffer);
++    if (!snapshot || snapshot->GetSize() != size ||
++        snapshot->GetColorSpace().IsHDR() ||
++        snapshot->PaintImageForCurrentFrame().GetColorType() ==
++            kRGBA_F16_SkColorType) {
++      capture.Fail("WebGL video SDR snapshot unavailable");
++      return std::vector<uint8_t>();
++    }
++    const auto info =
++        SkImageInfo::Make(size.width(), size.height(), kRGBA_8888_SkColorType,
++                          kUnpremul_SkAlphaType, SkColorSpace::MakeSRGB());
++    const auto bytes = snapshot->CopyImageData(info, false);
++    if (!canvas->isConnected() || canvas->RenderingContext() != this ||
++        &canvas->GetDocument() != document || !frame->IsAttached() ||
++        isContextLost() || ReachCanvasVideoSize() != size) {
++      capture.Fail("WebGL video context changed during snapshot");
++      return std::vector<uint8_t>();
++    }
++    return std::vector<uint8_t>(bytes.begin(), bytes.end());
++  });
+ }
+ 
+ CanvasRenderingContext::CanvasRenderingContext(
+@@ -90,6 +183,7 @@ CanvasRenderingContext::CanvasRenderingContext(
+ }
+ 
+ void CanvasRenderingContext::Dispose() {
++  ReleaseReachCanvasVideo();
+   RenderTaskEnded();
+ 
+   if (did_schedule_accessibility_ukm_recording_) {
+diff --git third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
+index 0af2916..78d7ea7 100644
+--- third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
++++ third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
+@@ -39,6 +39,7 @@
+ #include "third_party/blink/renderer/core/html/canvas/canvas_performance_monitor.h"
+ #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context_host.h"
+ #include "third_party/blink/renderer/platform/graphics/graphics_types_3d.h"
++#include "third_party/blink/renderer/platform/graphics/reach_canvas_video.h"
+ #include "third_party/blink/renderer/platform/heap/member.h"
+ #include "third_party/blink/renderer/platform/heap/prefinalizer.h"
+ #include "third_party/blink/renderer/platform/heap/visitor.h"
+@@ -74,6 +75,7 @@ class Element;
+ class ExceptionState;
+ class ExecutionContext;
+ class ImageBitmap;
++class HTMLCanvasElement;
+ class ReachWebGLJournal;
+ class ScriptState;
+ class StaticBitmapImage;
+@@ -136,6 +138,15 @@ class CORE_EXPORT CanvasRenderingContext
+     return canvas_rendering_type_ == CanvasRenderingAPI::kWebgpu;
+   }
+   virtual ReachWebGLJournal* GetReachWebGLJournal() { return nullptr; }
++  ReachCanvasVideo* GetReachCanvasVideo() const {
++    return reach_canvas_video_.get();
++  }
++  void ReachCanvasVideoChanged(bool epoch = false);
++  void ReleaseReachCanvasVideo();
++  bool CheckpointReachCanvasVideo();
++  virtual gfx::Size ReachCanvasVideoSize() const { return {}; }
++  virtual bool ReachCanvasVideoIsSDR() const { return false; }
++  static void SetReachCanvasVideoChangeCallback(void (*)(HTMLCanvasElement*));
+ 
+   // ActiveScriptWrappable
+   // As this class inherits from ActiveScriptWrappable, as long as
+@@ -325,7 +336,10 @@ class CORE_EXPORT CanvasRenderingContext
+ 
+   void DidMoveToNewDocument(Document*);
+ 
+-  void DetachHost() { host_ = nullptr; }
++  void DetachHost() {
++    ReleaseReachCanvasVideo();
++    host_ = nullptr;
++  }
+ 
+   const CanvasContextCreationAttributesCore& CreationAttributes() const {
+     return creation_attributes_;
+@@ -362,6 +376,7 @@ class CORE_EXPORT CanvasRenderingContext
+   std::optional<cc::PaintRecord> empty_recording_;
+ 
+  private:
++  std::unique_ptr<ReachCanvasVideo> reach_canvas_video_;
+   Member<CanvasRenderingContextHost> host_;
+   CanvasContextCreationAttributesCore creation_attributes_;
+ 
+diff --git third_party/blink/renderer/core/html/canvas/html_canvas_element.cc third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index c6b3332..937b02c 100644
+--- third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -718,6 +718,8 @@ void HTMLCanvasElement::InitializeLayerWithCSSProperties(cc::Layer* layer) {
+ }
+ 
+ void HTMLCanvasElement::PostFinalizeFrame(FlushReason reason) {
++  if (context_)
++    context_->CheckpointReachCanvasVideo();
+   RecordCanvasSizeToUMA();
+ 
+   if (IsWebGL()) {
+@@ -1176,6 +1178,8 @@ bool HTMLCanvasElement::PaintsIntoCanvasBuffer() const {
+ }
+ 
+ void HTMLCanvasElement::NotifyListenersCanvasChanged() {
++  if (context_)
++    context_->CheckpointReachCanvasVideo();
+   if (listeners_.size() == 0)
+     return;
+ 
+@@ -1333,8 +1337,11 @@ void HTMLCanvasElement::Paint(GraphicsContext& context,
+ 
+ void HTMLCanvasElement::PaintInternal(GraphicsContext& context,
+                                       const PhysicalRect& r) {
+-  if (Canvas2DBitmapProvider::IsReachWebGLCommandMode() &&
++  if ((Canvas2DBitmapProvider::IsReachWebGLCommandMode() ||
++       Canvas2DBitmapProvider::IsReachWebGLVideoMode()) &&
+       IsReachMediaCapture() && IsWebGL()) {
++    if (!RenderingContext()->CheckpointReachCanvasVideo())
++      return;
+     auto* target = context.Canvas();
+     cc::PaintCanvasAutoRestore restore(target, true);
+     target->translate(r.X(), r.Y());
+@@ -1915,8 +1922,10 @@ void HTMLCanvasElement::ContextDestroyed() {
+     // skipped.
+     accessibility_manager_->FlushUmaIfNeeded();
+   }
+-  if (context_)
++  if (context_) {
++    context_->ReleaseReachCanvasVideo();
+     context_->Stop();
++  }
+ }
+ 
+ bool HTMLCanvasElement::StyleChangeNeedsDidDraw(
+@@ -1978,6 +1987,8 @@ void HTMLCanvasElement::LangAttributeChanged() {
+ }
+ 
+ void HTMLCanvasElement::DidMoveToNewDocument(Document& old_document) {
++  if (context_)
++    context_->ReachCanvasVideoChanged(true);
+   SetExecutionContext(GetExecutionContext());
+   SetPage(GetDocument().GetPage());
+   HTMLElement::DidMoveToNewDocument(old_document);
+@@ -1989,6 +2000,8 @@ void HTMLCanvasElement::DidRecalcStyle(const StyleRecalcChange change) {
+ }
+ 
+ void HTMLCanvasElement::RemovedFrom(ContainerNode& insertion_point) {
++  if (context_)
++    context_->ReachCanvasVideoChanged(true);
+   HTMLElement::RemovedFrom(insertion_point);
+   ColorSchemeMayHaveChanged();
+ }
+diff --git third_party/blink/renderer/core/paint/html_canvas_painter.cc third_party/blink/renderer/core/paint/html_canvas_painter.cc
+index 8b09e79..6f0eb64 100644
+--- third_party/blink/renderer/core/paint/html_canvas_painter.cc
++++ third_party/blink/renderer/core/paint/html_canvas_painter.cc
+@@ -69,7 +69,8 @@ void HTMLCanvasPainter::PaintReplaced(const PaintInfo& paint_info,
+   }
+ 
+   const bool reach_webgl_commands =
+-      Canvas2DBitmapProvider::IsReachWebGLCommandMode() &&
++      (Canvas2DBitmapProvider::IsReachWebGLCommandMode() ||
++       Canvas2DBitmapProvider::IsReachWebGLVideoMode()) &&
+       IsReachMediaCapture() && canvas->IsWebGL();
+   if (auto* layer = canvas->ContentsCcLayer()) {
+     // TODO(crbug.com/705019): For a texture layer canvas, setting the layer
+diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index af26033..b703f83 100644
+--- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -910,6 +910,7 @@ void WebGLRenderingContextBase::drawingBufferStorage(GLenum sizedformat,
+ 
+   GetDrawingBuffer()->ResizeWithFormat(sizedformat, alpha_type,
+                                        gfx::Size(width, height));
++  ReachCanvasVideoChanged(true);
+ }
+ 
+ scoped_refptr<StaticBitmapImage> WebGLRenderingContextBase::GetImage() {
+@@ -1576,6 +1577,7 @@ void WebGLRenderingContextBase::InitializeNewContext() {
+   // initialized. Restore it now.
+   GetDrawingBuffer()->RestoreAllState();
+   ActivateContext(this);
++  ReachCanvasVideoChanged(true);
+   ReachJournal();
+ }
+ 
+@@ -1684,6 +1686,8 @@ void WebGLRenderingContextBase::MarkContextChanged(
+     return;
+   }
+ 
++  ReachCanvasVideoChanged();
++
+   // Regardless of whether dirty propagations are optimized away, the back
+   // buffer is now out of sync with respect to the canvas's internal backing
+   // store -- which is only used for certain purposes, like printing.
+@@ -1769,6 +1773,12 @@ void WebGLRenderingContextBase::OnErrorMessage(const char* message,
+   NotifyWebGLErrorOrWarning(message);
+ }
+ 
++bool WebGLRenderingContextBase::ReachCanvasVideoIsSDR() const {
++  const auto format = drawingBufferFormat();
++  return (format == GL_RGBA8 || format == GL_SRGB8_ALPHA8) &&
++         !GetColorSpace().IsHDR();
++}
++
+ ReachWebGLJournal* WebGLRenderingContextBase::ReachJournal() {
+   if (!Canvas2DBitmapProvider::IsReachWebGLCommandMode() || !Host() ||
+       Host()->IsOffscreenCanvas() || isContextLost())
+@@ -1940,8 +1950,10 @@ void WebGLRenderingContextBase::RestoreActiveTexture() {
+ }
+ 
+ void WebGLRenderingContextBase::MarkLayerComposited() {
+-  if (!isContextLost())
++  if (!isContextLost()) {
++    CheckpointReachCanvasVideo();
+     GetDrawingBuffer()->SetBufferClearNeeded(true);
++  }
+ }
+ 
+ bool WebGLRenderingContextBase::OnMemoryDump(
+@@ -2471,6 +2483,7 @@ void WebGLRenderingContextBase::Reshape(int width, int height) {
+   // buffer will also start off clear (and this matches what reshape will do).
+   GetDrawingBuffer()->Resize(gfx::Size(width, height));
+   GetDrawingBuffer()->MarkContentsChanged();
++  ReachCanvasVideoChanged(true);
+   if (reach_journal_)
+     reach_journal_->Resize(drawingBufferWidth(), drawingBufferHeight());
+ 
+@@ -2524,6 +2537,7 @@ void WebGLRenderingContextBase::setDrawingBufferColorSpace(
+   drawing_buffer_color_space_ = color_space;
+   if (GetDrawingBuffer())
+     GetDrawingBuffer()->SetColorSpace(drawing_buffer_color_space_);
++  ReachCanvasVideoChanged(true);
+ }
+ 
+ CanvasToneMapping* WebGLRenderingContextBase::drawingBufferToneMapping(
+@@ -7882,6 +7896,7 @@ void WebGLRenderingContextBase::ForceLostContext(
+   }
+ 
+   context_lost_mode_ = mode;
++  ReachCanvasVideoChanged(true);
+   DCHECK_NE(context_lost_mode_, kNotLostContext);
+   auto_recovery_method_ = auto_recovery_method;
+ 
+diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
+index 2a9fe21..d28b8c7 100644
+--- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
++++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
+@@ -152,6 +152,10 @@ class MODULES_EXPORT WebGLRenderingContextBase
+ 
+   ReachWebGLJournal* ReachJournal();
+   ReachWebGLJournal* GetReachWebGLJournal() override { return ReachJournal(); }
++  gfx::Size ReachCanvasVideoSize() const override {
++    return gfx::Size(drawingBufferWidth(), drawingBufferHeight());
++  }
++  bool ReachCanvasVideoIsSDR() const override;
+   ReachWebGLJournal* ReachExistingJournal() const {
+     return reach_journal_.get();
+   }
+diff --git third_party/blink/renderer/platform/BUILD.gn third_party/blink/renderer/platform/BUILD.gn
+index 8aed8b5..c394988 100644
+--- third_party/blink/renderer/platform/BUILD.gn
++++ third_party/blink/renderer/platform/BUILD.gn
+@@ -1243,6 +1243,7 @@ component("platform") {
+     "graphics/profiling_canvas.h",
+     "graphics/raster_dark_mode_filter_impl.cc",
+     "graphics/raster_dark_mode_filter_impl.h",
++    "graphics/reach_canvas_video.h",
+     "graphics/reach_image_bitmap_original.h",
+     "graphics/replaying_canvas.cc",
+     "graphics/replaying_canvas.h",
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
+index 8e9390a..788efd3 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
++++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
+@@ -49,7 +49,16 @@ bool Canvas2DBitmapProvider::IsReachWebGLCommandMode() {
+     auto environment = base::Environment::Create();
+     return environment->GetVar("REACH_WEBGL_COMMAND_REPLAY") == "1";
+   }();
+-  return enabled && IsReachCommandMode();
++  return enabled && IsReachCommandMode() && !IsReachWebGLVideoMode();
++}
++
++bool Canvas2DBitmapProvider::IsReachWebGLVideoMode() {
++  static const bool enabled = [] {
++    auto environment = base::Environment::Create();
++    return environment->GetVar("REACH_WEBGL_VIDEO") == "1";
++  }();
++  return enabled && IsReachCommandMode() &&
++         base::CommandLine::ForCurrentProcess()->HasSwitch("reach-webgl-video");
+ }
+ 
+ std::atomic_size_t& Canvas2DBitmapProvider::ReachWebGLPendingBytes() {
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
+index a5974e6..6ead245 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
++++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
+@@ -71,6 +71,7 @@ class PLATFORM_EXPORT Canvas2DBitmapProvider final
+ 
+   static bool IsReachCommandMode();
+   static bool IsReachWebGLCommandMode();
++  static bool IsReachWebGLVideoMode();
+   static std::atomic_size_t& ReachWebGLPendingBytes();
+   bool IsValid() const { return IsReachCommandMode() || GetSkSurface(); }
+   void SetDelegate(CanvasResourceProviderDelegate* delegate) {
+diff --git third_party/blink/renderer/platform/graphics/reach_canvas_video.h third_party/blink/renderer/platform/graphics/reach_canvas_video.h
+new file mode 100644
+index 0000000..57d40d8
+--- /dev/null
++++ third_party/blink/renderer/platform/graphics/reach_canvas_video.h
+@@ -0,0 +1,167 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_CANVAS_VIDEO_H_
++#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_CANVAS_VIDEO_H_
++
++#include <atomic>
++#include <cstdint>
++#include <limits>
++#include <map>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace blink {
++
++// CPU-owned current content, never a queue of rendered historical frames.
++class ReachCanvasVideo {
++ public:
++  struct Inventory {
++    bool Add(int width, int height) {
++      if (width < 1 || height < 1 || width > 3840 || height > 2160 ||
++          count == 4)
++        return false;
++      const uint64_t even = uint64_t((width + 1) & ~1) * ((height + 1) & ~1);
++      const uint64_t coded =
++          uint64_t((width + 15) & ~15) * ((height + 15) & ~15);
++      if (pixels + even > 4194304 ||
++          codec + coded * 64 + 4 * 1024 * 1024 > 320 * 1024 * 1024)
++        return false;
++      ++count;
++      pixels += even;
++      codec += coded * 64 + 4 * 1024 * 1024;
++      return true;
++    }
++    unsigned count = 0;
++    uint64_t pixels = 0;
++    uint64_t codec = 0;
++  };
++
++  struct Budget {
++    bool Admit(uint64_t stream, int width, int height) {
++      Inventory inventory;
++      for (const auto& [id, size] : active) {
++        if (id != stream && !inventory.Add(size.first, size.second))
++          return false;
++      }
++      if (!inventory.Add(width, height))
++        return false;
++      active[stream] = {width, height};
++      return true;
++    }
++    std::map<uint64_t, std::pair<int, int>> active;
++  };
++
++  ReachCanvasVideo() : stream_(AllocateStream()) {
++    if (!stream_)
++      Fail("WebGL video stream identity exhausted");
++  }
++  ~ReachCanvasVideo() { ReleaseBudget(); }
++  ReachCanvasVideo(const ReachCanvasVideo&) = delete;
++  ReachCanvasVideo& operator=(const ReachCanvasVideo&) = delete;
++
++  void SetBudget(std::shared_ptr<Budget> budget) {
++    if (budget_ != budget) {
++      ReleaseBudget();
++      budget_ = std::move(budget);
++      Epoch();
++    }
++  }
++  void Dirty() {
++    if (revision_ == std::numeric_limits<uint64_t>::max()) {
++      Fail("WebGL video content revision exhausted");
++      return;
++    }
++    ++revision_;
++  }
++  void Epoch() {
++    ReleaseBudget();
++    rgba_.clear();
++    rgba_.shrink_to_fit();
++    if (generation_ == std::numeric_limits<uint64_t>::max()) {
++      Fail("WebGL video generation exhausted");
++      return;
++    }
++    ++generation_;
++    error_.clear();
++    Dirty();
++  }
++  bool Fail(std::string error) {
++    error_ = std::move(error);
++    rgba_.clear();
++    rgba_.shrink_to_fit();
++    return false;
++  }
++
++  template <typename Read>
++  bool Checkpoint(int width, int height, Read read) {
++    if (!stream_)
++      return Fail("WebGL video stream identity exhausted");
++    if (!error_.empty())
++      return false;
++    Inventory dimensions;
++    if (!dimensions.Add(width, height))
++      return Fail("WebGL video dimensions or aggregate budget exceeded");
++    if (width_ != width || height_ != height) {
++      if (width_)
++        Epoch();
++      width_ = width;
++      height_ = height;
++    }
++    if (budget_ && !budget_->Admit(stream_, width, height))
++      return Fail("WebGL video dimensions or aggregate budget exceeded");
++    if (captured_ == revision_ && !rgba_.empty())
++      return true;
++    if (sequence_ == std::numeric_limits<uint64_t>::max())
++      return Fail("WebGL video sequence exhausted");
++    const uint64_t revision = revision_;
++    auto bytes = read();
++    if (!error_.empty())
++      return false;
++    if (bytes.size() != uint64_t(width) * height * 4 || revision != revision_)
++      return Fail("WebGL video snapshot truncated or context changed");
++    rgba_ = std::move(bytes);
++    captured_ = revision;
++    ++sequence_;
++    return true;
++  }
++
++  uint64_t stream() const { return stream_; }
++  uint64_t generation() const { return generation_; }
++  uint64_t sequence() const { return sequence_; }
++  int width() const { return width_; }
++  int height() const { return height_; }
++  const std::vector<uint8_t>& rgba() const { return rgba_; }
++  const std::string& error() const { return error_; }
++
++ private:
++  static std::atomic_uint64_t& NextStream() {
++    static std::atomic_uint64_t next{1};
++    return next;
++  }
++  static uint64_t AllocateStream() {
++    auto& next = NextStream();
++    uint64_t value = next.load();
++    while (value && value != std::numeric_limits<uint64_t>::max()) {
++      if (next.compare_exchange_weak(value, value + 1))
++        return value;
++    }
++    return 0;
++  }
++  void ReleaseBudget() {
++    if (budget_)
++      budget_->active.erase(stream_);
++  }
++  const uint64_t stream_;
++  uint64_t generation_ = 1;
++  uint64_t sequence_ = 0;
++  uint64_t revision_ = 1;
++  uint64_t captured_ = 0;
++  int width_ = 0;
++  int height_ = 0;
++  std::shared_ptr<Budget> budget_;
++  std::vector<uint8_t> rgba_;
++  std::string error_;
++};
++
++}  // namespace blink
++#endif  // THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_CANVAS_VIDEO_H_

@@ -68,6 +68,78 @@ These are queue tests, not browser pixel, source-cookie isolation, renderer IPC
 or reload/context-loss qualification. Full CEF builds remain on the canonical
 build VM. Pending delivery is not a reconstruction checkpoint.
 
+## Reach canvas-only AVC444 snapshots
+
+The matched reach-cef runtime selects this opt-in drawing mode with
+`Runtime::start_commands_with_canvas_video(config)`, after projecting
+`REACH_WEBGL_VIDEO=1` and `REACH_WEBGL_COMMAND_REPLAY=0`. Both browser and
+children receive `--reach-drawing-commands --reach-webgl-video`. Values other
+than `"1"` do not enable video. Ordinary commands and full VIDEO are unchanged;
+the video switch excludes the WebGL journal even if its legacy flag is present.
+
+`reach_canvas_video.patch` snapshots the actual logical drawing buffer before
+`MarkLayerComposited`, the canvas marker paint, `PostFinalizeFrame`'s early
+resource export, and canvas-listener export. Unchanged paints reuse owned
+pixels, not a reread of a discarded backbuffer. Default-buffer dirty revisions
+precede Blink's ordinary dirty coalescing, including alpha-only changes;
+user-framebuffer changes do not dirty that snapshot. Loss, resize, adoption and
+removal advance epochs, and document/context destruction releases ownership.
+Notifications use the existing coalesced frame-request path independently of
+the command journal.
+
+The implementation uses the pinned Chromium public
+`GetRGBAUnacceleratedStaticBitmapImage(kBackBuffer)` and
+`StaticBitmapImage::CopyImageData` APIs. DrawingBuffer's RGBA snapshot already
+has top-left origin; the copy requests RGBA8888, unpremultiplied alpha and sRGB.
+Worker OffscreenCanvas, out-of-process WebGL, HDR and F16 fail explicitly.
+HTML and Canvas2D still use their command records; no viewport crop or encoded
+image substitute is produced.
+
+Every successful video capture has a typed LIST at IPC argument 9, including
+an authoritative empty list. Each exact DICTIONARY contains integer
+`id,width,height`, string `document,stream,generation,sequence`, and binary
+`rgba`. Full replies reserve NULL at 6–8; incremental replies retain refs/chunks
+and NULL-or-BINARY scroll at 8. The complete inventory includes hidden canvases;
+only painted markers receive the matching `webgl-video` media-state annotation.
+The root's native document token binds all records to the capture transaction.
+
+Admission precedes readback: four streams, dimensions 1–3840 by 1–2160,
+4,194,304 aggregate even-padded pixels, and at most 16 MiB per raw inventory.
+Target-shared admission includes unchanged retained snapshots. During readback,
+current ownership plus prior response records and the bitmap/copy/new-vector
+scratch remain within 64 MiB. During IPC, the temporary raw response inventory
+is released before serialization, leaving room for retained pixels, CEF values,
+wire serialization and the receiver copy (four inventories). This bounds owned
+pixel representations, not total browser RSS. Codec reservation is separately
+bounded by 64 bytes per 16-aligned pixel plus 4 MiB per stream, at most 320 MiB.
+
+```powershell
+python tests\run_reach_canvas_video_patch_test.py --fixture <unmodified-chromium>
+python tests\run_reach_canvas_video_test.py --compiler cl --fixture <printed-patched-checkout>
+```
+
+The first runner independently verifies ten input paths against Chromium
+`9ce0cc67aed57702fcfc011b9e49b0b02d7d5e3a`, applies the relevant configured
+predecessor hunks, and checks exact new-patch blobs and strict forward, reverse
+and reapplication. It creates its own `.artifacts` checkout; the input is never
+changed. No source download occurs during a test. The second compiles the
+production ownership header, actual typed IPC packing, and actual dirty,
+compositor and early-export method bodies with substituted Chromium boundaries.
+It also runs the actual mode-selection functions in isolated processes, covering
+command defaults, exact `"1"` enablement, conflicting legacy flags and full
+VIDEO isolation.
+Omit `--fixture` to run ownership and IPC tests alone. `--baseline-hook dirty`,
+`composited` or `finalize` substitutes that pre-video method and must fail its
+pixel/alpha assertion. These are portable behavioral regressions, **not**
+native capture qualification.
+
+Actual CEF/Linux compilation belongs to the canonical Azure build. Activation
+still requires moving native WebGL1/2 pixels, alpha/HTML/Canvas2D overlap,
+transforms/clips/opacity, trusted input, independent/hidden streams,
+loss/restore/resize/navigation isolation and command/video mode switching.
+Neither these tests nor separately decoded synthetic metadata prove native
+browser capture or qualify the combined deployment.
+
 ## Reach encoded ImageBitmap originals
 
 From a Visual Studio developer shell:

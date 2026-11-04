@@ -220,6 +220,10 @@ void OnWebGlChanged(blink::HTMLCanvasElement* element) {
   if (!frame || !frame->IsAttached())
     return;
   auto& root = frame->LocalFrameRoot();
+  if (blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode()) {
+    OnFrameRequested(root);
+    return;
+  }
   if (WebGlChangeCallback()) {
     if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
       WebGlChangeCallback()(web_frame);
@@ -236,9 +240,15 @@ bool WebGlDecimal(const std::string& text, uint64_t* value) {
 
 void SetWebGlChangeCallback(
     std::function<void(blink::WebLocalFrame*)> callback) {
-  if (!blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode())
+  if (!blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode() &&
+      !blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode())
     return;
   WebGlChangeCallback() = std::move(callback);
+  if (blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode()) {
+    blink::CanvasRenderingContext::SetReachCanvasVideoChangeCallback(
+        &OnWebGlChanged);
+    return;
+  }
   blink::ReachWebGLJournal::SetChangeCallback(&OnWebGlChanged);
   blink::ReachWebGLJournal::SetOriginalHasher(
       [](base::span<const uint8_t> bytes) {
@@ -1381,7 +1391,29 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
         continue;
       }
       auto* context = element->RenderingContext();
+      if (!dependencies->raster &&
+          blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode() &&
+          element->IsOffscreenCanvasRegistered()) {
+        dependencies->error = "Worker OffscreenCanvas video is unsupported";
+        return std::nullopt;
+      }
       if (context && context->IsWebGL()) {
+        if (!dependencies->raster &&
+            blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode()) {
+          if (web_frame->Parent()) {
+            dependencies->error = "Out-of-process WebGL video is unsupported";
+            return std::nullopt;
+          }
+          if (context->isContextLost())
+            continue;
+          if (!context->CheckpointReachCanvasVideo()) {
+            const auto* snapshot = context->GetReachCanvasVideo();
+            dependencies->error = snapshot ? snapshot->error()
+                                           : "WebGL video snapshot unavailable";
+            return std::nullopt;
+          }
+          continue;
+        }
         const auto size = element->Size();
         const uint64_t pixels =
             uint64_t(std::max(0, size.width())) * std::max(0, size.height());
@@ -3286,6 +3318,12 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
     }
   }
   std::map<uint32_t, sk_sp<SkData>> media_states;
+  const bool canvas_video =
+      blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode();
+  if (canvas_video)
+    result.canvas_video.emplace();
+  blink::ReachCanvasVideo::Inventory canvas_inventory;
+  size_t canvas_bytes = 0;
   for (blink::Frame* tree_frame = frame.Get(); tree_frame;
        tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
     if (!IsInlinePaintFrame(frame.Get(), tree_frame)) {
@@ -3299,6 +3337,55 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
     ObserveMediaState(media_document->domWindow());
     for (auto& node :
          blink::FlatTreeTraversal::DescendantsOf(*media_document)) {
+      if (auto* canvas = blink::DynamicTo<blink::HTMLCanvasElement>(node);
+          canvas && canvas_video) {
+        if (canvas->IsOffscreenCanvasRegistered()) {
+          result.error = "Worker OffscreenCanvas video is unsupported";
+          return result;
+        }
+        auto* context = canvas->RenderingContext();
+        if (!context || !context->IsWebGL() || context->isContextLost())
+          continue;
+        if (web_frame->Parent() || !context->CheckpointReachCanvasVideo()) {
+          const auto* snapshot = context->GetReachCanvasVideo();
+          result.error =
+              snapshot ? snapshot->error() : "WebGL video snapshot unavailable";
+          return result;
+        }
+        const auto& snapshot = *context->GetReachCanvasVideo();
+        if (!canvas_inventory.Add(snapshot.width(), snapshot.height()) ||
+            snapshot.rgba().empty() ||
+            snapshot.rgba().size() > 16 * 1024 * 1024 - canvas_bytes) {
+          result.error = "WebGL video inventory budget exceeded";
+          return result;
+        }
+        canvas_bytes += snapshot.rgba().size();
+        result.canvas_video->push_back(
+            {static_cast<uint32_t>(canvas->GetDomNodeId()),
+             document->Token().ToString(),
+             base::NumberToString(snapshot.stream()),
+             base::NumberToString(snapshot.generation()),
+             base::NumberToString(snapshot.sequence()), snapshot.width(),
+             snapshot.height(), snapshot.rgba()});
+        if (dependencies.media_ids.contains(canvas->GetDomNodeId())) {
+          base::DictValue state;
+          state.Set("id", canvas->GetDomNodeId());
+          state.Set("kind", "webgl-video");
+          state.Set("stream", base::NumberToString(snapshot.stream()));
+          state.Set("generation", base::NumberToString(snapshot.generation()));
+          state.Set("width", snapshot.width());
+          state.Set("height", snapshot.height());
+          auto json = base::WriteJson(state);
+          if (!json) {
+            result.error = "WebGL video state serialization failed";
+            return result;
+          }
+          media_states.emplace(
+              canvas->GetDomNodeId(),
+              SkData::MakeWithCopy(json->data(), json->size()));
+        }
+        continue;
+      }
       if (auto* canvas = blink::DynamicTo<blink::HTMLCanvasElement>(node);
           canvas &&
           blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode() &&
@@ -3406,9 +3493,11 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   }
   CaptureTimer::Get().Mark("collect");
   if (known) {
-    return CaptureIncrementalPicture(frame.Get(), bounds, frame_pictures,
-                                     media_states, *known, sink,
-                                     known_originals);
+    auto incremental =
+        CaptureIncrementalPicture(frame.Get(), bounds, frame_pictures,
+                                  media_states, *known, sink, known_originals);
+    incremental.canvas_video = std::move(result.canvas_video);
+    return incremental;
   }
   PaintSerialization state;
   state.sink = sink;

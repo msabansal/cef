@@ -75,6 +75,38 @@ v8::Isolate* GetFrameIsolate(blink::WebLocalFrame* frame) {
   return frame->GetAgentGroupScheduler()->Isolate();
 }
 
+void AttachCanvasVideo(CefRefPtr<CefListValue> values,
+                       blink_glue::CefDrawingCommands& capture,
+                       bool incremental) {
+  if (!capture.canvas_video)
+    return;
+  values->SetSize(10);
+  if (!incremental) {
+    values->SetNull(6);
+    values->SetNull(7);
+  }
+  if (!incremental || capture.scroll.empty())
+    values->SetNull(8);
+  auto inventory = CefListValue::Create();
+  for (size_t index = 0; index < capture.canvas_video->size(); ++index) {
+    const auto& frame = (*capture.canvas_video)[index];
+    auto record = CefDictionaryValue::Create();
+    record->SetInt("id", static_cast<int>(frame.id));
+    record->SetString("document", frame.document);
+    record->SetString("stream", frame.stream);
+    record->SetString("generation", frame.generation);
+    record->SetString("sequence", frame.sequence);
+    record->SetInt("width", frame.width);
+    record->SetInt("height", frame.height);
+    record->SetBinary(
+        "rgba", CefBinaryValue::Create(frame.rgba.data(), frame.rgba.size()));
+    inventory->SetDictionary(index, record);
+  }
+  values->SetList(9, inventory);
+  // Do not retain another raw inventory during IPC serialization/receiver copy.
+  capture.canvas_video.reset();
+}
+
 }  // namespace
 
 CefFrameImpl::CefFrameImpl(CefBrowserImpl* browser, blink::WebLocalFrame* frame)
@@ -1185,6 +1217,7 @@ void CefFrameImpl::SendMessage(const std::string& name,
             values->SetBinary(8, CefBinaryValue::Create(
                 capture.scroll.data(), capture.scroll.size()));
         }
+        AttachCanvasVideo(values, capture, incremental);
       }
     }
     SendProcessMessage(PID_BROWSER, response);
@@ -1287,6 +1320,7 @@ void CefFrameImpl::SendMessage(const std::string& name,
       for (const auto& [key, bytes] : capture.resources)
         resources->SetBinary(key, CefBinaryValue::Create(bytes.data(), bytes.size()));
       values->SetDictionary(5, resources);
+      AttachCanvasVideo(values, capture, false);
     }
     SendProcessMessage(PID_BROWSER, response);
     return;

@@ -8,9 +8,10 @@
 
 #include <stdint.h>
 
-#include <memory>
-#include <map>
 #include <functional>
+#include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -44,7 +45,19 @@ BLINK_EXPORT blink::WebString DumpDocumentText(blink::WebLocalFrame* frame);
 // Returns the markup of the document element.
 BLINK_EXPORT blink::WebString DumpDocumentMarkup(blink::WebLocalFrame* frame);
 
+struct CefCanvasVideoFrame {
+  uint32_t id = 0;
+  std::string document;
+  std::string stream;
+  std::string generation;
+  std::string sequence;
+  int width = 0;
+  int height = 0;
+  std::vector<uint8_t> rgba;
+};
+
 struct CefDrawingCommands {
+  std::optional<std::vector<CefCanvasVideoFrame>> canvas_video;
   std::string error;
   std::string metadata;
   std::vector<uint8_t> picture;
