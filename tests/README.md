@@ -188,6 +188,24 @@ Clang runs with fatal `-Wshadow` diagnostics before compiling/executing the
 portable harness. `--baseline 01af7fa1f` reproduces the local-document shadow.
 This does not build CEF or qualify actual Blink GC/native browser behavior.
 
+## Reach program metadata capture
+
+```powershell
+python tests\run_reach_webgl_program_test.py --compiler cl --fixture <unmodified-chromium>
+```
+
+The fixture must include `gpu/command_buffer/client/gles2_implementation.cc`
+and `gles2_implementation_impl_autogen.h` at pinned Chromium commit
+`9ce0cc67aed57702fcfc011b9e49b0b02d7d5e3a`; the runner verifies their hashes.
+It compiles the complete production `ReachWebGLJournal::Program` method
+from the native patch and the exact upstream output-initialization macro
+invoked by `GetProgramiv`. GLES data and value dictionaries are substituted.
+The regression checks nontrivial WebGL2 attributes plus uniform blocks,
+unchanged WebGL1 metadata, initialized outputs when a lost context leaves
+uniform-block destinations untouched, and existing metadata bounds.
+`--baseline 999e2c1e2` reproduces the fatal reused-output contract violation.
+This is not native GPU, browser-pixel or full CEF qualification.
+
 ## Shared Code
 
 ### [shared](shared/)

@@ -635,10 +635,10 @@ index 0000000..6a04ffa
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 new file mode 100644
-index 0000000..2b28594
+index 0000000..aa223fa
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,704 @@
+@@ -0,0 +1,707 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -1086,6 +1086,9 @@ index 0000000..2b28594
 +  command.value.Set("attributes", std::move(attributes));
 +  if (!context_->IsWebGL2())
 +    return;
++  // GLES2 requires initialized query destinations, including reused storage.
++  count = 0;
++  max_length = 0;
 +  gl->GetProgramiv(program->Object(), GL_ACTIVE_UNIFORM_BLOCKS, &count);
 +  gl->GetProgramiv(program->Object(), GL_ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH,
 +                   &max_length);
