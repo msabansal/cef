@@ -635,10 +635,10 @@ index 0000000..6a04ffa
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 new file mode 100644
-index 0000000..aa223fa
+index 0000000..e43e657
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,707 @@
+@@ -0,0 +1,734 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -988,15 +988,11 @@ index 0000000..aa223fa
 +
 +uint32_t ReachWebGLJournal::CreateIdentity(ReachWebGLCommand& command,
 +                                           const ScriptWrappable* object) {
-+  if (identities_.size() >= kMaxObjects) {
-+    for (auto it = identities_.begin(); it != identities_.end();) {
-+      if (!it->second.object)
-+        it = identities_.erase(it);
-+      else
-+        ++it;
-+    }
-+  }
-+  if (!next_identity_ || identities_.size() >= kMaxObjects) {
++  const auto previous = identities_.find(object);
++  if (identities_.size() >= kMaxObjects ||
++      (previous != identities_.end() && !previous->second.object))
++    Collect();
++  if (!usable() || !next_identity_ || identities_.size() >= kMaxObjects) {
 +    command.error = "WebGL object identity budget exceeded";
 +    return 0;
 +  }
@@ -1004,6 +1000,34 @@ index 0000000..aa223fa
 +  identities_.insert_or_assign(
 +      object, Identity{WeakPersistent<const ScriptWrappable>(object), id});
 +  return id;
++}
++
++void ReachWebGLJournal::Collect() {
++  base::ListValue args;
++  const auto append = [this, &args] {
++    ReachWebGLCommand command;
++    command.value.Set("op", "$collect");
++    command.value.Set("args", std::move(args));
++    args = base::ListValue();
++    Append(std::move(command));
++  };
++  for (auto it = identities_.begin(); it != identities_.end();) {
++    if (it->second.object) {
++      ++it;
++      continue;
++    }
++    base::DictValue reference;
++    reference.Set("ref", static_cast<int>(it->second.id));
++    args.Append(std::move(reference));
++    it = identities_.erase(it);
++    if (args.size() == 16) {
++      append();
++      if (!usable())
++        return;
++    }
++  }
++  if (!args.empty())
++    append();
 +}
 +
 +void ReachWebGLJournal::Result(ReachWebGLCommand& command,
@@ -1224,6 +1248,9 @@ index 0000000..aa223fa
 +std::string ReachWebGLJournal::State() {
 +  if (!usable() || !element_ || !context_ || context_->isContextLost())
 +    return {};
++  Collect();
++  if (!usable())
++    return {};
 +  auto* attributes = context_->getContextAttributes();
 +  if (!attributes)
 +    return {};
@@ -1348,10 +1375,10 @@ index 0000000..aa223fa
 +}  // namespace blink
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.h third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
 new file mode 100644
-index 0000000..9ed0ad2
+index 0000000..e23aeee
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,286 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +
@@ -1514,6 +1541,7 @@ index 0000000..9ed0ad2
 +  base::Value View(ReachWebGLCommand&, const DOMArrayBufferView&);
 +  base::Value Reference(ReachWebGLCommand&, const ScriptWrappable*);
 +  uint32_t CreateIdentity(ReachWebGLCommand&, const ScriptWrappable*);
++  void Collect();
 +  void Fail(std::string_view);
 +  void NotifyChange();
 +
