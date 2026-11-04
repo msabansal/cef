@@ -258,10 +258,10 @@ index d611207..e7b0902 100644
      "ext_blend_min_max.cc",
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_call.h third_party/blink/renderer/modules/webgl/reach_webgl_call.h
 new file mode 100644
-index 0000000..756ada6
+index 0000000..6a04ffa
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_call.h
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,105 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 +
@@ -320,6 +320,7 @@ index 0000000..756ada6
 +  } else {
 +    journal = nullptr;
 +  }
++  ReachWebGLJournal::CommandScope command_scope(journal, &command);
 +  const auto accepted = [&] {
 +    if (!journal || context->isContextLost() ||
 +        context->ReachValidationSerial() != serial) {
@@ -368,10 +369,10 @@ index 0000000..756ada6
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 new file mode 100644
-index 0000000..db2b016
+index 0000000..80b17de
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,378 @@
+@@ -0,0 +1,437 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -537,6 +538,65 @@ index 0000000..db2b016
 +      return base::Value();
 +  }
 +  return Bytes(command, type, view.ByteSpanMaybeShared());
++}
++
++void ReachWebGLJournal::RejectTextureUpload(std::string_view error) {
++  if (HasTextureSource())
++    pending_->error = error;
++}
++
++void ReachWebGLJournal::TextureUpload(base::ListValue args,
++                                      unsigned type,
++                                      base::span<const uint8_t> pixels) {
++  if (!HasTextureSource())
++    return;
++  const std::string* op = pending_->value.FindString("op");
++  if (!op ||
++      (*op != "texImage2D" && *op != "texSubImage2D" && *op != "texImage3D" &&
++       *op != "texSubImage3D") ||
++      pending_->error !=
++          *op + ": WebGL source argument requires command transport") {
++    return;
++  }
++  std::string_view view;
++  switch (type) {
++    case GL_BYTE:
++      view = "Int8Array";
++      break;
++    case GL_UNSIGNED_BYTE:
++      view = "Uint8Array";
++      break;
++    case GL_SHORT:
++      view = "Int16Array";
++      break;
++    case GL_UNSIGNED_SHORT:
++    case GL_HALF_FLOAT:
++    case GL_HALF_FLOAT_OES:
++    case GL_UNSIGNED_SHORT_5_6_5:
++    case GL_UNSIGNED_SHORT_4_4_4_4:
++    case GL_UNSIGNED_SHORT_5_5_5_1:
++      view = "Uint16Array";
++      break;
++    case GL_INT:
++      view = "Int32Array";
++      break;
++    case GL_UNSIGNED_INT:
++    case GL_UNSIGNED_INT_2_10_10_10_REV:
++    case GL_UNSIGNED_INT_10F_11F_11F_REV:
++    case GL_UNSIGNED_INT_5_9_9_9_REV:
++      view = "Uint32Array";
++      break;
++    case GL_FLOAT:
++      view = "Float32Array";
++      break;
++    default:
++      RejectTextureUpload("Unsupported converted WebGL texture type");
++      return;
++  }
++  pending_->error.clear();
++  args.Append(Bytes(*pending_, view, pixels));
++  pending_->value.Set("args", std::move(args));
++  pending_->value.Set("unpack", true);
 +}
 +
 +base::Value ReachWebGLJournal::Reference(ReachWebGLCommand& command,
@@ -752,10 +812,10 @@ index 0000000..db2b016
 +}  // namespace blink
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.h third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
 new file mode 100644
-index 0000000..9231e9e
+index 0000000..c1d69c7
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,228 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +
@@ -795,10 +855,29 @@ index 0000000..9231e9e
 +  base::DictValue value;
 +  std::string error;
 +  size_t input_bytes = 0;
++  bool texture_source = false;
 +};
 +
 +class MODULES_EXPORT ReachWebGLJournal final {
 + public:
++  class CommandScope {
++   public:
++    CommandScope(ReachWebGLJournal* journal, ReachWebGLCommand* command)
++        : journal_(journal),
++          previous_(journal ? std::exchange(journal->pending_, command)
++                            : nullptr) {}
++    CommandScope(const CommandScope&) = delete;
++    CommandScope& operator=(const CommandScope&) = delete;
++    ~CommandScope() {
++      if (journal_)
++        journal_->pending_ = previous_;
++    }
++
++   private:
++    ReachWebGLJournal* journal_;
++    ReachWebGLCommand* previous_;
++  };
++
 +  explicit ReachWebGLJournal(WebGLRenderingContextBase&);
 +  ~ReachWebGLJournal();
 +
@@ -820,6 +899,11 @@ index 0000000..9231e9e
 +  void Result(ReachWebGLCommand&, const ScriptWrappable*);
 +  void Result(ReachWebGLCommand&, uint32_t);
 +  void Target(ReachWebGLCommand&, WebGLExtension*);
++  bool HasTextureSource() const {
++    return pending_ && pending_->texture_source;
++  }
++  void TextureUpload(base::ListValue, unsigned, base::span<const uint8_t>);
++  void RejectTextureUpload(std::string_view);
 +
 +  template <typename T>
 +  void Argument(ReachWebGLCommand& command,
@@ -885,6 +969,7 @@ index 0000000..9231e9e
 +                           std::is_convertible_v<V, const WebGLExtension*>) {
 +        return Reference(command, value);
 +      }
++      command.texture_source = true;
 +      command.error = "WebGL source argument requires command transport";
 +      return base::Value();
 +    } else if constexpr (requires { value.Get(); }) {
@@ -954,12 +1039,13 @@ index 0000000..9231e9e
 +  std::vector<std::string> commands_;
 +  size_t bytes_ = 0;
 +  std::string error_;
++  ReachWebGLCommand* pending_ = nullptr;
 +};
 +
 +}  // namespace blink
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index b17f336..6866836 100644
+index b17f336..87b7661 100644
 --- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -44,6 +44,8 @@
@@ -1024,7 +1110,60 @@ index b17f336..6866836 100644
      return extension;
    }
  
-@@ -9266,6 +9286,7 @@ void WebGLRenderingContextBase::SynthesizeGLError(
+@@ -5747,6 +5767,52 @@ void WebGLRenderingContextBase::TexImageSkImage(TexImageParams params,
+     params.height = pixmap.height();
+   if (!params.depth)
+     params.depth = 1;
++  if (reach_journal_ && reach_journal_->HasTextureSource()) {
++    unsigned bytes = 0;
++    WebGLImageConversion::PixelStoreParams unpack;
++    unpack.alignment = 1;
++    const GLenum error = WebGLImageConversion::ComputeImageSizeInBytes(
++        params.format, params.type, *params.width, *params.height,
++        *params.depth, unpack, &bytes, nullptr, nullptr);
++    if (error != GL_NO_ERROR) {
++      reach_journal_->RejectTextureUpload(
++          "Invalid converted WebGL texture dimensions");
++    } else {
++      base::ListValue args;
++      args.Append(static_cast<int>(params.target));
++      args.Append(params.level);
++      switch (params.function_id) {
++        case kTexImage2D:
++        case kTexImage3D:
++          args.Append(static_cast<int>(params.internalformat));
++          break;
++        case kTexSubImage2D:
++        case kTexSubImage3D:
++          args.Append(params.xoffset);
++          args.Append(params.yoffset);
++          if (params.function_id == kTexSubImage3D)
++            args.Append(params.zoffset);
++          break;
++      }
++      args.Append(*params.width);
++      args.Append(*params.height);
++      if (params.function_id == kTexImage3D ||
++          params.function_id == kTexSubImage3D) {
++        args.Append(*params.depth);
++      }
++      if (params.function_id == kTexImage2D ||
++          params.function_id == kTexImage3D) {
++        args.Append(params.border);
++      }
++      args.Append(static_cast<int>(params.format));
++      args.Append(static_cast<int>(params.type));
++      // Copy the validated upload input, not a rendered WebGL output frame.
++      reach_journal_->TextureUpload(
++          std::move(args), params.type,
++          UNSAFE_BUFFERS(
++              base::span(static_cast<const uint8_t*>(gl_data), bytes)));
++    }
++  }
+   TexImageBase(params, gl_data);
+ }
+ 
+@@ -9266,6 +9332,7 @@ void WebGLRenderingContextBase::SynthesizeGLError(
      const char* function_name,
      const char* description,
      ConsoleDisplayPreference display) {
