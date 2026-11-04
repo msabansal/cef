@@ -20,6 +20,7 @@ using sk_sp = std::shared_ptr<T>;
 
 // Only Chromium/Skia boundaries are substituted. Upload routing, original
 // capture, replay-state wrapping and retirement below are production methods.
+std::atomic_size_t& RetainedBytes();
 namespace base {
 template <typename T>
 using span = std::span<T>;
@@ -64,6 +65,7 @@ struct DictValue {
     auto it = strings.find(key);
     return it == strings.end() ? nullptr : &it->second;
   }
+  size_t EstimateMemoryUsage() const;
 };
 struct Value {
   std::optional<DictValue> dictionary;
@@ -79,6 +81,20 @@ std::string Base64Encode(span<const uint8_t> bytes) {
 }
 void ListValue::Append(DictValue value) {
   references.push_back(std::move(value));
+}
+size_t DictValue::EstimateMemoryUsage() const {
+  size_t bytes = 0;
+  for (const auto& [key, value] : strings)
+    bytes += key.capacity() + value.capacity() + sizeof(key) + sizeof(value) +
+             4 * sizeof(void*);
+  for (const auto& [key, value] : lists) {
+    bytes += key.capacity() + sizeof(key) + sizeof(value) + 4 * sizeof(void*) +
+             value.values.capacity() * sizeof(int) +
+             value.references.capacity() * sizeof(DictValue);
+    for (const auto& reference : value.references)
+      bytes += reference.EstimateMemoryUsage();
+  }
+  return bytes;
 }
 std::optional<std::string> WriteJson(const DictValue& value) {
   if (!value.lists.contains("args")) {
@@ -108,11 +124,49 @@ std::optional<std::string> WriteJson(const DictValue& value) {
   }
   return json + "]}";
 }
+size_t maximum_serialized_ownership = 0;
 struct JSONWriter {
   static bool Write(const DictValue& value, std::string* output) {
-    const auto json = WriteJson(value);
-    if (!json) return false;
-    output->assign(*json);
+    const size_t simultaneous =
+        value.EstimateMemoryUsage() + output->capacity();
+    assert(RetainedBytes().load() >= simultaneous &&
+           "captured input and JSON must both be charged during serialization");
+    assert(RetainedBytes().load() <= ReachWebGLPending::kLimit);
+    maximum_serialized_ownership =
+        std::max(maximum_serialized_ownership, simultaneous);
+    if (!value.lists.contains("args")) {
+      const auto json = WriteJson(value);
+      if (!json) return false;
+      output->assign(*json);
+      return true;
+    }
+    output->assign("{\"op\":\"");
+    output->append(value.strings.at("op"));
+    output->append("\",\"args\":[");
+    bool first = true;
+    auto separator = [&]() {
+      if (!first) output->push_back(',');
+      first = false;
+    };
+    const auto& args = value.lists.at("args");
+    for (int number : args.values) {
+      separator();
+      output->append(std::to_string(number));
+    }
+    for (const auto& reference : args.references) {
+      separator();
+      if (reference.strings.contains("image")) {
+        output->append("{\"image\":\"");
+        output->append(reference.strings.at("image"));
+      } else {
+        output->append("{\"type\":\"");
+        output->append(reference.strings.at("type"));
+        output->append("\",\"data\":\"");
+        output->append(reference.strings.at("data"));
+      }
+      output->append("\"}");
+    }
+    output->append("]}");
     return true;
   }
 };
@@ -301,6 +355,53 @@ int main() {
           return std::vector<uint8_t>{137, 80, 78, 71};
         });
     assert(source);
+  }
+  assert(aggregate.load() == 0);
+  {
+    ReachWebGLJournal producer;
+    producer.Reset("bufferData");
+    producer.captured_command.error.clear();
+    producer.captured_command.texture_source = false;
+    const std::vector<uint8_t> input(120 * 1024 * 1024);
+    base::ListValue args;
+    args.Append(producer.Bytes(producer.captured_command, "Uint8Array", input));
+    assert(producer.captured_command.error.empty());
+    producer.captured_command.value.Set("args", std::move(args));
+    producer.Append(std::move(producer.captured_command));
+    assert(!producer.usable());
+    assert(producer.error_ ==
+           "Combined WebGL pending serialization budget exceeded");
+    assert(producer.commands_.next() == 0);
+    assert(base::maximum_serialized_ownership == 0);
+    assert(aggregate.load() == 0);
+  }
+  assert(aggregate.load() == 0);
+  for (const bool sibling_pending : {false, true}) {
+    ReachWebGLPending sibling(aggregate, 17);
+    if (sibling_pending)
+      assert(sibling.Append(std::string(20 * 1024 * 1024, 's')).empty());
+    const size_t sibling_charge = aggregate.load();
+    ReachWebGLJournal producer;
+    producer.Reset("bufferData");
+    producer.captured_command.error.clear();
+    producer.captured_command.texture_source = false;
+    const std::vector<uint8_t> input(90 * 1024 * 1024);
+    base::ListValue args;
+    args.Append(producer.Bytes(producer.captured_command, "Uint8Array", input));
+    assert(producer.captured_command.error.empty());
+    producer.captured_command.value.Set("args", std::move(args));
+    producer.Append(std::move(producer.captured_command));
+    if (sibling_pending) {
+      assert(!producer.usable() && producer.commands_.next() == 0);
+      assert(producer.error_ ==
+             "Combined WebGL pending serialization budget exceeded");
+      assert(aggregate.load() == sibling_charge);
+    } else {
+      assert(producer.usable() && producer.commands_.next() == 1);
+      assert(aggregate.load() < 121 * 1024 * 1024);
+    }
+    assert(base::maximum_serialized_ownership >= 240 * 1024 * 1024);
+    assert(base::maximum_serialized_ownership <= ReachWebGLPending::kLimit);
   }
   assert(aggregate.load() == 0);
   {
@@ -545,6 +646,7 @@ int main() {
     assert(crowded == ReachImageBitmapOriginal::kLimit - 1024);
     assert(!ReachImageBitmapOriginal::Create(crowded, {}, {0, 1, 37444}));
   }
-  std::cout << "Pinned native ImageBitmap: 128 original/policy/retirement "
+  std::cout << "Pinned native ImageBitmap: 120/90 MiB simultaneous admission; "
+               "128 original/policy/retirement "
                "cases; reupload, explicit rejection and shared budget PASS\n";
 }

@@ -632,10 +632,10 @@ index e69de29..6a04ffa 100644
 +}  // namespace blink
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-index e69de29..ec30ad3 100644
+index e69de29..2b28594 100644
 --- third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,694 @@
+@@ -0,0 +1,704 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -1127,16 +1127,24 @@ index e69de29..ec30ad3 100644
 +        return;
 +    }
 +  }
-+  if (command.input_bytes > kMaxCommandBytes - 512 ||
-+      !command.reservation.Reserve(RetainedBytes(),
-+                                   command.input_bytes + 512)) {
++  const size_t captured_bytes = command.value.EstimateMemoryUsage();
++  const size_t serialized_bound = std::max(command.input_bytes, captured_bytes);
++  if (captured_bytes > kMaxCommandBytes - 512 ||
++      !command.reservation.Reserve(RetainedBytes(), captured_bytes + 512)) {
 +    Fail("Combined WebGL pending command budget exceeded");
 +    return;
 +  }
++  // The value tree remains owned while JSONWriter fills a distinct buffer.
++  ReachWebGLPending::Reservation serialized;
++  if (serialized_bound > kMaxCommandBytes - 512 ||
++      !serialized.Reserve(RetainedBytes(), serialized_bound + 512)) {
++    Fail("Combined WebGL pending serialization budget exceeded");
++    return;
++  }
 +  std::optional<std::string> json(std::in_place);
-+  json->reserve(command.input_bytes + 512);
++  json->reserve(serialized_bound + 512);
 +  if (json->capacity() > kMaxCommandBytes - 512 ||
-+      !command.reservation.Reserve(RetainedBytes(), json->capacity() + 512)) {
++      !serialized.Reserve(RetainedBytes(), json->capacity() + 512)) {
 +    Fail("Combined WebGL pending serialization budget exceeded");
 +    return;
 +  }
@@ -1146,6 +1154,8 @@ index e69de29..ec30ad3 100644
 +    Fail("WebGL command delivery size exceeded");
 +    return;
 +  }
++  command.value = base::DictValue();
++  command.reservation = ReachWebGLPending::Reservation();
 +  if (command.original && !originals_.contains(command.original_hash)) {
 +    const size_t charge =
 +        (command.original_precharged ? 0 : command.original->size()) + 256;
@@ -1161,7 +1171,7 @@ index e69de29..ec30ad3 100644
 +  }
 +  const std::string error = commands_.Append(
 +      std::move(*json), command.original ? command.original->size() : 0,
-+      command.original_hash, &command.reservation);
++      command.original_hash, &serialized);
 +  if (error.empty() && command.original)
 +    originals_.at(command.original_hash).last_next = commands_.next();
 +  if (!error.empty())

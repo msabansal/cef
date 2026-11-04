@@ -111,8 +111,17 @@ ownership, construction reservations, pending serialized capacity/metadata and
 pending originals. The same ImageBitmap encoded allocation is charged once
 when shared with its pending SkData. UTF-8/JSON string expansion, base64 output
 and encoded-source copies are preflighted/reserved; allocation capacity and
-queue metadata are charged before commitment. This is a pending-ownership
-budget, not a bound on all browser heap or transient serializer/read buffers.
+queue metadata are charged before commitment. Captured value-tree storage and
+the JSON destination have separate simultaneous reservations while serializing.
+Only after releasing the value tree does the JSON reservation transfer to
+pending queue ownership. A 120 MiB raw upload (approximately 160 MiB captured
+base64 plus 160 MiB JSON) is rejected before serialization; a 90 MiB raw upload
+with approximately 240 MiB simultaneous owned representations is admitted.
+The compiled production-method harness checks the actual destination capacity
+against concurrent captured ownership. The accounting regression is reproduced
+with `--baseline-limits 6aa434f7256314b9f55d4eefa251098ebf406760`.
+This bounds owned capture/pending data, not the entire browser heap or all
+IPC/Rust read scratch buffers.
 
 The former 1/3/4/8 MiB individual string/span/command/original limits are removed.
 Native responses remain at most 8 MiB; oversized individual operations use
@@ -127,6 +136,11 @@ Client crash/reload is a fresh-target operation: revoke/close the old target
 and load a fresh page from zero. GPU-state reconstruction is not required.
 Actual fresh-client pixels/input, sibling isolation and source semantics still
 require native-build/browser acceptance before activation.
+
+`$discard` is an implicit backbuffer-clear operation, not context retirement.
+Native context destruction emits no final batch or change notification;
+weak-owner discovery can subsequently omit that stream. Client disposal needs
+coordinator-authoritative lifetime/inventory integration, never picture absence.
 
 ## Shared Code
 
