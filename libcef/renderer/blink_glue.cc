@@ -279,7 +279,7 @@ std::string WebGlRequest(
   // explicitly without capturing a picture or enabling compositor raster.
   blink::Persistent<blink::LocalFrame> retained_frame = frame;
   if (operation == "Reach.WebGlTick.v2") {
-    blink::Persistent<blink::Document> document = frame->GetDocument();
+    blink::Persistent<blink::Document> retained_document = frame->GetDocument();
     blink::Persistent<blink::Page> page = frame->GetPage();
     if (!page || !frame->View())
       return "WebGL animation frame is unavailable";
@@ -287,12 +287,12 @@ std::string WebGlRequest(
         blink::scheduler::WebThreadScheduler::MainThreadScheduler())
         .BeginFrameNotExpectedSoon();
     page->Animator().ServiceScriptedAnimations(base::TimeTicks::Now());
-    if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
+    if (!frame->IsAttached() || frame->GetDocument() != retained_document.Get() ||
         frame->GetPage() != page.Get() || !frame->View())
       return "WebGL animation document changed";
     page->Animator().UpdateAllLifecyclePhasesExceptPaint(
         *frame, blink::DocumentUpdateReason::kInspector);
-    if (!frame->IsAttached() || frame->GetDocument() != document.Get() ||
+    if (!frame->IsAttached() || frame->GetDocument() != retained_document.Get() ||
         frame->GetPage() != page.Get() || !frame->View())
       return "WebGL animation document changed";
   }

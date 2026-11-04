@@ -173,6 +173,21 @@ four missing-file failures caused by treating introduced files as modifications
 of pre-existing empty files. Cached-index-only checks against such placeholders
 do not establish application on the real Chromium baseline.
 
+## Reach animation tick glue
+
+```powershell
+python tests\run_reach_webgl_tick_test.py --compiler cl --clang-tidy <clang-tidy>
+```
+
+The runner extracts the actual `WebGlRequest` prefix through animation servicing
+and both document-identity checks, preserving its public parameters. Substituted
+Blink boundaries verify persistent frame/document/page ownership during script
+and lifecycle callbacks, identity rejection after either callback replaces the
+document (even with the same token), and unchanged stale-wire rejection.
+Clang runs with fatal `-Wshadow` diagnostics before compiling/executing the
+portable harness. `--baseline 01af7fa1f` reproduces the local-document shadow.
+This does not build CEF or qualify actual Blink GC/native browser behavior.
+
 ## Shared Code
 
 ### [shared](shared/)
