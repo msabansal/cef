@@ -29,6 +29,14 @@ auto MakeRefCounted(Args&&... args) {
 }  // namespace base
 
 namespace blink {
+constexpr unsigned GL_RGB8 = 0x8051;
+constexpr unsigned GL_RGBA8 = 0x8058;
+constexpr unsigned GL_SRGB8_ALPHA8 = 0x8c43;
+constexpr unsigned GL_RGBA16F = 0x881a;
+struct ColorSpace {
+  bool IsHDR() const { return hdr; }
+  bool hdr = false;
+};
 enum FlushReason { kTest };
 enum SourceDrawingBuffer { kBackBuffer };
 struct CanvasPerformanceMonitor {
@@ -62,6 +70,9 @@ struct WebGLRenderingContextBase {
   } buffer;
 
   bool isContextLost() const { return lost; }
+  unsigned drawingBufferFormat() const { return storage_format; }
+  const ColorSpace& GetColorSpace() const { return color_space; }
+  bool ReachCanvasVideoIsSDR() const;
   Buffer* GetDrawingBuffer() { return &buffer; }
   HostFixture* Host() { return &host; }
   bool canvas() const { return true; }
@@ -92,6 +103,8 @@ struct WebGLRenderingContextBase {
   std::vector<uint8_t> pixels{1, 2, 3, 17};
   unsigned reads = 0;
   bool lost = false;
+  unsigned storage_format = GL_RGBA8;
+  ColorSpace color_space;
   Framebuffer* framebuffer_binding_ = nullptr;
   bool must_paint_to_canvas_ = false;
   bool marked_canvas_dirty_ = false;
@@ -134,6 +147,19 @@ struct HTMLCanvasElement {
 int main() {
   using Context = blink::WebGLRenderingContextBase;
   Context context;
+  for (const auto format :
+       {blink::GL_RGB8, blink::GL_RGBA8, blink::GL_SRGB8_ALPHA8}) {
+    context.storage_format = format;
+    assert(context.ReachCanvasVideoIsSDR());
+    context.color_space.hdr = true;
+    assert(!context.ReachCanvasVideoIsSDR());
+    context.color_space.hdr = false;
+  }
+  context.storage_format = blink::GL_RGBA16F;
+  assert(!context.ReachCanvasVideoIsSDR());
+  context.storage_format = 0;
+  assert(!context.ReachCanvasVideoIsSDR());
+  context.storage_format = blink::GL_RGBA8;
   context.MarkLayerComposited();
   assert(context.CheckpointReachCanvasVideo());
   assert(context.capture.rgba()[3] == 17);

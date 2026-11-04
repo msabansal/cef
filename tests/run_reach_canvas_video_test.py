@@ -60,6 +60,11 @@ def main():
             ) if (args.baseline_hooks or args.baseline_hook == label) else (
                 args.fixture / path).read_text()
             hooks.append(method_body(text, method))
+        webgl = (args.fixture / "third_party" / "blink" / "renderer"
+                 / "modules" / "webgl" / "webgl_rendering_context_base.cc")
+        hooks.append(method_body(
+            webgl.read_text(),
+            "WebGLRenderingContextBase::ReachCanvasVideoIsSDR", "bool"))
         (output / "reach_canvas_video_hooks.inc").write_text("\n".join(hooks))
         sources.append("reach_canvas_video_hooks_test")
         lifecycle = []

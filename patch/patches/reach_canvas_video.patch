@@ -284,7 +284,7 @@ index 8b09e79..6f0eb64 100644
    if (auto* layer = canvas->ContentsCcLayer()) {
      // TODO(crbug.com/705019): For a texture layer canvas, setting the layer
 diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index af26033..84dfd06 100644
+index af26033..548d05b 100644
 --- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -910,6 +910,7 @@ void WebGLRenderingContextBase::drawingBufferStorage(GLenum sizedformat,
@@ -312,20 +312,21 @@ index af26033..84dfd06 100644
    // Regardless of whether dirty propagations are optimized away, the back
    // buffer is now out of sync with respect to the canvas's internal backing
    // store -- which is only used for certain purposes, like printing.
-@@ -1769,6 +1773,12 @@ void WebGLRenderingContextBase::OnErrorMessage(const char* message,
+@@ -1769,6 +1773,13 @@ void WebGLRenderingContextBase::OnErrorMessage(const char* message,
    NotifyWebGLErrorOrWarning(message);
  }
  
 +bool WebGLRenderingContextBase::ReachCanvasVideoIsSDR() const {
 +  const auto format = drawingBufferFormat();
-+  return (format == GL_RGBA8 || format == GL_SRGB8_ALPHA8) &&
++  return (format == GL_RGB8 || format == GL_RGBA8 ||
++          format == GL_SRGB8_ALPHA8) &&
 +         !GetColorSpace().IsHDR();
 +}
 +
  ReachWebGLJournal* WebGLRenderingContextBase::ReachJournal() {
    if (!Canvas2DBitmapProvider::IsReachWebGLCommandMode() || !Host() ||
        Host()->IsOffscreenCanvas() || isContextLost())
-@@ -1940,8 +1950,10 @@ void WebGLRenderingContextBase::RestoreActiveTexture() {
+@@ -1940,8 +1951,10 @@ void WebGLRenderingContextBase::RestoreActiveTexture() {
  }
  
  void WebGLRenderingContextBase::MarkLayerComposited() {
@@ -337,7 +338,7 @@ index af26033..84dfd06 100644
  }
  
  bool WebGLRenderingContextBase::OnMemoryDump(
-@@ -2471,6 +2483,7 @@ void WebGLRenderingContextBase::Reshape(int width, int height) {
+@@ -2471,6 +2484,7 @@ void WebGLRenderingContextBase::Reshape(int width, int height) {
    // buffer will also start off clear (and this matches what reshape will do).
    GetDrawingBuffer()->Resize(gfx::Size(width, height));
    GetDrawingBuffer()->MarkContentsChanged();
@@ -345,7 +346,7 @@ index af26033..84dfd06 100644
    if (reach_journal_)
      reach_journal_->Resize(drawingBufferWidth(), drawingBufferHeight());
  
-@@ -2524,6 +2537,7 @@ void WebGLRenderingContextBase::setDrawingBufferColorSpace(
+@@ -2524,6 +2538,7 @@ void WebGLRenderingContextBase::setDrawingBufferColorSpace(
    drawing_buffer_color_space_ = color_space;
    if (GetDrawingBuffer())
      GetDrawingBuffer()->SetColorSpace(drawing_buffer_color_space_);
@@ -353,7 +354,7 @@ index af26033..84dfd06 100644
  }
  
  CanvasToneMapping* WebGLRenderingContextBase::drawingBufferToneMapping(
-@@ -7882,6 +7896,7 @@ void WebGLRenderingContextBase::ForceLostContext(
+@@ -7882,6 +7897,7 @@ void WebGLRenderingContextBase::ForceLostContext(
    }
  
    context_lost_mode_ = mode;
