@@ -67,9 +67,8 @@ index 995d858..e8a476b 100644
          body.append(
              CxxUnlikelyIfNode(cond="${exception_state}.HadException()",
 diff --git third_party/blink/renderer/bindings/scripts/bind_gen/reach_webgl_test.py third_party/blink/renderer/bindings/scripts/bind_gen/reach_webgl_test.py
-new file mode 100644
-index 0000000..c6e70dd
---- /dev/null
+index e69de29..c6e70dd 100644
+--- third_party/blink/renderer/bindings/scripts/bind_gen/reach_webgl_test.py
 +++ third_party/blink/renderer/bindings/scripts/bind_gen/reach_webgl_test.py
 @@ -0,0 +1,50 @@
 +import ast
@@ -172,6 +171,111 @@ index 2e99b4a..c6b3332 100644
    if (Canvas2DBitmapProvider::IsReachCommandMode() &&
        IsRenderingContext2D()) {
      RenderingContext()->FlushCanvas(FlushReason::kPrinting);
+diff --git third_party/blink/renderer/core/imagebitmap/image_bitmap.cc third_party/blink/renderer/core/imagebitmap/image_bitmap.cc
+index 828f244..38aadeb 100644
+--- third_party/blink/renderer/core/imagebitmap/image_bitmap.cc
++++ third_party/blink/renderer/core/imagebitmap/image_bitmap.cc
+@@ -31,6 +31,7 @@
+ #include "third_party/blink/renderer/core/svg/graphics/svg_image_for_container.h"
+ #include "third_party/blink/renderer/platform/bindings/enumeration_base.h"
+ #include "third_party/blink/renderer/platform/graphics/accelerated_static_bitmap_image.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
+ #include "third_party/blink/renderer/platform/graphics/gpu/shared_gpu_context.h"
+ #include "third_party/blink/renderer/platform/graphics/graphics_context.h"
+ #include "third_party/blink/renderer/platform/graphics/graphics_context_types.h"
+@@ -328,6 +329,7 @@ ImageBitmap::ImageBitmap(ImageElementBase* image,
+                       .TakePaintImage();
+   }
+ 
++  const bool reach_hdr = paint_image.GetColorType() == kRGBA_F16_SkColorType;
+   auto static_input = UnacceleratedStaticBitmapImage::Create(
+       std::move(paint_image), input->Orientation());
+ 
+@@ -336,6 +338,36 @@ ImageBitmap::ImageBitmap(ImageElementBase* image,
+     return;
+ 
+   image_->SetOriginClean(!image->WouldTaintOrigin());
++  if (Canvas2DBitmapProvider::IsReachWebGLCommandMode()) {
++    std::shared_ptr<const ReachImageBitmapOriginal> original;
++    std::string error =
++        "ImageBitmap encoded original unavailable or source budget exceeded";
++    if (crop_rect || options->hasResizeWidth() || options->hasResizeHeight()) {
++      error = "ImageBitmap original crop or resize is unsupported";
++    } else if (image_->width() > 4096 || image_->height() > 4096) {
++      error = "ImageBitmap original dimensions exceed the replay limit";
++    } else if (!input->IsBitmapImage() || input->MaybeAnimated() ||
++               !input->HasDefaultOrientation() || reach_hdr) {
++      error =
++          "ImageBitmap original animation, orientation, SVG or HDR is "
++          "unsupported";
++    } else if (input->HasData() && input->DataSize() > 0 &&
++               input->DataSize() <= ReachImageBitmapOriginal::kMaxBytes) {
++      const auto encoded = input->Data();
++      if (encoded && !encoded->empty() &&
++          encoded->size() <= ReachImageBitmapOriginal::kMaxBytes) {
++        std::vector<uint8_t> bytes(encoded->size());
++        if (encoded->GetBytes(base::span(bytes))) {
++          original = ReachImageBitmapOriginal::Create(
++              Canvas2DBitmapProvider::ReachWebGLPendingBytes(),
++              std::move(bytes),
++              {parsed_options.flip_y, parsed_options.premultiply_alpha,
++               parsed_options.has_color_space_conversion ? 37444 : 0});
++        }
++      }
++    }
++    image_->SetReachOriginal(std::move(original), std::move(error));
++  }
+   UpdateImageBitmapMemoryUsage();
+ }
+ 
+@@ -508,6 +540,10 @@ scoped_refptr<StaticBitmapImage> ImageBitmap::Transfer() {
+       if (!copy) {
+         return nullptr;
+       }
++      if (Canvas2DBitmapProvider::IsReachWebGLCommandMode()) {
++        copy->SetReachOriginal(image_->ReachOriginal(),
++                               image_->ReachOriginalError());
++      }
+       image_ = std::move(copy);
+     }
+   }
+@@ -530,6 +566,8 @@ void ImageBitmap::UpdateImageBitmapMemoryUsage() {
+     base::CheckedNumeric<int32_t> memory_usage_checked = bytes_per_pixel;
+     memory_usage_checked *= image_->width();
+     memory_usage_checked *= image_->height();
++    if (image_->ReachOriginal())
++      memory_usage_checked += image_->ReachOriginal()->bytes().size();
+     new_memory_usage = memory_usage_checked.ValueOrDefault(
+         std::numeric_limits<int32_t>::max());
+   }
+diff --git third_party/blink/renderer/core/imagebitmap/image_bitmap.h third_party/blink/renderer/core/imagebitmap/image_bitmap.h
+index 046bab1..f57585f 100644
+--- third_party/blink/renderer/core/imagebitmap/image_bitmap.h
++++ third_party/blink/renderer/core/imagebitmap/image_bitmap.h
+@@ -6,6 +6,7 @@
+ #define THIRD_PARTY_BLINK_RENDERER_CORE_IMAGEBITMAP_IMAGE_BITMAP_H_
+ 
+ #include <memory>
++#include <string>
+ 
+ #include "base/memory/scoped_refptr.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -82,6 +83,15 @@ class CORE_EXPORT ImageBitmap final : public ScriptWrappable,
+ 
+   scoped_refptr<StaticBitmapImage> BitmapImage() const { return image_; }
+ 
++  void SetReachOriginal(
++      std::shared_ptr<const ReachImageBitmapOriginal> original,
++      std::string error) {
++    if (image_) {
++      image_->SetReachOriginal(std::move(original), std::move(error));
++      UpdateImageBitmapMemoryUsage();
++    }
++  }
++
+   // Retrieve the SkImageInfo that best represents BitmapImage().
+   SkImageInfo GetBitmapSkImageInfo() const;
+ 
 diff --git third_party/blink/renderer/core/paint/html_canvas_painter.cc third_party/blink/renderer/core/paint/html_canvas_painter.cc
 index 8f02ea1..8b09e79 100644
 --- third_party/blink/renderer/core/paint/html_canvas_painter.cc
@@ -242,6 +346,164 @@ index db92058..c703baa 100644
  
  class LayoutVideo;
  struct PaintInfo;
+diff --git third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.cc third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.cc
+index 01098ab..3bf974e 100644
+--- third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.cc
++++ third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.cc
+@@ -56,6 +56,7 @@
+ #include "third_party/blink/renderer/modules/webcodecs/video_frame.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_state.h"
+ #include "third_party/blink/renderer/platform/bindings/script_state.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
+ #include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/heap/cross_thread_handle.h"
+ #include "third_party/blink/renderer/platform/instrumentation/histogram.h"
+@@ -356,6 +357,7 @@ ImageBitmapFactories::ImageBitmapLoader::~ImageBitmapLoader() {
+ 
+ void ImageBitmapFactories::ImageBitmapLoader::RejectPromise(
+     ImageBitmapRejectionReason reason) {
++  reach_original_.reset();
+   CHECK(resolver_);
+   ScriptState* resolver_script_state = resolver_->GetScriptState();
+   if (!IsInParallelAlgorithmRunnable(resolver_->GetExecutionContext(),
+@@ -392,6 +394,7 @@ void ImageBitmapFactories::ImageBitmapLoader::RejectPromise(
+ }
+ 
+ void ImageBitmapFactories::ImageBitmapLoader::ContextDestroyed() {
++  reach_original_.reset();
+   if (loader_) {
+     factory_->DidFinishLoading(this);
+     loader_->Cancel();
+@@ -422,8 +425,9 @@ void DecodeImageOnDecoderThread(
+     ArrayBufferContents contents,
+     ImageDecoder::AlphaOption alpha_option,
+     ColorBehavior color_behavior,
+-    CrossThreadOnceFunction<void(sk_sp<SkImage>, const ImageOrientationEnum)>
+-        result_callback) {
++    CrossThreadOnceFunction<void(sk_sp<SkImage>,
++                                 const ImageOrientationEnum,
++                                 bool)> result_callback) {
+   const bool data_complete = true;
+   std::unique_ptr<ImageDecoder> decoder = ImageDecoder::Create(
+       SegmentReader::CreateFromSkData(
+@@ -433,13 +437,17 @@ void DecodeImageOnDecoderThread(
+       Platform::GetMaxDecodedImageBytes());
+   sk_sp<SkImage> frame;
+   ImageOrientationEnum orientation = ImageOrientationEnum::kDefault;
++  bool single_frame = false;
+   if (decoder) {
+     orientation = decoder->Orientation();
++    if (Canvas2DBitmapProvider::IsReachWebGLCommandMode())
++      single_frame = decoder->FrameCount() == 1;
+     frame = ImageBitmap::GetSkImageFromDecoder(std::move(decoder));
+   }
+-  PostCrossThreadTask(*task_runner, FROM_HERE,
+-                      CrossThreadBindOnce(std::move(result_callback),
+-                                          std::move(frame), orientation));
++  PostCrossThreadTask(
++      *task_runner, FROM_HERE,
++      CrossThreadBindOnce(std::move(result_callback), std::move(frame),
++                          orientation, single_frame));
+ }
+ }  // namespace
+ 
+@@ -456,6 +464,27 @@ void ImageBitmapFactories::ImageBitmapLoader::ScheduleAsyncImageBitmapDecoding(
+       options_->colorSpaceConversion() == V8ColorSpaceConversion::Enum::kNone
+           ? ColorBehavior::kIgnore
+           : ColorBehavior::kTag;
++  if (Canvas2DBitmapProvider::IsReachWebGLCommandMode()) {
++    reach_original_error_ =
++        "ImageBitmap encoded original unavailable or source budget exceeded";
++    if (crop_rect_ || options_->hasResizeWidth() ||
++        options_->hasResizeHeight()) {
++      reach_original_error_ = "ImageBitmap original crop or resize unsupported";
++    } else if (contents.DataLength() > 0 &&
++               contents.DataLength() <= ReachImageBitmapOriginal::kMaxBytes) {
++      const auto bytes = UNSAFE_BUFFERS(base::span(
++          static_cast<const uint8_t*>(contents.Data()), contents.DataLength()));
++      reach_original_ = ReachImageBitmapOriginal::Create(
++          Canvas2DBitmapProvider::ReachWebGLPendingBytes(),
++          std::vector<uint8_t>(bytes.begin(), bytes.end()),
++          {options_->imageOrientation() == V8ImageOrientation::Enum::kFlipY,
++           options_->premultiplyAlpha() != V8PremultiplyAlpha::Enum::kNone,
++           options_->colorSpaceConversion() ==
++                   V8ColorSpaceConversion::Enum::kNone
++               ? 0
++               : 37444});
++    }
++  }
+   worker_pool::PostTask(
+       FROM_HERE,
+       CrossThreadBindOnce(
+@@ -468,7 +497,8 @@ void ImageBitmapFactories::ImageBitmapLoader::ScheduleAsyncImageBitmapDecoding(
+ 
+ void ImageBitmapFactories::ImageBitmapLoader::ResolvePromiseOnOriginalThread(
+     sk_sp<SkImage> frame,
+-    const ImageOrientationEnum orientation) {
++    const ImageOrientationEnum orientation,
++    bool single_frame) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   if (!frame) {
+     RejectPromise(kUndecodableImageBitmapRejectionReason);
+@@ -483,6 +513,17 @@ void ImageBitmapFactories::ImageBitmapLoader::ResolvePromiseOnOriginalThread(
+   auto* image_bitmap =
+       MakeGarbageCollected<ImageBitmap>(image, crop_rect_, options_);
+   if (image_bitmap && image_bitmap->BitmapImage()) {
++    if (Canvas2DBitmapProvider::IsReachWebGLCommandMode()) {
++      if (!single_frame || orientation != ImageOrientationEnum::kDefault ||
++          image_bitmap->width() > 4096 || image_bitmap->height() > 4096) {
++        reach_original_.reset();
++        reach_original_error_ =
++            "ImageBitmap original animation, orientation or dimensions "
++            "unsupported";
++      }
++      image_bitmap->SetReachOriginal(std::move(reach_original_),
++                                     std::move(reach_original_error_));
++    }
+     resolver_->Resolve(image_bitmap);
+   } else {
+     RejectPromise(kAllocationFailureImageBitmapRejectionReason);
+diff --git third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.h third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.h
+index e912ed7..1a037cb 100644
+--- third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.h
++++ third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.h
+@@ -31,6 +31,9 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_CANVAS_IMAGEBITMAP_IMAGE_BITMAP_FACTORIES_H_
+ #define THIRD_PARTY_BLINK_RENDERER_MODULES_CANVAS_IMAGEBITMAP_IMAGE_BITMAP_FACTORIES_H_
+ 
++#include <memory>
++#include <string>
++
+ #include "base/sequence_checker.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
+@@ -45,6 +48,7 @@
+ #include "third_party/blink/renderer/core/workers/worker_global_scope.h"
+ #include "third_party/blink/renderer/modules/modules_export.h"
+ #include "third_party/blink/renderer/platform/bindings/name_client.h"
++#include "third_party/blink/renderer/platform/graphics/reach_image_bitmap_original.h"
+ #include "third_party/blink/renderer/platform/heap/collection_support/heap_hash_set.h"
+ #include "third_party/blink/renderer/platform/image-decoders/image_decoder.h"
+ #include "third_party/blink/renderer/platform/supplementable.h"
+@@ -190,7 +194,8 @@ class MODULES_EXPORT ImageBitmapFactories final
+ 
+     void ScheduleAsyncImageBitmapDecoding(ArrayBufferContents);
+     void ResolvePromiseOnOriginalThread(sk_sp<SkImage>,
+-                                        const ImageOrientationEnum);
++                                        const ImageOrientationEnum,
++                                        bool single_frame);
+ 
+     // ExecutionContextLifecycleObserver
+     void ContextDestroyed() override;
+@@ -204,6 +209,8 @@ class MODULES_EXPORT ImageBitmapFactories final
+     Member<ScriptPromiseResolver<ImageBitmap>> resolver_;
+     std::optional<gfx::Rect> crop_rect_;
+     Member<const ImageBitmapOptions> options_;
++    std::shared_ptr<const ReachImageBitmapOriginal> reach_original_;
++    std::string reach_original_error_;
+   };
+ 
+   static ImageBitmapFactories& From(ExecutionContext&);
 diff --git third_party/blink/renderer/modules/webgl/BUILD.gn third_party/blink/renderer/modules/webgl/BUILD.gn
 index d611207..70a6606 100644
 --- third_party/blink/renderer/modules/webgl/BUILD.gn
@@ -258,9 +520,8 @@ index d611207..70a6606 100644
      "angle_instanced_arrays.h",
      "ext_blend_min_max.cc",
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_call.h third_party/blink/renderer/modules/webgl/reach_webgl_call.h
-new file mode 100644
-index 0000000..6a04ffa
---- /dev/null
+index e69de29..6a04ffa 100644
+--- third_party/blink/renderer/modules/webgl/reach_webgl_call.h
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_call.h
 @@ -0,0 +1,105 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
@@ -369,11 +630,10 @@ index 0000000..6a04ffa
 +}  // namespace blink
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-new file mode 100644
-index 0000000..c0b47b7
---- /dev/null
+index e69de29..0c24d4e 100644
+--- third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,564 @@
+@@ -0,0 +1,616 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -389,6 +649,7 @@ index 0000000..c0b47b7
 +#include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
 +#include "third_party/blink/renderer/modules/webgl/webgl_program.h"
 +#include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
 +
 +namespace blink {
 +namespace {
@@ -396,6 +657,7 @@ index 0000000..c0b47b7
 +constexpr uint64_t kJournalBit = uint64_t{1} << 63;
 +constexpr size_t kMaxCommandBytes = 4 * 1024 * 1024;
 +constexpr uint32_t kMaxObjects = 65536;
++static_assert(ReachWebGLPending::kLimit == ReachImageBitmapOriginal::kLimit);
 +
 +using Journals = std::map<uint64_t, WeakPersistent<WebGLRenderingContextBase>>;
 +
@@ -405,8 +667,7 @@ index 0000000..c0b47b7
 +}
 +
 +std::atomic_size_t& RetainedBytes() {
-+  static std::atomic_size_t bytes{0};
-+  return bytes;
++  return Canvas2DBitmapProvider::ReachWebGLPendingBytes();
 +}
 +
 +void (*change_callback)(HTMLCanvasElement*) = nullptr;
@@ -572,6 +833,29 @@ index 0000000..c0b47b7
 +void ReachWebGLJournal::RejectTextureUpload(std::string_view error) {
 +  if (HasTextureSource())
 +    pending_->error = error;
++}
++
++void ReachWebGLJournal::OriginalImageBitmapTexture(
++    base::ListValue args,
++    std::shared_ptr<const ReachImageBitmapOriginal> original,
++    int width,
++    int height,
++    ReachImageBitmapOriginal::Unpack restore) {
++  if (!HasTextureSource() || !original)
++    return;
++  auto* owner = new std::shared_ptr<const ReachImageBitmapOriginal>(original);
++  auto encoded = SkData::MakeWithProc(
++      original->bytes().data(), original->bytes().size(),
++      [](const void*, void* context) {
++        delete static_cast<std::shared_ptr<const ReachImageBitmapOriginal>*>(
++            context);
++      },
++      owner);
++  OriginalTexture(std::move(args), std::move(encoded), width, height);
++  if (!pending_->texture_source && pending_->error.empty()) {
++    pending_->unpack_before = original->unpack();
++    pending_->unpack_after = restore;
++  }
 +}
 +
 +void ReachWebGLJournal::OriginalTexture(base::ListValue args,
@@ -806,6 +1090,20 @@ index 0000000..c0b47b7
 +    Fail(command.error);
 +    return;
 +  }
++  if (command.unpack_before) {
++    constexpr std::array<int, 3> names{37440, 37441, 37443};
++    for (size_t i = 0; i < names.size(); ++i) {
++      ReachWebGLCommand unpack;
++      unpack.value.Set("op", "pixelStorei");
++      base::ListValue args;
++      args.Append(names[i]);
++      args.Append((*command.unpack_before)[i]);
++      unpack.value.Set("args", std::move(args));
++      Append(std::move(unpack));
++      if (!usable())
++        return;
++    }
++  }
 +  auto json = base::WriteJson(command.value);
 +  if (!json || json->size() > kMaxCommandBytes) {
 +    Fail("WebGL command delivery size exceeded");
@@ -832,6 +1130,20 @@ index 0000000..c0b47b7
 +    Fail(error);
 +  else
 +    NotifyChange();
++  if (command.unpack_after && usable()) {
++    constexpr std::array<int, 3> names{37440, 37441, 37443};
++    for (size_t i = 0; i < names.size(); ++i) {
++      ReachWebGLCommand unpack;
++      unpack.value.Set("op", "pixelStorei");
++      base::ListValue args;
++      args.Append(names[i]);
++      args.Append((*command.unpack_after)[i]);
++      unpack.value.Set("args", std::move(args));
++      Append(std::move(unpack));
++      if (!usable())
++        return;
++    }
++  }
 +}
 +
 +void ReachWebGLJournal::Resize(int width, int height) {
@@ -939,17 +1251,17 @@ index 0000000..c0b47b7
 +
 +}  // namespace blink
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.h third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
-new file mode 100644
-index 0000000..ad918e9
---- /dev/null
+index e69de29..da09af8 100644
+--- third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,268 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +
 +#include <cmath>
 +#include <cstdint>
 +#include <map>
++#include <optional>
 +#include <string>
 +#include <string_view>
 +#include <type_traits>
@@ -961,11 +1273,12 @@ index 0000000..ad918e9
 +#include "third_party/blink/renderer/core/typed_arrays/dom_array_buffer.h"
 +#include "third_party/blink/renderer/core/typed_arrays/dom_array_buffer_view.h"
 +#include "third_party/blink/renderer/modules/modules_export.h"
++#include "third_party/blink/renderer/modules/webgl/reach_webgl_pending.h"
 +#include "third_party/blink/renderer/modules/webgl/webgl_extension.h"
 +#include "third_party/blink/renderer/modules/webgl/webgl_object.h"
-+#include "third_party/blink/renderer/modules/webgl/reach_webgl_pending.h"
 +#include "third_party/blink/renderer/modules/webgl/webgl_uniform_location.h"
 +#include "third_party/blink/renderer/platform/bindings/exception_state.h"
++#include "third_party/blink/renderer/platform/graphics/reach_image_bitmap_original.h"
 +#include "third_party/blink/renderer/platform/heap/persistent.h"
 +#include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
 +#include "third_party/skia/include/core/SkData.h"
@@ -988,6 +1301,8 @@ index 0000000..ad918e9
 +  bool texture_source = false;
 +  std::string original_hash;
 +  sk_sp<const SkData> original;
++  std::optional<ReachImageBitmapOriginal::Unpack> unpack_before;
++  std::optional<ReachImageBitmapOriginal::Unpack> unpack_after;
 +};
 +
 +class MODULES_EXPORT ReachWebGLJournal final {
@@ -1053,6 +1368,12 @@ index 0000000..ad918e9
 +                       sk_sp<const SkData>,
 +                       int width,
 +                       int height);
++  void OriginalImageBitmapTexture(
++      base::ListValue,
++      std::shared_ptr<const ReachImageBitmapOriginal>,
++      int width,
++      int height,
++      ReachImageBitmapOriginal::Unpack restore);
 +
 +  template <typename T>
 +  void Argument(ReachWebGLCommand& command,
@@ -1202,8 +1523,137 @@ index 0000000..ad918e9
 +
 +}  // namespace blink
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
+diff --git third_party/blink/renderer/modules/webgl/reach_webgl_pending.h third_party/blink/renderer/modules/webgl/reach_webgl_pending.h
+new file mode 100644
+index 0000000..923c356
+--- /dev/null
++++ third_party/blink/renderer/modules/webgl/reach_webgl_pending.h
+@@ -0,0 +1,123 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
++
++#include <algorithm>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <iterator>
++#include <limits>
++#include <list>
++#include <string>
++#include <utility>
++
++namespace blink {
++
++// Delivery state only. This is deliberately not a reconstruction checkpoint.
++class ReachWebGLPending final {
++ public:
++  static constexpr size_t kLimit = 256 * 1024 * 1024;
++  explicit ReachWebGLPending(std::atomic_size_t& aggregate,
++                            uint64_t generation = 0)
++      : aggregate_(aggregate), generation_(generation) {}
++  ReachWebGLPending(const ReachWebGLPending&) = delete;
++  ReachWebGLPending& operator=(const ReachWebGLPending&) = delete;
++  ~ReachWebGLPending() { aggregate_.fetch_sub(bytes_); }
++
++  std::string Append(std::string command, size_t delivery_bytes = 0) {
++    if (next_ == std::numeric_limits<uint64_t>::max())
++      return "WebGL absolute sequence exhausted";
++    // Include node/string storage; never charge only a context's payload.
++    const size_t overhead = sizeof(Entry) + 2 * sizeof(void*) + 1;
++    if (command.capacity() > kLimit - overhead)
++      return "Combined WebGL pending delivery budget exceeded";
++    const size_t charge = command.capacity() + overhead;
++    size_t previous = aggregate_.load();
++    do {
++      if (previous > kLimit - charge)
++        return "Combined WebGL pending delivery budget exceeded";
++    } while (!aggregate_.compare_exchange_weak(previous, previous + charge));
++    commands_.push_back({std::move(command), delivery_bytes});
++    bytes_ += charge;
++    ++next_;
++    return {};
++  }
++
++  std::string Read(uint64_t generation,
++                   uint64_t cursor,
++                   size_t max_bytes,
++                   std::string* commands,
++                   uint64_t* end) {
++    if (generation != generation_)
++      return "WebGL read generation is stale";
++    if (cursor < retired_ || cursor > read_through_ || max_bytes <= 2)
++      return "WebGL cursor is retired, future, or skips an unread prefix";
++    auto it = commands_.begin();
++    std::advance(it, cursor - retired_);
++    *commands = "[";
++    *end = cursor;
++    size_t delivery = 0;
++    for (; it != commands_.end(); ++it) {
++      const size_t separator = *end == cursor ? 0 : 1;
++      if (it->value.size() + separator + 1 + it->delivery_bytes >
++          max_bytes - commands->size() - delivery)
++        break;
++      if (separator)
++        *commands += ',';
++      *commands += it->value;
++      delivery += it->delivery_bytes;
++      ++*end;
++    }
++    if (*end == cursor && cursor < next_)
++      return "WebGL command does not fit the bounded response";
++    *commands += ']';
++    read_through_ = std::max(read_through_, *end);
++    return {};
++  }
++
++  std::string Sent(uint64_t generation, uint64_t through) {
++    if (generation != generation_)
++      return "WebGL sent generation is stale";
++    if (through > read_through_)
++      return "WebGL sent prefix is future or unread";
++    sent_through_ = std::max(sent_through_, through);
++    return {};
++  }
++
++  std::string Applied(uint64_t generation, uint64_t through) {
++    if (generation != generation_)
++      return "WebGL applied generation is stale";
++    if (through > sent_through_)
++      return "WebGL applied prefix is future or unsent";
++    while (retired_ < through) {
++      const auto& command = commands_.front().value;
++      const size_t charge = command.capacity() + sizeof(Entry) +
++                            2 * sizeof(void*) + 1;
++      bytes_ -= charge;
++      aggregate_.fetch_sub(charge);
++      commands_.pop_front();
++      ++retired_;
++    }
++    return {};
++  }
++
++  uint64_t next() const { return next_; }
++  uint64_t retired() const { return retired_; }
++
++ private:
++  struct Entry {
++    std::string value;
++    size_t delivery_bytes;
++  };
++  std::atomic_size_t& aggregate_;
++  const uint64_t generation_;
++  std::list<Entry> commands_;
++  size_t bytes_ = 0;
++  uint64_t retired_ = 0;
++  uint64_t next_ = 0;
++  uint64_t read_through_ = 0;
++  uint64_t sent_through_ = 0;
++};
++
++}  // namespace blink
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
 diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index b17f336..466da10 100644
+index b17f336..0c6ad01 100644
 --- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -44,6 +44,8 @@
@@ -1387,7 +1837,57 @@ index b17f336..466da10 100644
    TexImageSkImage(params, std::move(sk_image));
  }
  
-@@ -9266,6 +9384,7 @@ void WebGLRenderingContextBase::SynthesizeGLError(
+@@ -6824,6 +6942,7 @@ void WebGLRenderingContextBase::TexImageHelperImageBitmap(
+   if (!ValidateTexImageBinding(params))
+     return;
+ 
++  const bool explicit_size = params.width || params.height || params.depth;
+   if (!params.width)
+     params.width = bitmap->width();
+   if (!params.height)
+@@ -6842,6 +6961,41 @@ void WebGLRenderingContextBase::TexImageHelperImageBitmap(
+   auto static_bitmap_image = bitmap->BitmapImage();
+   DCHECK(static_bitmap_image);
+ 
++  if (reach_journal_ && reach_journal_->HasTextureSource()) {
++    const auto& original = static_bitmap_image->ReachOriginal();
++    if (explicit_size || selecting_sub_rectangle || params.unpack_skip_pixels ||
++        params.unpack_skip_rows || params.unpack_skip_images ||
++        params.unpack_image_height || unpack_row_length_ ||
++        unpack_color_space_ != PredefinedColorSpace::kSRGB ||
++        (params.function_id != kTexImage2D &&
++         params.function_id != kTexSubImage2D)) {
++      reach_journal_->RejectTextureUpload(
++          "WebGL original ImageBitmap crop, 3D or wide-gamut unpack is "
++          "unsupported");
++    } else if (!original) {
++      reach_journal_->RejectTextureUpload(
++          static_bitmap_image->ReachOriginalError());
++    } else {
++      base::ListValue args;
++      args.Append(static_cast<int>(params.target));
++      args.Append(params.level);
++      if (params.function_id == kTexImage2D) {
++        args.Append(static_cast<int>(params.internalformat));
++      } else {
++        args.Append(params.xoffset);
++        args.Append(params.yoffset);
++      }
++      args.Append(static_cast<int>(params.format));
++      args.Append(static_cast<int>(params.type));
++      // ImageBitmap ignores app UNPACK_*: reproduce creation policy, then
++      // restore the captured application state without changing native GL.
++      reach_journal_->OriginalImageBitmapTexture(
++          std::move(args), original, bitmap->width(), bitmap->height(),
++          {unpack_flip_y_, unpack_premultiply_alpha_,
++           static_cast<int>(unpack_colorspace_conversion_)});
++    }
++  }
++
+   // When TexImage is called with an ImageBitmap, the values of UNPACK_FLIP_Y,
+   // UNPACK_PREMULTIPLY_ALPHA, and UNPACK_COLORSPACE_CONVERSION are to be
+   // ignored. Set `adjusted_params` such that no conversions will be made using
+@@ -9266,6 +9420,7 @@ void WebGLRenderingContextBase::SynthesizeGLError(
      const char* function_name,
      const char* description,
      ConsoleDisplayPreference display) {
@@ -1430,8 +1930,20 @@ index 2e5ca58..2a9fe21 100644
    WebGLRenderingContextBase(CanvasRenderingContextHost*,
                              scoped_refptr<base::SingleThreadTaskRunner>,
                              std::unique_ptr<WebGraphicsContext3DProvider>,
+diff --git third_party/blink/renderer/platform/BUILD.gn third_party/blink/renderer/platform/BUILD.gn
+index 6101076..8aed8b5 100644
+--- third_party/blink/renderer/platform/BUILD.gn
++++ third_party/blink/renderer/platform/BUILD.gn
+@@ -1243,6 +1243,7 @@ component("platform") {
+     "graphics/profiling_canvas.h",
+     "graphics/raster_dark_mode_filter_impl.cc",
+     "graphics/raster_dark_mode_filter_impl.h",
++    "graphics/reach_image_bitmap_original.h",
+     "graphics/replaying_canvas.cc",
+     "graphics/replaying_canvas.h",
+     "graphics/resource_id_traits.h",
 diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
-index 153c924..20b76bf 100644
+index 153c924..8e9390a 100644
 --- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
 +++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
 @@ -13,6 +13,7 @@
@@ -1442,7 +1954,7 @@ index 153c924..20b76bf 100644
  #include "base/functional/bind.h"
  #include "base/memory/ptr_util.h"
  #include "base/strings/stringprintf.h"
-@@ -43,6 +44,14 @@ bool Canvas2DBitmapProvider::IsReachCommandMode() {
+@@ -43,6 +44,19 @@ bool Canvas2DBitmapProvider::IsReachCommandMode() {
        "reach-drawing-commands");
  }
  
@@ -1454,147 +1966,161 @@ index 153c924..20b76bf 100644
 +  return enabled && IsReachCommandMode();
 +}
 +
++std::atomic_size_t& Canvas2DBitmapProvider::ReachWebGLPendingBytes() {
++  static std::atomic_size_t bytes{0};
++  return bytes;
++}
++
  Canvas2DBitmapProvider::Canvas2DBitmapProvider(
      gfx::Size size,
      viz::SharedImageFormat format,
 diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
-index 2cb58aa..4873818 100644
+index 2cb58aa..a5974e6 100644
 --- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
 +++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
-@@ -69,6 +69,7 @@ class PLATFORM_EXPORT Canvas2DBitmapProvider final
+@@ -5,6 +5,7 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_CANVAS_2D_BITMAP_PROVIDER_H_
+ #define THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_CANVAS_2D_BITMAP_PROVIDER_H_
+ 
++#include <atomic>
+ #include <memory>
+ #include <optional>
+ 
+@@ -69,6 +70,8 @@ class PLATFORM_EXPORT Canvas2DBitmapProvider final
    ~Canvas2DBitmapProvider() override;
  
    static bool IsReachCommandMode();
 +  static bool IsReachWebGLCommandMode();
++  static std::atomic_size_t& ReachWebGLPendingBytes();
    bool IsValid() const { return IsReachCommandMode() || GetSkSurface(); }
    void SetDelegate(CanvasResourceProviderDelegate* delegate) {
      delegate_ = delegate;
-diff --git third_party/blink/renderer/modules/webgl/reach_webgl_pending.h third_party/blink/renderer/modules/webgl/reach_webgl_pending.h
+diff --git third_party/blink/renderer/platform/graphics/reach_image_bitmap_original.h third_party/blink/renderer/platform/graphics/reach_image_bitmap_original.h
 new file mode 100644
-index 0000000..923c356
+index 0000000..fbfe224
 --- /dev/null
-+++ third_party/blink/renderer/modules/webgl/reach_webgl_pending.h
-@@ -0,0 +1,123 @@
-+#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
-+#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
++++ third_party/blink/renderer/platform/graphics/reach_image_bitmap_original.h
+@@ -0,0 +1,67 @@
++#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_IMAGE_BITMAP_ORIGINAL_H_
++#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_IMAGE_BITMAP_ORIGINAL_H_
 +
-+#include <algorithm>
++#include <array>
 +#include <atomic>
 +#include <cstddef>
 +#include <cstdint>
-+#include <iterator>
-+#include <limits>
-+#include <list>
-+#include <string>
++#include <memory>
 +#include <utility>
++#include <vector>
 +
 +namespace blink {
 +
-+// Delivery state only. This is deliberately not a reconstruction checkpoint.
-+class ReachWebGLPending final {
++// Immutable current-source ownership, not a delivered-command archive.
++class ReachImageBitmapOriginal final {
 + public:
 +  static constexpr size_t kLimit = 256 * 1024 * 1024;
-+  explicit ReachWebGLPending(std::atomic_size_t& aggregate,
-+                            uint64_t generation = 0)
-+      : aggregate_(aggregate), generation_(generation) {}
-+  ReachWebGLPending(const ReachWebGLPending&) = delete;
-+  ReachWebGLPending& operator=(const ReachWebGLPending&) = delete;
-+  ~ReachWebGLPending() { aggregate_.fetch_sub(bytes_); }
++  static constexpr size_t kMaxBytes = 8 * 1024 * 1024 - 1024;
++  using Unpack = std::array<int, 3>;
 +
-+  std::string Append(std::string command, size_t delivery_bytes = 0) {
-+    if (next_ == std::numeric_limits<uint64_t>::max())
-+      return "WebGL absolute sequence exhausted";
-+    // Include node/string storage; never charge only a context's payload.
-+    const size_t overhead = sizeof(Entry) + 2 * sizeof(void*) + 1;
-+    if (command.capacity() > kLimit - overhead)
-+      return "Combined WebGL pending delivery budget exceeded";
-+    const size_t charge = command.capacity() + overhead;
-+    size_t previous = aggregate_.load();
++  static std::shared_ptr<const ReachImageBitmapOriginal> Create(
++      std::atomic_size_t& budget,
++      std::vector<uint8_t> bytes,
++      Unpack unpack) {
++    if (bytes.empty() || bytes.size() > kMaxBytes ||
++        bytes.capacity() > kMaxBytes || (unpack[0] != 0 && unpack[0] != 1) ||
++        (unpack[1] != 0 && unpack[1] != 1) ||
++        (unpack[2] != 0 && unpack[2] != 37444)) {
++      return nullptr;
++    }
++    const size_t charge = bytes.capacity() + 256;
++    size_t previous = budget.load(std::memory_order_relaxed);
 +    do {
 +      if (previous > kLimit - charge)
-+        return "Combined WebGL pending delivery budget exceeded";
-+    } while (!aggregate_.compare_exchange_weak(previous, previous + charge));
-+    commands_.push_back({std::move(command), delivery_bytes});
-+    bytes_ += charge;
-+    ++next_;
-+    return {};
++        return nullptr;
++    } while (!budget.compare_exchange_weak(previous, previous + charge,
++                                           std::memory_order_relaxed));
++    return std::shared_ptr<const ReachImageBitmapOriginal>(
++        new ReachImageBitmapOriginal(budget, std::move(bytes), unpack, charge));
 +  }
 +
-+  std::string Read(uint64_t generation,
-+                   uint64_t cursor,
-+                   size_t max_bytes,
-+                   std::string* commands,
-+                   uint64_t* end) {
-+    if (generation != generation_)
-+      return "WebGL read generation is stale";
-+    if (cursor < retired_ || cursor > read_through_ || max_bytes <= 2)
-+      return "WebGL cursor is retired, future, or skips an unread prefix";
-+    auto it = commands_.begin();
-+    std::advance(it, cursor - retired_);
-+    *commands = "[";
-+    *end = cursor;
-+    size_t delivery = 0;
-+    for (; it != commands_.end(); ++it) {
-+      const size_t separator = *end == cursor ? 0 : 1;
-+      if (it->value.size() + separator + 1 + it->delivery_bytes >
-+          max_bytes - commands->size() - delivery)
-+        break;
-+      if (separator)
-+        *commands += ',';
-+      *commands += it->value;
-+      delivery += it->delivery_bytes;
-+      ++*end;
-+    }
-+    if (*end == cursor && cursor < next_)
-+      return "WebGL command does not fit the bounded response";
-+    *commands += ']';
-+    read_through_ = std::max(read_through_, *end);
-+    return {};
++  ReachImageBitmapOriginal(const ReachImageBitmapOriginal&) = delete;
++  ReachImageBitmapOriginal& operator=(const ReachImageBitmapOriginal&) = delete;
++  ~ReachImageBitmapOriginal() {
++    budget_.fetch_sub(charge_, std::memory_order_relaxed);
 +  }
-+
-+  std::string Sent(uint64_t generation, uint64_t through) {
-+    if (generation != generation_)
-+      return "WebGL sent generation is stale";
-+    if (through > read_through_)
-+      return "WebGL sent prefix is future or unread";
-+    sent_through_ = std::max(sent_through_, through);
-+    return {};
-+  }
-+
-+  std::string Applied(uint64_t generation, uint64_t through) {
-+    if (generation != generation_)
-+      return "WebGL applied generation is stale";
-+    if (through > sent_through_)
-+      return "WebGL applied prefix is future or unsent";
-+    while (retired_ < through) {
-+      const auto& command = commands_.front().value;
-+      const size_t charge = command.capacity() + sizeof(Entry) +
-+                            2 * sizeof(void*) + 1;
-+      bytes_ -= charge;
-+      aggregate_.fetch_sub(charge);
-+      commands_.pop_front();
-+      ++retired_;
-+    }
-+    return {};
-+  }
-+
-+  uint64_t next() const { return next_; }
-+  uint64_t retired() const { return retired_; }
++  const std::vector<uint8_t>& bytes() const { return bytes_; }
++  const Unpack& unpack() const { return unpack_; }
 +
 + private:
-+  struct Entry {
-+    std::string value;
-+    size_t delivery_bytes;
-+  };
-+  std::atomic_size_t& aggregate_;
-+  const uint64_t generation_;
-+  std::list<Entry> commands_;
-+  size_t bytes_ = 0;
-+  uint64_t retired_ = 0;
-+  uint64_t next_ = 0;
-+  uint64_t read_through_ = 0;
-+  uint64_t sent_through_ = 0;
++  ReachImageBitmapOriginal(std::atomic_size_t& budget,
++                           std::vector<uint8_t> bytes,
++                           Unpack unpack,
++                           size_t charge)
++      : budget_(budget),
++        bytes_(std::move(bytes)),
++        unpack_(unpack),
++        charge_(charge) {}
++
++  std::atomic_size_t& budget_;
++  const std::vector<uint8_t> bytes_;
++  const Unpack unpack_;
++  const size_t charge_;
 +};
 +
 +}  // namespace blink
-+#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
++#endif  // THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_IMAGE_BITMAP_ORIGINAL_H_
+diff --git third_party/blink/renderer/platform/graphics/static_bitmap_image.h third_party/blink/renderer/platform/graphics/static_bitmap_image.h
+index 60de4ba..2e56845 100644
+--- third_party/blink/renderer/platform/graphics/static_bitmap_image.h
++++ third_party/blink/renderer/platform/graphics/static_bitmap_image.h
+@@ -5,12 +5,16 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_STATIC_BITMAP_IMAGE_H_
+ #define THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_STATIC_BITMAP_IMAGE_H_
+ 
++#include <string>
++#include <string_view>
++
+ #include "base/byte_size.h"
+ #include "base/notreached.h"
+ #include "components/viz/common/resources/shared_image_format_utils.h"
+ #include "gpu/command_buffer/client/client_shared_image.h"
+ #include "gpu/command_buffer/common/shared_image_usage.h"
+ #include "third_party/blink/renderer/platform/graphics/image.h"
++#include "third_party/blink/renderer/platform/graphics/reach_image_bitmap_original.h"
+ #include "third_party/blink/renderer/platform/wtf/casting.h"
+ #include "third_party/khronos/GLES2/gl2.h"
+ #include "third_party/skia/include/core/SkRefCnt.h"
+@@ -92,6 +96,23 @@ class PLATFORM_EXPORT StaticBitmapImage : public Image {
+   bool OriginClean() const { return is_origin_clean_; }
+   void SetOriginClean(bool flag) { is_origin_clean_ = flag; }
+ 
++  const std::shared_ptr<const ReachImageBitmapOriginal>& ReachOriginal() const {
++    return reach_original_;
++  }
++  std::string_view ReachOriginalError() const {
++    return reach_original_error_.empty()
++               ? "ImageBitmap original provenance unavailable or transform "
++                 "unsupported"
++               : std::string_view(reach_original_error_);
++  }
++  void SetReachOriginal(
++      std::shared_ptr<const ReachImageBitmapOriginal> original,
++      std::string_view error) {
++    reach_original_ = std::move(original);
++    reach_original_error_ =
++        reach_original_ ? std::string() : std::string(error);
++  }
++
+   // StaticBitmapImage needs to store the orientation of the image itself,
+   // because the underlying representations do not. If the bitmap represents
+   // a non-default orientation it must be explicitly given in the constructor.
+@@ -140,6 +161,10 @@ class PLATFORM_EXPORT StaticBitmapImage : public Image {
+   // AcceleratedStaticBitmapImage. To change this property, the call site would
+   // have to call SetOriginClean().
+   bool is_origin_clean_ = true;
++
++ private:
++  std::shared_ptr<const ReachImageBitmapOriginal> reach_original_;
++  std::string reach_original_error_;
+ };
+ 
+ template <>

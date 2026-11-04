@@ -57,6 +57,55 @@ These are queue tests, not browser pixel, source-cookie isolation, renderer IPC
 or reload/context-loss qualification. Full CEF builds remain on the canonical
 build VM. Pending delivery is not a reconstruction checkpoint.
 
+## Reach encoded ImageBitmap originals
+
+From a Visual Studio developer shell:
+
+```powershell
+python tests\run_reach_image_bitmap_test.py --compiler cl --fixture <patched-chromium>
+```
+
+The fixture must be the Chromium revision pinned by
+`CHROMIUM_BUILD_COMPATIBILITY.txt`, with `reach_webgl_commands.patch` applied.
+The runner compiles the actual native ImageBitmap upload method, original
+capture methods, append/retirement methods and production ownership/queue
+headers. Chromium/Skia boundary objects are substituted; no CEF build or
+browser runs. `--baseline-upload` substitutes the fixture index's pre-fix upload
+method and must fail the original-byte assertion.
+
+The regression covers 128 combinations of creation/application unpack policy
+and texture/subimage uploads: original references, temporary creation-policy
+commands, exact application-state restoration, source closure before delivery,
+sent/applied retirement, current-source reupload, bounded aggregate ownership
+and explicit unsupported-source/transform errors. It is not decoder, worker
+transfer, cookie-route, native GPU or pixel-equivalence qualification.
+
+Native provenance is attached to a live `StaticBitmapImage` for supported
+encoded HTML images and Blob decoding. Exact bytes stay with that current
+source and outstanding delivery references, not a global cache or delivered
+history; closing/collecting the source and applying its final reference releases
+them. Ordinary transfer and exact transfer copies preserve provenance.
+Creation-time flip, premultiply and default/none color conversion use ordered
+`pixelStorei` overrides around the original reference, then restore application
+unpack state without modifying native GL. Cropping/resizing, oriented or
+animated sources, HDR HTML images, 3D uploads, transformed copies without proven
+provenance and wide-gamut unpack fail explicitly. Original dimensions remain
+at most 4096 each.
+
+The shared 256 MiB budget conservatively includes current-source encoded
+ownership, pending commands and pending originals. A read remains at most
+8 MiB including original bytes; originals are at most 8 MiB minus 1024 bytes.
+Larger otherwise-valid GL inputs are **not generally supported**: copied spans
+above 3 MiB, serialized commands above 4 MiB and individual strings above
+1 MiB fail explicitly. Base64/JSON overhead can reject a copied span at the
+nominal 3 MiB boundary. No native fragmentation or silent splitting changes
+WebGL calls; transport fragments do not remove these native limits.
+
+Client crash/reload is a fresh-target operation: revoke/close the old target
+and load a fresh page from zero. GPU-state reconstruction is not required.
+Actual fresh-client pixels/input, sibling isolation and source semantics still
+require native-build/browser acceptance before activation.
+
 ## Shared Code
 
 ### [shared](shared/)
