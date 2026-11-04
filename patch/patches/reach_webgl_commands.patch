@@ -369,10 +369,10 @@ index 0000000..6a04ffa
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 new file mode 100644
-index 0000000..80b17de
+index 0000000..8787a5a
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,437 @@
+@@ -0,0 +1,460 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -701,6 +701,29 @@ index 0000000..80b17de
 +    attributes.Set(std::string(name.data(), length), location);
 +  }
 +  command.value.Set("attributes", std::move(attributes));
++  if (!context_->IsWebGL2())
++    return;
++  gl->GetProgramiv(program->Object(), GL_ACTIVE_UNIFORM_BLOCKS, &count);
++  gl->GetProgramiv(program->Object(), GL_ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH,
++                   &max_length);
++  if (count < 0 || count > 256 || max_length < 0 || max_length > 1024) {
++    command.error = "WebGL program uniform block budget exceeded";
++    return;
++  }
++  base::DictValue blocks;
++  const GLsizei block_name_capacity = std::max(1, max_length);
++  name.resize(block_name_capacity);
++  for (GLint index = 0; index < count; ++index) {
++    GLsizei length = 0;
++    gl->GetActiveUniformBlockName(program->Object(), index, block_name_capacity,
++                                  &length, name.data());
++    if (length <= 0 || static_cast<size_t>(length) >= name.size()) {
++      command.error = "WebGL program uniform block name is invalid";
++      return;
++    }
++    blocks.Set(std::string(name.data(), length), index);
++  }
++  command.value.Set("uniformBlocks", std::move(blocks));
 +}
 +
 +void ReachWebGLJournal::Append(ReachWebGLCommand command) {
