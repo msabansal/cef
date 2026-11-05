@@ -1,7 +1,7 @@
-diff --git a/third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc b/third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc
+diff --git third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc
 index b010478..69eba20 100644
---- a/third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc
-+++ b/third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc
+--- third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc
++++ third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc
 @@ -47,6 +47,7 @@
  #include <optional>
  #include <utility>
