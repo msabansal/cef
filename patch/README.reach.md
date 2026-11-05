@@ -20,7 +20,7 @@ they are not an extra patch to apply to an already integrated fork.
 | `canvas_frames.patch` | Canvas2D records and bounded local/out-of-process child-frame composition. |
 | `video_commands.patch` | Video paint-order markers without embedding source-decoded frames. |
 | `paint_chunks.patch` | Incremental drawing-command paint chunks. |
-| `frame_requests.patch` | On-demand command-capture visual update notifications. |
+| `frame_requests.patch` | On-demand command-capture visual update notifications, also waking document-scoped animation demand in Blink glue before any WebGL context exists. |
 | `command_presentation.patch` | Successful command-capture presentation/timing completion. |
 | `media_journal.patch` | Ordered same-thread MediaSource operations. |
 | `webgl_commands.patch` | Converted WebGL commands, resources, retirement and client composition. |
@@ -88,3 +88,11 @@ artifact-internal paths `provenance/skia-command-export.patch` and
 CanvasKit bytes and independently qualified native identities stay unchanged.
 New native source revisions require their own build/qualification; never relabel
 an existing binary as built from a new documentation/provenance commit.
+
+Animation delivery now arms a refresh deadline only while discovery reports
+`animationPending`. This required native discovery field is not compatible with
+older artifacts. The registered `frame_requests.patch` hook also wakes animation
+delivery independently of picture-notification coalescing. Discovery does not
+consume demand; servicing clears it before script so nested RAF/CSS scheduling
+is retained. Drawing capture services the same demand without enabling raster
+or compositor begin frames. Supplement ownership isolates replacement documents.

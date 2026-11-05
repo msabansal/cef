@@ -2,17 +2,46 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
 
 namespace base {
+template <typename T>
+struct NoDestructor {
+  T value;
+  T& operator*() { return value; }
+};
+inline std::string NumberToString(uint64_t value) {
+  return std::to_string(value);
+}
 struct TimeTicks {
   static TimeTicks Now() { return {}; }
 };
 }  // namespace base
 
 namespace blink {
+struct Visitor {};
+template <typename T>
+struct GarbageCollected {};
+template <typename T, typename... Args>
+T* MakeGarbageCollected(Args&&... args) {
+  return new T(std::forward<Args>(args)...);
+}
+template <typename T>
+struct Supplement {
+  explicit Supplement(T&) {}
+  virtual ~Supplement() = default;
+  virtual void Trace(Visitor*) const {}
+  template <typename S>
+  static S* From(T& object) {
+    return static_cast<S*>(object.supplement);
+  }
+  static void ProvideTo(T& object, Supplement* value) {
+    object.supplement = value;
+  }
+};
 struct Pinned {
   int pins = 0;
 };
@@ -20,13 +49,16 @@ template <typename T>
 class Persistent {
  public:
   Persistent(T* ptr) : ptr_(ptr) {
-    if (ptr_) ++ptr_->pins;
+    if (ptr_)
+      ++ptr_->pins;
   }
   ~Persistent() {
-    if (ptr_) --ptr_->pins;
+    if (ptr_)
+      --ptr_->pins;
   }
   T* Get() const { return ptr_; }
   T* operator->() const { return ptr_; }
+  T& operator*() const { return *ptr_; }
   explicit operator bool() const { return ptr_ != nullptr; }
 
  private:
@@ -34,6 +66,7 @@ class Persistent {
 };
 struct LocalFrame;
 struct Document : Pinned {
+  void* supplement = nullptr;
   struct TokenValue {
     std::string ToString() const { return "same-token"; }
   };
@@ -66,6 +99,10 @@ struct LocalFrame : Pinned {
 };
 struct WebLocalFrame {};
 struct WebLocalFrameImpl : WebLocalFrame {
+  static WebLocalFrame* FromFrame(LocalFrame&) {
+    static WebLocalFrameImpl web;
+    return &web;
+  }
   LocalFrame* GetFrame() const { return target; }
   LocalFrame* target = nullptr;
 };
@@ -82,6 +119,11 @@ struct HTMLCanvasElement {
 };
 struct ReachWebGLJournal {
   HTMLCanvasElement* element() const { return nullptr; }
+  static std::vector<ReachWebGLJournal*> Current() { return {}; }
+  void ClearChangeNotification() {}
+  std::string State() const { return {}; }
+  std::string error() const { return {}; }
+  uint64_t retired() const { return 0; }
 };
 enum class DocumentUpdateReason { kInspector };
 namespace scheduler {
@@ -97,10 +139,88 @@ struct WebThreadScheduler {
 }  // namespace scheduler
 }  // namespace blink
 
+// NATIVE_DEMAND_NOTIFICATIONS
+
 // NATIVE_WEBGL_REQUEST_PREFIX
 
 int main() {
-  // Both documents deliberately report the same token; address identity matters.
+#ifdef REACH_TEST_DEMAND
+  {
+    blink::Document document;
+    blink::Document replacement;
+    blink::Page page;
+    blink::LocalFrame frame;
+    frame.current_document = &document;
+    frame.current_page = &page;
+    document.owner = &frame;
+    replacement.owner = &frame;
+    blink::WebLocalFrameImpl web;
+    web.target = &frame;
+    int pictures = 0;
+    int wakes = 0;
+    FrameRequestCallback() = [&](blink::WebLocalFrame*) { ++pictures; };
+    WebGlChangeCallback() = [&](blink::WebLocalFrame*) { ++wakes; };
+    auto inventory = [&] {
+      std::vector<uint8_t> bytes;
+      std::map<std::string, std::vector<uint8_t>> originals;
+      assert(WebGlRequest(&web, "Reach.WebGlStreams.v2", "", "", "", "", "", 0,
+                          &bytes, &originals)
+                 .empty());
+      return std::string(bytes.begin(), bytes.end());
+    };
+    const auto idle = inventory();
+    // A fully idle page, with no WebGL contexts, asks for its first RAF.
+    OnFrameRequested(frame);
+    assert(wakes == 1 && pictures == 1);
+    assert(idle.find("\"animationPending\":false") != std::string::npos);
+    OnFrameRequested(frame);
+    assert(wakes == 1 && pictures == 1);
+    assert(inventory().find("\"animationPending\":true") != std::string::npos);
+    assert(inventory().find("\"animationPending\":true") != std::string::npos);
+    int scripts = 0;
+    bool rearm = true;
+    page.driver.script = [&] {
+      ++scripts;
+      if (rearm)
+        OnFrameRequested(frame);
+    };
+    page.driver.lifecycle = [] {};
+    auto tick = [&] {
+      std::vector<uint8_t> bytes;
+      std::map<std::string, std::vector<uint8_t>> originals;
+      assert(WebGlRequest(&web, "Reach.WebGlTick.v2", "", "", "", "", "", 0,
+                          &bytes, &originals)
+                 .empty());
+    };
+    tick();
+    assert(wakes == 2 && scripts == 1 && pictures == 1);
+    assert(inventory().find("\"animationPending\":true") != std::string::npos);
+    rearm = false;
+    tick();
+    assert(scripts == 2);
+    assert(inventory().find("\"animationPending\":false") != std::string::npos);
+    // Lifecycle scheduling (including CSS), not just script, rearms demand.
+    page.driver.lifecycle = [&] { OnFrameRequested(frame); };
+    tick();
+    assert(wakes == 3);
+    assert(inventory().find("\"animationPending\":true") != std::string::npos);
+    page.driver.lifecycle = [] {};
+    tick();
+    assert(inventory().find("\"animationPending\":false") != std::string::npos);
+    OnFrameRequested(frame);
+    assert(wakes == 4);
+    frame.current_document = &replacement;
+    assert(inventory().find("\"animationPending\":false") != std::string::npos);
+    OnFrameRequested(frame);
+    assert(wakes == 5);
+    frame.current_document = &document;
+    assert(inventory().find("\"animationPending\":true") != std::string::npos);
+    // Drawing notification coalescing cannot swallow a new animation wake.
+    assert(pictures == 1);
+  }
+#endif
+  // Both documents deliberately report the same token; address identity
+  // matters.
   for (int changed_at = 0; changed_at < 3; ++changed_at) {
     blink::Document original;
     blink::Document replacement;
@@ -121,19 +241,20 @@ int main() {
     page.driver.script = [&] {
       check_pins();
       ++scripts;
-      if (changed_at == 1) frame.current_document = &replacement;
+      if (changed_at == 1)
+        frame.current_document = &replacement;
     };
     page.driver.lifecycle = [&] {
       check_pins();
       ++lifecycles;
-      if (changed_at == 2) frame.current_document = &replacement;
+      if (changed_at == 2)
+        frame.current_document = &replacement;
     };
     std::vector<uint8_t> output;
     std::map<std::string, std::vector<uint8_t>> originals;
     const std::string token = "same-token";
-    const auto result = WebGlRequest(
-        &web, "Reach.WebGlTick.v2", token, "", "", "", "", 0,
-        &output, &originals);
+    const auto result = WebGlRequest(&web, "Reach.WebGlTick.v2", token, "", "",
+                                     "", "", 0, &output, &originals);
     assert(result == (changed_at ? "WebGL animation document changed" : ""));
     assert(scripts == 1 && lifecycles == (changed_at == 1 ? 0 : 1));
     assert(original.pins == 0 && replacement.pins == 0);

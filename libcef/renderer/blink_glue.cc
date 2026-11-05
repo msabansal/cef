@@ -110,6 +110,7 @@
 #include "third_party/blink/renderer/platform/loader/fetch/resource_response.h"
 #include "third_party/blink/renderer/platform/loader/fetch/script_fetch_options.h"
 #include "third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.h"
+#include "third_party/blink/renderer/platform/supplementable.h"
 #include "third_party/blink/renderer/platform/weborigin/scheme_registry.h"
 #include "third_party/skia/include/core/SkBlendMode.h"
 #include "third_party/skia/include/core/SkColorFilter.h"
@@ -149,6 +150,38 @@ namespace {
 
 // Local roots already reported as needing a visual update since their last
 // drawing-command capture. Pointers are only compared, never dereferenced.
+// Animation demand is separate: discovery must not consume it, and picture
+// notification coalescing must not swallow a first RAF on an otherwise idle
+// page. A document supplement retires with its document, not a reused pointer.
+class PendingAnimation final : public blink::GarbageCollected<PendingAnimation>,
+                               public blink::Supplement<blink::Document> {
+ public:
+  static const char kSupplementName[];
+
+  static PendingAnimation& From(blink::Document& document) {
+    auto* state =
+        blink::Supplement<blink::Document>::From<PendingAnimation>(document);
+    if (!state) {
+      state = blink::MakeGarbageCollected<PendingAnimation>(document);
+      blink::Supplement<blink::Document>::ProvideTo(document, state);
+    }
+    return *state;
+  }
+
+  explicit PendingAnimation(blink::Document& document)
+      : blink::Supplement<blink::Document>(document) {}
+
+  void Trace(blink::Visitor* visitor) const override {
+    blink::Supplement<blink::Document>::Trace(visitor);
+  }
+
+  bool pending = false;
+};
+
+const char PendingAnimation::kSupplementName[] = "ReachPendingAnimation";
+
+std::function<void(blink::WebLocalFrame*)>& WebGlChangeCallback();
+
 std::set<const blink::LocalFrame*>& RequestedFrameRoots() {
   static base::NoDestructor<std::set<const blink::LocalFrame*>> roots;
   return *roots;
@@ -160,6 +193,17 @@ std::function<void(blink::WebLocalFrame*)>& FrameRequestCallback() {
 }
 
 void OnFrameRequested(blink::LocalFrame& root) {
+  if (blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode() &&
+      root.GetDocument()) {
+    auto& demand = PendingAnimation::From(*root.GetDocument());
+    if (!demand.pending) {
+      demand.pending = true;
+      if (WebGlChangeCallback()) {
+        if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
+          WebGlChangeCallback()(web_frame);
+      }
+    }
+  }
   if (!FrameRequestCallback() || !RequestedFrameRoots().insert(&root).second)
     return;
   if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
@@ -293,6 +337,9 @@ std::string WebGlRequest(
     blink::Persistent<blink::Page> page = frame->GetPage();
     if (!page || !frame->View())
       return "WebGL animation frame is unavailable";
+    // Clear before entering script/lifecycle. A request made by that work
+    // rearms demand and emits a new wakeup, even without a WebGL journal.
+    PendingAnimation::From(*retained_document).pending = false;
     static_cast<blink::scheduler::MainThreadSchedulerImpl&>(
         blink::scheduler::WebThreadScheduler::MainThreadScheduler())
         .BeginFrameNotExpectedSoon();
@@ -308,9 +355,12 @@ std::string WebGlRequest(
   }
   if (operation == "Reach.WebGlStreams.v2" ||
       operation == "Reach.WebGlTick.v2") {
+    const char* pending = PendingAnimation::From(*frame->GetDocument()).pending
+                              ? "true"
+                              : "false";
     std::string json = "{\"document\":\"" +
                        frame->GetDocument()->Token().ToString() +
-                       "\",\"streams\":[";
+                       "\",\"animationPending\":" + pending + ",\"streams\":[";
     bool first = true;
     for (auto* journal : blink::ReachWebGLJournal::Current()) {
       if (!owned(journal))
@@ -3194,6 +3244,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   // Visual update requests made from here on (including by this capture's own
   // animation and lifecycle steps) are reported again for the next capture.
   RequestedFrameRoots().erase(&frame->LocalFrameRoot());
+  PendingAnimation::From(*document).pending = false;
   CaptureTimer::Get().Start();
   // Held begin frames also suppress the compositor's idle-period signal.
   // Let Blink schedule idle work normally between command captures.

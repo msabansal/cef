@@ -32,6 +32,13 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     unit = output / "tick-test.cc"
     harness = (root / "tests" / "reach_webgl_tick_test.cc").read_text()
+    callback_start = source.index(
+        "std::function<void(blink::WebLocalFrame*)>& WebGlChangeCallback() {")
+    callback = source[callback_start:source.index(
+        "void OnWebGlChanged", callback_start)]
+    notifications = callback + source[source.index("// Local roots"):source.index(
+        "// Media playback state")]
+    harness = harness.replace("// NATIVE_DEMAND_NOTIFICATIONS", notifications)
     unit.write_text(harness.replace("// NATIVE_WEBGL_REQUEST_PREFIX", prefix))
     subprocess.run([
         args.clang_tidy, str(unit),
