@@ -20,7 +20,7 @@ they are not an extra patch to apply to an already integrated fork.
 | `canvas_frames.patch` | Canvas2D records and bounded local/out-of-process child-frame composition. |
 | `video_commands.patch` | Video paint-order markers without embedding source-decoded frames. |
 | `paint_chunks.patch` | Incremental drawing-command paint chunks. |
-| `frame_requests.patch` | On-demand command-capture visual update notifications. |
+| `frame_requests.patch` | On-demand command-capture visual update notifications, also waking document-scoped animation demand in Blink glue before any WebGL context exists. |
 | `command_presentation.patch` | Successful command-capture presentation/timing completion. |
 | `media_journal.patch` | Ordered same-thread MediaSource operations. |
 | `webgl_commands.patch` | Converted WebGL commands, resources, retirement and client composition. |
@@ -98,3 +98,25 @@ artifact-internal paths `provenance/skia-command-export.patch` and
 CanvasKit bytes and independently qualified native identities stay unchanged.
 New native source revisions require their own build/qualification; never relabel
 an existing binary as built from a new documentation/provenance commit.
+
+Animation delivery now arms a refresh deadline only while discovery reports
+`animationPending`. This required native discovery field is not compatible with
+older artifacts. The registered `frame_requests.patch` hook also wakes animation
+delivery independently of picture-notification coalescing. Discovery does not
+consume demand; servicing clears it before script so nested RAF/CSS scheduling
+is retained. Drawing capture services the same demand without enabling raster
+or compositor begin frames. Supplement ownership isolates replacement documents.
+
+Idle discovery also wakes on WebGL journal collection. While its canvas is live,
+each journal obtains a retirement notifier shared by its document. Finalization
+touches only non-GC notification state, never the canvas, document, frame, or weak
+registry. One deferred renderer task coalesces collected journals per document;
+only that task resolves the weak document and checks current attached ownership
+before waking authoritative stream discovery. This does not arm animation demand
+or polling. Retired/replaced documents cannot notify replacement targets.
+Mutation/discovery rebinds an adopted canvas to its current document and wakes the
+old owner to remove its stale inventory, without retaining either document.
+Live rebinding pins the context, canvas, and document across supplement allocation;
+the deferred retirement task keeps only a weak document identity.
+The updated `webgl_commands.patch` and Blink glue must be built together; existing
+artifact images are not evidence of this retirement behavior.

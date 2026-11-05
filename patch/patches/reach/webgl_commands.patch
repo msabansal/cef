@@ -635,10 +635,10 @@ index 0000000..6a04ffa
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 new file mode 100644
-index 0000000..e43e657
+index 0000000..9df53ca
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,734 @@
+@@ -0,0 +1,764 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -676,6 +676,7 @@ index 0000000..e43e657
 +}
 +
 +void (*change_callback)(HTMLCanvasElement*) = nullptr;
++std::function<void()> (*retirement_callback)(HTMLCanvasElement*) = nullptr;
 +std::string (*original_hasher)(base::span<const uint8_t>) = nullptr;
 +
 +uint64_t NextId() {
@@ -714,6 +715,7 @@ index 0000000..e43e657
 +    Fail("WebGL context ownership or context budget is invalid");
 +    return;
 +  }
++  RefreshRetirementNotification();
 +  journals.emplace(id_, WeakPersistent<WebGLRenderingContextBase>(&context));
 +  Resize(context.drawingBufferWidth(), context.drawingBufferHeight());
 +  for (const char* name : {"viewport", "scissor"}) {
@@ -731,6 +733,8 @@ index 0000000..e43e657
 +
 +ReachWebGLJournal::~ReachWebGLJournal() {
 +  RetainedBytes().fetch_sub(original_bytes_, std::memory_order_relaxed);
++  if (retirement_notification_)
++    retirement_notification_();
 +}
 +
 +HTMLCanvasElement* ReachWebGLJournal::element() const {
@@ -761,6 +765,31 @@ index 0000000..e43e657
 +  change_callback = callback;
 +}
 +
++void ReachWebGLJournal::SetRetirementCallback(
++    std::function<void()> (*callback)(HTMLCanvasElement*)) {
++  retirement_callback = callback;
++}
++
++void ReachWebGLJournal::RefreshRetirementNotification() {
++  auto* document = element_ ? &element_->GetDocument() : nullptr;
++  if (!document || !retirement_callback || retirement_document_ == document)
++    return;
++  // Binding may allocate a document supplement during weak-registry discovery.
++  Persistent<WebGLRenderingContextBase> retained_context = context_.Get();
++  Persistent<HTMLCanvasElement> retained_element = element_.Get();
++  Persistent<Document> retained_document = document;
++  // Adoption also invalidates the previously authoritative owner's inventory.
++  if (retirement_notification_)
++    retirement_notification_();
++  retirement_document_ = retained_document.Get();
++  retirement_notification_ = retirement_callback(retained_element.Get());
++}
++
++void ReachWebGLJournal::ClearChangeNotification() {
++  change_pending_ = false;
++  RefreshRetirementNotification();
++}
++
 +void ReachWebGLJournal::SetOriginalHasher(
 +    std::string (*hasher)(base::span<const uint8_t>)) {
 +  original_hasher = hasher;
@@ -780,6 +809,7 @@ index 0000000..e43e657
 +}
 +
 +void ReachWebGLJournal::NotifyChange() {
++  RefreshRetirementNotification();
 +  if (change_callback && element_ && !change_pending_) {
 +    change_pending_ = true;
 +    change_callback(element_.Get());
@@ -1375,15 +1405,16 @@ index 0000000..e43e657
 +}  // namespace blink
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.h third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
 new file mode 100644
-index 0000000..e23aeee
+index 0000000..69cab47
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,294 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +
 +#include <cmath>
 +#include <cstdint>
++#include <functional>
 +#include <map>
 +#include <optional>
 +#include <string>
@@ -1413,6 +1444,7 @@ index 0000000..e23aeee
 +
 +namespace blink {
 +
++class Document;
 +class HTMLCanvasElement;
 +class ScriptState;
 +class WebGLProgram;
@@ -1459,6 +1491,9 @@ index 0000000..e23aeee
 +  static ReachWebGLJournal* Find(uint64_t);
 +  static std::vector<ReachWebGLJournal*> Current();
 +  static void SetChangeCallback(void (*callback)(HTMLCanvasElement*));
++  // The factory runs while the canvas is live; its result must be GC-safe.
++  static void SetRetirementCallback(
++      std::function<void()> (*callback)(HTMLCanvasElement*));
 +  static void SetOriginalHasher(
 +      std::string (*hasher)(base::span<const uint8_t>));
 +  static bool ShouldRecord(std::string_view);
@@ -1467,7 +1502,7 @@ index 0000000..e23aeee
 +  const std::string& error() const { return error_; }
 +  uint64_t generation() const { return generation_; }
 +  uint64_t retired() const { return commands_.retired(); }
-+  void ClearChangeNotification() { change_pending_ = false; }
++  void ClearChangeNotification();
 +  HTMLCanvasElement* element() const;
 +  std::string State();
 +  std::string Read(uint64_t cursor,
@@ -1544,6 +1579,7 @@ index 0000000..e23aeee
 +  void Collect();
 +  void Fail(std::string_view);
 +  void NotifyChange();
++  void RefreshRetirementNotification();
 +
 +  template <typename T>
 +  base::Value Encode(ReachWebGLCommand& command, const T& value) {
@@ -1661,6 +1697,8 @@ index 0000000..e23aeee
 +  std::string error_;
 +  ReachWebGLCommand* pending_ = nullptr;
 +  bool change_pending_ = false;
++  WeakPersistent<Document> retirement_document_;
++  std::function<void()> retirement_notification_;
 +};
 +
 +}  // namespace blink

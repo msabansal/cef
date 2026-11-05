@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <deque>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string_view>
@@ -19,9 +21,12 @@
 #include "base/functional/callback_helpers.h"
 #include "base/hash/hash.h"
 #include "base/json/json_writer.h"
+#include "base/location.h"
+#include "base/memory/scoped_refptr.h"
 #include "base/no_destructor.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
+#include "base/task/single_thread_task_runner.h"
 #include "base/time/time.h"
 #include "base/values.h"
 #include "build/build_config.h"
@@ -115,6 +120,7 @@
 #include "third_party/blink/renderer/platform/loader/fetch/resource_fetcher.h"
 #include "third_party/blink/renderer/platform/loader/fetch/script_fetch_options.h"
 #include "third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.h"
+#include "third_party/blink/renderer/platform/supplementable.h"
 #include "third_party/blink/renderer/platform/weborigin/scheme_registry.h"
 #include "third_party/skia/include/core/SkBlendMode.h"
 #include "third_party/skia/include/core/SkColorFilter.h"
@@ -266,6 +272,38 @@ namespace {
 
 // Local roots already reported as needing a visual update since their last
 // drawing-command capture. Pointers are only compared, never dereferenced.
+// Animation demand is separate: discovery must not consume it, and picture
+// notification coalescing must not swallow a first RAF on an otherwise idle
+// page. A document supplement retires with its document, not a reused pointer.
+class PendingAnimation final : public blink::GarbageCollected<PendingAnimation>,
+                               public blink::Supplement<blink::Document> {
+ public:
+  static const char kSupplementName[];
+
+  static PendingAnimation& From(blink::Document& document) {
+    auto* state =
+        blink::Supplement<blink::Document>::From<PendingAnimation>(document);
+    if (!state) {
+      state = blink::MakeGarbageCollected<PendingAnimation>(document);
+      blink::Supplement<blink::Document>::ProvideTo(document, state);
+    }
+    return *state;
+  }
+
+  explicit PendingAnimation(blink::Document& document)
+      : blink::Supplement<blink::Document>(document) {}
+
+  void Trace(blink::Visitor* visitor) const override {
+    blink::Supplement<blink::Document>::Trace(visitor);
+  }
+
+  bool pending = false;
+};
+
+const char PendingAnimation::kSupplementName[] = "ReachPendingAnimation";
+
+std::function<void(blink::WebLocalFrame*)>& WebGlChangeCallback();
+
 std::set<const blink::LocalFrame*>& RequestedFrameRoots() {
   static base::NoDestructor<std::set<const blink::LocalFrame*>> roots;
   return *roots;
@@ -277,6 +315,17 @@ std::function<void(blink::WebLocalFrame*)>& FrameRequestCallback() {
 }
 
 void OnFrameRequested(blink::LocalFrame& root) {
+  if (blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode() &&
+      root.GetDocument()) {
+    auto& demand = PendingAnimation::From(*root.GetDocument());
+    if (!demand.pending) {
+      demand.pending = true;
+      if (WebGlChangeCallback()) {
+        if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
+          WebGlChangeCallback()(web_frame);
+      }
+    }
+  }
   if (!FrameRequestCallback() || !RequestedFrameRoots().insert(&root).second)
     return;
   if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
@@ -347,6 +396,73 @@ void OnWebGlChanged(blink::HTMLCanvasElement* element) {
   }
 }
 
+class WebGlRetirement final : public blink::GarbageCollected<WebGlRetirement>,
+                              public blink::Supplement<blink::Document> {
+ public:
+  static const char kSupplementName[];
+
+  explicit WebGlRetirement(blink::Document& document)
+      : blink::Supplement<blink::Document>(document),
+        wake_(std::make_shared<Wake>(document)) {}
+
+  static std::function<void()> Notification(blink::Document& document) {
+    auto* retirement =
+        blink::Supplement<blink::Document>::From<WebGlRetirement>(document);
+    if (!retirement) {
+      retirement = blink::MakeGarbageCollected<WebGlRetirement>(document);
+      blink::Supplement<blink::Document>::ProvideTo(document, retirement);
+    }
+    return [wake = retirement->wake_] {
+      // Finalization must not inspect canvas, document, frame, or weak
+      // registry. One non-GC task state per document coalesces all collected
+      // journals.
+      if (wake->pending.exchange(true))
+        return;
+      wake->runner->PostTask(
+          FROM_HERE,
+          base::BindOnce(
+              [](std::shared_ptr<Wake> state) {
+                state->pending.store(false);
+                auto* current_document = state->document.Get();
+                auto* frame =
+                    current_document ? current_document->GetFrame() : nullptr;
+                if (!frame || !frame->IsAttached() ||
+                    frame->GetDocument() != current_document)
+                  return;
+                if (WebGlChangeCallback()) {
+                  if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(
+                          frame->LocalFrameRoot()))
+                    WebGlChangeCallback()(web_frame);
+                }
+              },
+              wake));
+    };
+  }
+
+  void Trace(blink::Visitor* visitor) const override {
+    blink::Supplement<blink::Document>::Trace(visitor);
+  }
+
+ private:
+  struct Wake {
+    explicit Wake(blink::Document& owner)
+        : runner(base::SingleThreadTaskRunner::GetCurrentDefault()),
+          document(&owner) {}
+
+    scoped_refptr<base::SingleThreadTaskRunner> runner;
+    blink::WeakPersistent<blink::Document> document;
+    std::atomic_bool pending{false};
+  };
+
+  std::shared_ptr<Wake> wake_;
+};
+
+const char WebGlRetirement::kSupplementName[] = "ReachWebGlRetirement";
+
+std::function<void()> OnWebGlRetirement(blink::HTMLCanvasElement* element) {
+  return WebGlRetirement::Notification(element->GetDocument());
+}
+
 bool WebGlDecimal(const std::string& text, uint64_t* value) {
   return !text.empty() && text.size() <= 20 &&
          base::StringToUint64(text, value) &&
@@ -367,6 +483,7 @@ void SetWebGlChangeCallback(
     return;
   }
   blink::ReachWebGLJournal::SetChangeCallback(&OnWebGlChanged);
+  blink::ReachWebGLJournal::SetRetirementCallback(&OnWebGlRetirement);
   blink::ReachWebGLJournal::SetOriginalHasher(
       [](base::span<const uint8_t> bytes) {
         return sk_reach::Hex(crypto::hash::Sha256(std::string_view(
@@ -410,6 +527,9 @@ std::string WebGlRequest(
     blink::Persistent<blink::Page> page = frame->GetPage();
     if (!page || !frame->View())
       return "WebGL animation frame is unavailable";
+    // Clear before entering script/lifecycle. A request made by that work
+    // rearms demand and emits a new wakeup, even without a WebGL journal.
+    PendingAnimation::From(*retained_document).pending = false;
     static_cast<blink::scheduler::MainThreadSchedulerImpl&>(
         blink::scheduler::WebThreadScheduler::MainThreadScheduler())
         .BeginFrameNotExpectedSoon();
@@ -425,9 +545,12 @@ std::string WebGlRequest(
   }
   if (operation == "Reach.WebGlStreams.v2" ||
       operation == "Reach.WebGlTick.v2") {
+    const char* pending = PendingAnimation::From(*frame->GetDocument()).pending
+                              ? "true"
+                              : "false";
     std::string json = "{\"document\":\"" +
                        frame->GetDocument()->Token().ToString() +
-                       "\",\"streams\":[";
+                       "\",\"animationPending\":" + pending + ",\"streams\":[";
     bool first = true;
     for (auto* journal : blink::ReachWebGLJournal::Current()) {
       if (!owned(journal))
@@ -3311,6 +3434,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   // Visual update requests made from here on (including by this capture's own
   // animation and lifecycle steps) are reported again for the next capture.
   RequestedFrameRoots().erase(&frame->LocalFrameRoot());
+  PendingAnimation::From(*document).pending = false;
   CaptureTimer::Get().Start();
   // Held begin frames also suppress the compositor's idle-period signal.
   // Let Blink schedule idle work normally between command captures.
