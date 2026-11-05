@@ -139,8 +139,9 @@ remain development builds, not official CEF releases.
 Only the dependency installation and entrypoint are baked into the image.
 APT installs exclude recommended packages, with locked BuildKit caches for
 package downloads and indexes rather than storing them in the image.
-Host GCC, C++ development headers and Make are omitted because Chromium
-supplies the compiler and target sysroot.
+Host GCC and C++ development headers are installed for standalone Skia's GN
+host toolchain, including the matching CanvasKit build. Chromium still uses
+its downloaded Clang and target sysroot; Make is not required.
 The Docker build context excludes the source checkout. CEF edits therefore
 require neither rebuilding the image nor downloading Chromium again. Persistent
 object files supply the primary incremental-build cache; no additional compiler

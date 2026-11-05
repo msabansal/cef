@@ -3,13 +3,14 @@ ARG BASE_IMAGE=ubuntu:26.10
 FROM ${BASE_IMAGE} AS builder
 
 # Chromium supplies the target sysroot and Clang. These packages also support
-# executing host tools that are built against that sysroot.
+# executing host tools that are built against that sysroot. Standalone Skia's
+# GN host toolchain additionally needs the system C/C++ compiler and headers.
 RUN --mount=type=cache,id=cef-ubuntu-apt,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,id=cef-ubuntu-apt-lists,target=/var/lib/apt/lists,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        bash ca-certificates git python3 rsync \
+        bash ca-certificates g++ git python3 rsync \
         tar gzip bzip2 xz-utils unzip zip curl file findutils diffutils patch \
         procps util-linux passwd pkg-config libatomic1 \
         libglib2.0-0t64 libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 \
