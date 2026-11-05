@@ -14,6 +14,13 @@ order. Paths inside each patch are relative to Chromium `src`, except
 CEF adapter changes live directly in `include/`, `libcef/` and `libcef_dll/`;
 they are not an extra patch to apply to an already integrated fork.
 
+Reach's drawing/video renderer commit hook disables scrollbars only on the main
+frame's `LocalFrameView`. The client retains its existing root-scroll controls;
+nested overflow and shadow-DOM scrollbars remain native. Do not combine this
+with CDP `Emulation.setScrollbarsHidden(true)`, which hides all scrollbars.
+This hook is gated by the existing Reach capture switches and must be rebuilt
+and qualified together with the agent's removal of that global CDP override.
+
 | File in `patches/reach/` | Reach integration |
 | --- | --- |
 | `wire_media.patch` | Browser-context original encoded responses, headers, cookies and cancellation. |
