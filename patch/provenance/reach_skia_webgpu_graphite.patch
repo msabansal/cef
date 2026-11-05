@@ -1,0 +1,1134 @@
+diff --git a/modules/canvaskit/BUILD.gn b/modules/canvaskit/BUILD.gn
+index e54983ef1cf77872be3e235b7a1fa78da10c3d2e..7b46de82084ead635b9ddc8f358fbe61ce836ab0 100644
+--- a/modules/canvaskit/BUILD.gn
++++ b/modules/canvaskit/BUILD.gn
+@@ -197,12 +197,11 @@ skia_wasm_lib("canvaskit") {
+       rebase_path("webgpu.js"),
+       "-sUSE_WEBGL2=0",
+       "-sUSE_WEBGPU=1",
+-      "-sASYNCIFY",
++      "--js-library",
++      rebase_path("webgpu_library.js"),
+ 
+-      # Modules from html5_webgpu for JS<->WASM interop
+-      "-sEXPORTED_RUNTIME_METHODS=WebGPU,JsValStore",
+-
+-      # TODO(skbug.com/40044518): The closure compiler doesn't play well with optimized builds and ASYNCIFY.
++      # Graphite runs as a non-yielding Context (no DawnTickFunction), so ASYNCIFY is not needed.
++      # The WebGPU/JsValStore runtime modules are exported below with the HEAP views.
+       "--closure=0",
+     ]
+   } else if (skia_canvaskit_enable_webgl) {
+@@ -349,7 +348,14 @@ skia_wasm_lib("canvaskit") {
+     "-sINITIAL_MEMORY=128MB",
+     "-sWASM",
+     "-sSTRICT=1",
+-    "-sEXPORTED_RUNTIME_METHODS=HEAP32,HEAPU8,HEAPU16,HEAPU32,HEAPF32",
++  ]
++  if (skia_canvaskit_enable_webgpu) {
++    # Modules from html5_webgpu for JS<->WASM interop
++    ldflags += [ "-sEXPORTED_RUNTIME_METHODS=HEAP32,HEAPU8,HEAPU16,HEAPU32,HEAPF32,WebGPU,JsValStore" ]
++  } else {
++    ldflags += [ "-sEXPORTED_RUNTIME_METHODS=HEAP32,HEAPU8,HEAPU16,HEAPU32,HEAPF32" ]
++  }
++  ldflags += [
+ 
+     # INCOMING_MODULE_JS_API is set to empty by default.
+     # https://github.com/emscripten-core/emscripten/blob/8dc91db45bf96c174531006839472a3924d105aa/src/settings.js#L1204
+@@ -395,6 +401,12 @@ skia_wasm_lib("canvaskit") {
+       ]
+     }
+   }
++  if (skia_enable_graphite && skia_canvaskit_enable_webgpu) {
++    defines += [
++      "SK_GRAPHITE",
++      "CK_ENABLE_WEBGPU",
++    ]
++  }
+ 
+   if (skia_canvaskit_enable_pathops) {
+     defines += [ "CK_INCLUDE_PATHOPS" ]
+diff --git a/modules/canvaskit/canvaskit_bindings.cpp b/modules/canvaskit/canvaskit_bindings.cpp
+index d1fe64a578ad3c0a742f7fea32a614e613eb4adc..9f9b3fe36f3c7abeda002ea06fb661e6b859d1e1 100644
+--- a/modules/canvaskit/canvaskit_bindings.cpp
++++ b/modules/canvaskit/canvaskit_bindings.cpp
+@@ -80,14 +80,14 @@
+ #define ENABLE_GPU
+ #endif
+ 
+-#ifdef ENABLE_GPU
++#ifdef CK_ENABLE_WEBGL
+ #include "include/gpu/GpuTypes.h"
+ #include "include/gpu/ganesh/GrDirectContext.h"
+ #include "include/gpu/ganesh/GrExternalTextureGenerator.h"
+ #include "include/gpu/ganesh/SkImageGanesh.h"
+ #include "include/gpu/ganesh/SkSurfaceGanesh.h"
+ #include "src/gpu/ganesh/GrCaps.h"
+-#endif  // ENABLE_GPU
++#endif  // CK_ENABLE_WEBGL
+ 
+ #ifdef CK_ENABLE_WEBGL
+ #include "include/gpu/ganesh/GrBackendSurface.h"
+@@ -106,9 +106,23 @@
+ #endif  // CK_ENABLE_WEBGL
+ 
+ #ifdef CK_ENABLE_WEBGPU
++#include <list>
+ #include <emscripten/html5_webgpu.h>
+ #include <webgpu/webgpu.h>
+ #include <webgpu/webgpu_cpp.h>
++#include "include/gpu/GpuTypes.h"
++#include "include/gpu/graphite/BackendTexture.h"
++#include "include/gpu/graphite/Context.h"
++#include "include/gpu/graphite/ContextOptions.h"
++#include "include/gpu/graphite/GraphiteTypes.h"
++#include "include/gpu/graphite/Image.h"
++#include "include/gpu/graphite/ImageProvider.h"
++#include "include/gpu/graphite/Recorder.h"
++#include "include/gpu/graphite/Recording.h"
++#include "include/gpu/graphite/Surface.h"
++#include "include/gpu/graphite/dawn/DawnBackendContext.h"
++#include "include/gpu/graphite/dawn/DawnGraphiteTypes.h"
++#include "include/private/SkLog.h"
+ #endif  // CK_ENABLE_WEBGPU
+ 
+ #ifndef CK_NO_FONTS
+@@ -370,71 +384,272 @@ sk_sp<SkSurface> MakeRenderTarget(sk_sp<GrDirectContext> dContext, SimpleImageIn
+ 
+ #ifdef CK_ENABLE_WEBGPU
+ 
+-sk_sp<GrDirectContext> MakeGrContext() {
+-    GrContextOptions options;
++// One Graphite Context and Recorder per GPUDevice. Every surface and image created for the device
++// records into the same Recorder; Surface.flush() snaps and submits it. The Context is
++// non-yielding (no DawnTickFunction), so GPU completion is observed from the browser event loop
++// through checkAsyncWorkCompletion() and pixel reads are asynchronous.
++struct WebGPUDeviceContext {
++    struct PendingRead {
++        bool done = false;
++        bool ok = false;
++        size_t rowBytes = 0;
++        int height = 0;
++        std::vector<uint8_t> pixels;
++    };
++
++    std::unique_ptr<skgpu::graphite::Context> context;
++    std::unique_ptr<skgpu::graphite::Recorder> recorder;
++    std::map<uint32_t, std::unique_ptr<PendingRead>> reads;
++    uint32_t nextRead = 1;
++
++    ~WebGPUDeviceContext();
++    bool flush();
++};
++
++static std::map<const skgpu::graphite::Recorder*, WebGPUDeviceContext*>& WebGPUContexts() {
++    static auto* contexts = new std::map<const skgpu::graphite::Recorder*, WebGPUDeviceContext*>();
++    return *contexts;
++}
++
++WebGPUDeviceContext::~WebGPUDeviceContext() {
++    WebGPUContexts().erase(recorder.get());
++    recorder.reset();
++    // Graphite aborts when a non-yielding Context is destroyed with GPU work in flight. JS delete()
++    // waits for that work first; if it is still unfinished here (e.g. the device was lost and never
++    // reported completion) leak the Context rather than abort the module.
++    context->checkAsyncWorkCompletion();
++    if (context->hasUnfinishedGpuWork()) {
++        SKIA_LOG_W("Leaking a WebGPU Graphite context with unfinished GPU work");
++        (void)context.release();
++        return;
++    }
++    context.reset();
++}
++
++bool WebGPUDeviceContext::flush() {
++    std::unique_ptr<skgpu::graphite::Recording> recording = recorder->snap();
++    if (!recording) {
++        return false;
++    }
++    skgpu::graphite::InsertRecordingInfo info;
++    info.fRecording = recording.get();
++    bool inserted = context->insertRecording(info) == skgpu::graphite::InsertStatus::kSuccess;
++    context->submit();
++    context->checkAsyncWorkCompletion();
++    return inserted;
++}
++
++static bool FlushWebGPU(const skgpu::graphite::Recorder* recorder) {
++    auto found = WebGPUContexts().find(recorder);
++    return found != WebGPUContexts().end() && found->second->flush();
++}
++
++// Graphite only draws Graphite-backed images unless the Recorder has an ImageProvider. This one
++// uploads raster and lazy (encoded) images and keeps the textures in a byte-bounded LRU keyed by
++// image unique ID, so pictures redrawn every frame reuse their uploads.
++class CanvasKitImageProvider final : public skgpu::graphite::ImageProvider {
++public:
++    static constexpr size_t kBudgetBytes = 128 * 1024 * 1024;
++
++    sk_sp<SkImage> findOrCreate(skgpu::graphite::Recorder* recorder,
++                                const SkImage* image,
++                                SkImage::RequiredProperties props) override {
++        const uint64_t key = (static_cast<uint64_t>(image->uniqueID()) << 1) | props.fMipmapped;
++        auto found = fEntries.find(key);
++        if (found != fEntries.end()) {
++            fLru.splice(fLru.begin(), fLru, found->second);
++            return found->second->texture;
++        }
++        sk_sp<SkImage> texture = SkImages::TextureFromImage(recorder, image, props);
++        if (!texture) {
++            return nullptr;
++        }
++        const size_t bytes = texture->imageInfo().computeMinByteSize() * (props.fMipmapped ? 4 : 3) / 3;
++        fLru.push_front({key, texture, bytes});
++        fEntries[key] = fLru.begin();
++        fBytes += bytes;
++        while (fBytes > kBudgetBytes && fLru.size() > 1) {
++            fBytes -= fLru.back().bytes;
++            fEntries.erase(fLru.back().key);
++            fLru.pop_back();
++        }
++        return texture;
++    }
++
++private:
++    struct Entry {
++        uint64_t key;
++        sk_sp<SkImage> texture;
++        size_t bytes;
++    };
++    std::list<Entry> fLru;
++    std::map<uint64_t, std::list<Entry>::iterator> fEntries;
++    size_t fBytes = 0;
++};
++
++// The device is the one JS stored in Module.preinitializedWebGPUDevice.
++WebGPUDeviceContext* MakeWebGPUDeviceContext() {
+     wgpu::Device device = wgpu::Device::Acquire(emscripten_webgpu_get_device());
+-    return GrDirectContext::MakeDawn(device, options);
++    if (!device) {
++        return nullptr;
++    }
++    skgpu::graphite::DawnBackendContext backendContext;
++    backendContext.fDevice = device;
++    backendContext.fQueue = device.GetQueue();
++    skgpu::graphite::ContextOptions options;
++    auto context = skgpu::graphite::ContextFactory::MakeDawn(backendContext, options);
++    if (!context) {
++        return nullptr;
++    }
++    skgpu::graphite::RecorderOptions recorderOptions;
++    recorderOptions.fImageProvider = sk_make_sp<CanvasKitImageProvider>();
++    auto recorder = context->makeRecorder(recorderOptions);
++    if (!recorder) {
++        return nullptr;
++    }
++    auto* result = new WebGPUDeviceContext();
++    result->context = std::move(context);
++    result->recorder = std::move(recorder);
++    WebGPUContexts()[result->recorder.get()] = result;
++    return result;
+ }
+ 
+-sk_sp<SkSurface> MakeGPUTextureSurface(sk_sp<GrDirectContext> dContext,
++// Width, height and format are taken from the texture; the parameters are kept for API parity.
++sk_sp<SkSurface> MakeGPUTextureSurface(WebGPUDeviceContext* ctx,
+                                        uint32_t textureHandle,
+-                                       uint32_t textureFormat,
+-                                       int width,
+-                                       int height,
++                                       uint32_t /*textureFormat*/,
++                                       int /*width*/,
++                                       int /*height*/,
+                                        sk_sp<SkColorSpace> colorSpace) {
++    wgpu::Texture texture = wgpu::Texture::Acquire(emscripten_webgpu_import_texture(textureHandle));
++    emscripten_webgpu_release_js_handle(textureHandle);
++    if (!ctx || !texture) {
++        return nullptr;
++    }
+     if (!colorSpace) {
+         colorSpace = SkColorSpace::MakeSRGB();
+     }
++    auto backendTexture = skgpu::graphite::BackendTextures::MakeDawn(texture.Get());
++    return SkSurfaces::WrapBackendTexture(
++            ctx->recorder.get(), backendTexture, std::move(colorSpace), nullptr);
++}
+ 
+-    wgpu::TextureFormat format = static_cast<wgpu::TextureFormat>(textureFormat);
+-    wgpu::Texture texture(emscripten_webgpu_import_texture(textureHandle));
+-    emscripten_webgpu_release_js_handle(textureHandle);
+-
+-    // GrDawnRenderTargetInfo currently only supports a 1-mip TextureView.
+-    constexpr uint32_t mipLevelCount = 1;
+-    constexpr uint32_t sampleCount = 1;
++sk_sp<SkSurface> MakeGPURenderTarget(WebGPUDeviceContext* ctx, SimpleImageInfo sii) {
++    if (!ctx) {
++        return nullptr;
++    }
++    return SkSurfaces::RenderTarget(ctx->recorder.get(), toSkImageInfo(sii));
++}
+ 
+-    GrDawnTextureInfo info;
+-    info.fTexture = texture;
+-    info.fFormat = format;
+-    info.fLevelCount = mipLevelCount;
++// Wraps a JS GPUTexture (TEXTURE_BINDING usage) as an image. The texture is destroyed once Graphite
++// no longer uses it.
++sk_sp<SkImage> MakeImageFromGPUTexture(WebGPUDeviceContext* ctx,
++                                       uint32_t textureHandle,
++                                       SkAlphaType alphaType,
++                                       sk_sp<SkColorSpace> colorSpace) {
++    wgpu::Texture texture = wgpu::Texture::Acquire(emscripten_webgpu_import_texture(textureHandle));
++    emscripten_webgpu_release_js_handle(textureHandle);
++    if (!ctx || !texture) {
++        return nullptr;
++    }
++    if (!colorSpace) {
++        colorSpace = SkColorSpace::MakeSRGB();
++    }
++    auto backendTexture = skgpu::graphite::BackendTextures::MakeDawn(texture.Get());
++    auto* owned = new wgpu::Texture(texture);
++    return SkImages::WrapTexture(ctx->recorder.get(),
++                                 backendTexture,
++                                 alphaType,
++                                 std::move(colorSpace),
++                                 skgpu::Origin::kTopLeft,
++                                 [](void* context) {
++                                     auto* texture = static_cast<wgpu::Texture*>(context);
++                                     texture->Destroy();
++                                     delete texture;
++                                 },
++                                 owned);
++}
+ 
+-    GrBackendTexture target(width, height, info);
+-    return SkSurfaces::WrapBackendTexture(
+-            dContext.get(),
+-            target,
+-            kTopLeft_GrSurfaceOrigin,
+-            sampleCount,
+-            colorSpace->isSRGB() ? kRGBA_8888_SkColorType : kRGBA_F16_SkColorType,
+-            colorSpace,
+-            nullptr);
++static uint32_t AsyncReadPixels(WebGPUDeviceContext& ctx,
++                                SkSurface* surface,
++                                const SkImage* image,
++                                SimpleImageInfo sii,
++                                int srcX,
++                                int srcY) {
++    SkImageInfo dstInfo = toSkImageInfo(sii);
++    if (dstInfo.isEmpty()) {
++        return 0;
++    }
++    // Surfaces are read through their (cached) snapshot: Graphite's surface readback uses
++    // SkSurfaces::AsImage, which warns when mixed with the makeImageSnapshot calls clients make.
++    sk_sp<SkImage> snapshot;
++    if (surface) {
++        snapshot = surface->makeImageSnapshot();
++        image = snapshot.get();
++    }
++    // Reads are ordered after previously inserted recordings, so submit pending draws (and the
++    // snapshot copy) first.
++    ctx.flush();
++    auto read = std::make_unique<WebGPUDeviceContext::PendingRead>();
++    read->rowBytes = dstInfo.minRowBytes();
++    read->height = dstInfo.height();
++    auto* pending = read.get();
++    const uint32_t id = ctx.nextRead++;
++    ctx.reads[id] = std::move(read);
++    auto callback = [](SkImage::ReadPixelsContext context,
++                       std::unique_ptr<const SkImage::AsyncReadResult> result) {
++        auto* read = static_cast<WebGPUDeviceContext::PendingRead*>(context);
++        read->done = true;
++        if (!result || result->count() != 1 || result->rowBytes(0) < read->rowBytes) {
++            return;
++        }
++        read->pixels.resize(read->rowBytes * read->height);
++        const auto* src = static_cast<const uint8_t*>(result->data(0));
++        for (int y = 0; y < read->height; ++y) {
++            memcpy(read->pixels.data() + y * read->rowBytes,
++                   src + y * result->rowBytes(0),
++                   read->rowBytes);
++        }
++        read->ok = true;
++    };
++    const SkIRect srcRect = SkIRect::MakeXYWH(srcX, srcY, dstInfo.width(), dstInfo.height());
++    if (image) {
++        ctx.context->asyncRescaleAndReadPixels(image, dstInfo, srcRect,
++                                               SkImage::RescaleGamma::kSrc,
++                                               SkImage::RescaleMode::kNearest, callback, pending);
++    } else {
++        callback(pending, nullptr);
++    }
++    ctx.context->submit();
++    return id;
+ }
+ 
+-bool ReplaceBackendTexture(
+-        SkSurface& surface, uint32_t textureHandle, uint32_t textureFormat, int width, int height) {
+-    wgpu::TextureFormat format = static_cast<wgpu::TextureFormat>(textureFormat);
+-    wgpu::Texture texture(emscripten_webgpu_import_texture(textureHandle));
+-    emscripten_webgpu_release_js_handle(textureHandle);
++// 0 while pending, 1 when the pixels are ready, -1 on failure or an unknown id.
++static int CheckAsyncRead(WebGPUDeviceContext& ctx, uint32_t id) {
++    ctx.context->checkAsyncWorkCompletion();
++    auto found = ctx.reads.find(id);
++    if (found == ctx.reads.end()) {
++        return -1;
++    }
++    if (!found->second->done) {
++        return 0;
++    }
++    if (!found->second->ok) {
++        ctx.reads.erase(found);
++        return -1;
++    }
++    return 1;
++}
+ 
+-    GrDawnTextureInfo info;
+-    info.fTexture = texture;
+-    info.fFormat = format;
+-    info.fLevelCount = 1;
+-
+-    // Use kDiscard_ContentChangeMode to discard the contents of the old backing texture. This not
+-    // only avoids an unnecessary blit, we also don't support copying the contents of a swapchain
+-    // texture due to the default GPUCanvasConfiguration usage bits we used when configuring the
+-    // GPUCanvasContext in JS.
+-    //
+-    // The default usage bits only contain GPUTextureUsage.RENDER_ATTACHMENT. To support a copy we
+-    // would need to also set GPUTextureUsage.TEXTURE_BINDING (to sample it in a shader) or
+-    // GPUTextureUsage.COPY_SRC (for a copy command).
+-    //
+-    // See https://www.w3.org/TR/webgpu/#namespacedef-gputextureusage and
+-    // https://www.w3.org/TR/webgpu/#dictdef-gpucanvasconfiguration.
+-    GrBackendTexture target(width, height, info);
+-    return surface.replaceBackendTexture(
+-            target, kTopLeft_GrSurfaceOrigin, SkSurface::kDiscard_ContentChangeMode);
++static Uint8Array TakeAsyncRead(WebGPUDeviceContext& ctx, uint32_t id) {
++    auto found = ctx.reads.find(id);
++    if (found == ctx.reads.end() || !found->second->ok) {
++        return emscripten::val::null();
++    }
++    auto read = std::move(found->second);
++    ctx.reads.erase(found);
++    return emscripten::val(typed_memory_view(read->pixels.size(), read->pixels.data()))
++            .call<Uint8Array>("slice");
+ }
+ 
+ #endif  // CK_ENABLE_WEBGPU
+@@ -1123,10 +1338,10 @@ private:
+ };
+ 
+ EMSCRIPTEN_BINDINGS(Skia) {
+-#ifdef ENABLE_GPU
++#ifdef CK_ENABLE_WEBGL
+     constant("gpu", true);
+     function("_MakeGrContext", &MakeGrContext);
+-#endif  // ENABLE_GPU
++#endif  // CK_ENABLE_WEBGL
+ 
+ #ifdef CK_ENABLE_WEBGL
+     constant("webgl", true);
+@@ -1147,8 +1362,40 @@ EMSCRIPTEN_BINDINGS(Skia) {
+ #endif  // CK_ENABLE_WEBGL
+ 
+ #ifdef CK_ENABLE_WEBGPU
++    constant("gpu", true);
+     constant("webgpu", true);
+-    function("_MakeGPUTextureSurface", &MakeGPUTextureSurface);
++    constant("graphite", true);
++    class_<WebGPUDeviceContext>("WebGPUDeviceContext")
++            .function("_flush", optional_override([](WebGPUDeviceContext& self) -> bool {
++                          return self.flush();
++                      }))
++            .function("_hasUnfinishedGpuWork",
++                      optional_override([](WebGPUDeviceContext& self) -> bool {
++                          self.context->checkAsyncWorkCompletion();
++                          return self.context->hasUnfinishedGpuWork();
++                      }))
++            .function("_asyncReadSurfacePixels",
++                      optional_override([](WebGPUDeviceContext& self,
++                                           SkSurface& surface,
++                                           SimpleImageInfo sii,
++                                           int srcX,
++                                           int srcY) -> uint32_t {
++                          return AsyncReadPixels(self, &surface, nullptr, sii, srcX, srcY);
++                      }))
++            .function("_asyncReadImagePixels",
++                      optional_override([](WebGPUDeviceContext& self,
++                                           sk_sp<SkImage> image,
++                                           SimpleImageInfo sii,
++                                           int srcX,
++                                           int srcY) -> uint32_t {
++                          return AsyncReadPixels(self, nullptr, image.get(), sii, srcX, srcY);
++                      }))
++            .function("_checkAsyncRead", &CheckAsyncRead)
++            .function("_takeAsyncRead", &TakeAsyncRead);
++    function("_MakeGPUDeviceContext", &MakeWebGPUDeviceContext, allow_raw_pointers());
++    function("_MakeGPUTextureSurface", &MakeGPUTextureSurface, allow_raw_pointers());
++    function("_MakeGPURenderTarget", &MakeGPURenderTarget, allow_raw_pointers());
++    function("_MakeImageFromGPUTexture", &MakeImageFromGPUTexture, allow_raw_pointers());
+ #endif  // CK_ENABLE_WEBGPU
+ 
+     function("getDecodeCacheLimitBytes", &SkResourceCache::GetTotalByteLimit);
+@@ -1412,7 +1659,7 @@ EMSCRIPTEN_BINDINGS(Skia) {
+              allow_raw_pointers());
+ #endif
+ 
+-#ifdef ENABLE_GPU
++#ifdef CK_ENABLE_WEBGL
+     class_<GrDirectContext>("GrDirectContext")
+             .smart_ptr<sk_sp<GrDirectContext>>("sk_sp<GrDirectContext>")
+             .function("_getResourceCacheLimitBytes",
+@@ -1438,7 +1685,7 @@ EMSCRIPTEN_BINDINGS(Skia) {
+                           self.getResourceCacheLimits(&maxResources, &currMax);
+                           self.setResourceCacheLimits(maxResources, maxResourceBytes);
+                       }));
+-#endif  // ENABLE_GPU
++#endif  // CK_ENABLE_WEBGL
+ #ifdef CK_ENABLE_WEBGL
+     // This allows us to give the C++ code a JS callback to delete textures that
+     // have been passed in via makeImageFromTexture and makeImageFromTextureSource.
+@@ -2158,7 +2405,7 @@ EMSCRIPTEN_BINDINGS(Skia) {
+                                            int quality) -> Uint8Array {
+                           return encodeImage(nullptr, self, fmt, quality);
+                       }))
+-#if defined(ENABLE_GPU)
++#if defined(CK_ENABLE_WEBGL)
+             .function("_encodeToBytes",
+                       optional_override([](sk_sp<SkImage> self,
+                                            SkEncodedImageFormat fmt,
+@@ -2196,7 +2443,7 @@ EMSCRIPTEN_BINDINGS(Skia) {
+                                   tx, ty, {filter, mipmap}, mPtr ? &localMatrix : nullptr);
+                       }),
+                       allow_raw_pointers())
+-#if defined(ENABLE_GPU)
++#if defined(CK_ENABLE_WEBGL)
+             .function("_readPixels",
+                       optional_override([](sk_sp<SkImage> self,
+                                            SimpleImageInfo sii,
+@@ -3019,6 +3266,9 @@ EMSCRIPTEN_BINDINGS(Skia) {
+             .function("_flush", optional_override([](SkSurface& self) {
+ #ifdef CK_ENABLE_WEBGL
+                           skgpu::ganesh::FlushAndSubmit(&self);
++#endif
++#ifdef CK_ENABLE_WEBGPU
++                          FlushWebGPU(self.recorder());
+ #endif
+                       }))
+             .function("_getCanvas", &SkSurface::getCanvas, allow_raw_pointers())
+@@ -3057,16 +3307,6 @@ EMSCRIPTEN_BINDINGS(Skia) {
+                                   releaseCtx);
+                       }))
+ #endif  // CK_ENABLE_WEBGL
+-#ifdef CK_ENABLE_WEBGPU
+-            .function("_replaceBackendTexture",
+-                      optional_override([](SkSurface& self,
+-                                           uint32_t texHandle,
+-                                           uint32_t texFormat,
+-                                           int width,
+-                                           int height) {
+-                          return ReplaceBackendTexture(self, texHandle, texFormat, width, height);
+-                      }))
+-#endif  // CK_ENABLE_WEBGPU
+             .function("_makeImageSnapshot",
+                       optional_override([](SkSurface& self, WASMPointerU32 iPtr) -> sk_sp<SkImage> {
+                           SkIRect* bounds = reinterpret_cast<SkIRect*>(iPtr);
+@@ -3081,7 +3321,14 @@ EMSCRIPTEN_BINDINGS(Skia) {
+                         return self.makeSurface(toSkImageInfo(sii));
+                     }),
+                     allow_raw_pointers())
+-#ifdef ENABLE_GPU
++#if defined(CK_ENABLE_WEBGPU)
++            .function("reportBackendTypeIsGPU", optional_override([](SkSurface& self) -> bool {
++                          return self.recorder() != nullptr;
++                      }))
++            .function("sampleCnt", optional_override([](SkSurface& self) -> int {
++                          return self.recorder() != nullptr ? 1 : 0;
++                      }))
++#elif defined(CK_ENABLE_WEBGL)
+             .function("reportBackendTypeIsGPU", optional_override([](SkSurface& self) -> bool {
+                           return self.getCanvas()->recordingContext() != nullptr;
+                       }))
+diff --git a/modules/canvaskit/webgpu.js b/modules/canvaskit/webgpu.js
+index 0e937d41b47798c23dbbd2ea1d0c735e334f4291..50148620cce9ebccdaf168debf5a09ad21ae1c03 100644
+--- a/modules/canvaskit/webgpu.js
++++ b/modules/canvaskit/webgpu.js
+@@ -1,23 +1,61 @@
+ // Adds compile-time JS functions to augment the CanvasKit interface.
+-// Specifically, anything that should only be on the WebGL version of canvaskit.
++// Specifically, anything that should only be on the WebGPU (Graphite) version of canvaskit.
+ // Functions in this file are supplemented by cpu.js.
+ (function(CanvasKit){
+     CanvasKit._extraInitializations = CanvasKit._extraInitializations || [];
+     CanvasKit._extraInitializations.push(function() {
++      // GPUTextureUsage bits. Canvas textures are also sampled (makeImageSnapshot) and copied
++      // (readPixelsAsync), which Graphite needs in addition to rendering.
++      var TEXTURE_USAGE_COPY_SRC = 0x01;
++      var TEXTURE_USAGE_COPY_DST = 0x02;
++      var TEXTURE_USAGE_TEXTURE_BINDING = 0x04;
++      var TEXTURE_USAGE_RENDER_ATTACHMENT = 0x10;
++
+       CanvasKit.MakeGPUDeviceContext = function(device) {
+         if (!device) {
+           return null;
+         }
+ 
+         // This allows native code to access this device by calling
+-        // `emscripten_webgpu_get_device().`
++        // `emscripten_webgpu_get_device().` Forget any earlier device so each context uses its own.
+         CanvasKit.preinitializedWebGPUDevice = device;
+-        var context = this._MakeGrContext();
++        CanvasKit.WebGPU.preinitializedDeviceId = undefined;
++        var context = this._MakeGPUDeviceContext();
++        if (!context) {
++          return null;
++        }
+         context._device = device;
+-
++        CanvasKit._currentGPUDeviceContext = context;
+         return context;
+       };
+ 
++      // A non-yielding Graphite Context must not be destroyed while submitted GPU work is in
++      // flight. delete() returns at once; the native context is destroyed once the GPU reports
++      // completion (or the device is lost), and after 10 s it is destroyed regardless, which then
++      // leaks the Graphite Context instead of aborting.
++      var deleteDeviceContext = CanvasKit.WebGPUDeviceContext.prototype.delete;
++      CanvasKit.WebGPUDeviceContext.prototype.delete = function() {
++        if (this._pendingDelete) {
++          return;
++        }
++        this._pendingDelete = true;
++        if (CanvasKit._currentGPUDeviceContext === this) {
++          CanvasKit._currentGPUDeviceContext = null;
++        }
++        var self = this;
++        var deadline = Date.now() + 10000;
++        (function attempt() {
++          if (self.isDeleted()) {
++            return;
++          }
++          if (self._hasUnfinishedGpuWork() && Date.now() < deadline) {
++            setTimeout(attempt, 4);
++            return;
++          }
++          deleteDeviceContext.call(self);
++        })();
++      };
++
+       CanvasKit.MakeGPUCanvasContext = function(devCtx, canvas, opts) {
+         var canvasCtx = canvas.getContext('webgpu');
+         if (!canvasCtx) {
+@@ -29,6 +67,8 @@
+         canvasCtx.configure({
+             device: devCtx._device,
+             format: format,
++            usage: (opts && opts.usage) ? opts.usage : (TEXTURE_USAGE_RENDER_ATTACHMENT |
++                TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_SRC),
+             alphaMode: (opts && opts.alphaMode) ? opts.alphaMode : undefined,
+         });
+ 
+@@ -52,6 +92,8 @@
+         return context;
+       };
+ 
++      // Graphite cannot retarget a Surface, so this wraps the canvas' current texture in a new
++      // Surface. Create one per frame: flush it before the frame is presented, then dispose it.
+       CanvasKit.MakeGPUCanvasSurface = function(canvasCtx, colorSpace, width, height) {
+         let context = canvasCtx._inner;
+         if (!width) {
+@@ -64,7 +106,11 @@
+                                                  context.getCurrentTexture(),
+                                                  canvasCtx._textureFormat,
+                                                  width, height, colorSpace);
++        if (!surface) {
++          return null;
++        }
+         surface._canvasContext = canvasCtx;
++        surface._deviceContext = canvasCtx._deviceContext;
+         return surface;
+       };
+ 
+@@ -77,65 +123,183 @@
+           //
+           // The CanvasKit WASM module is responsible for removing entries from the value store by
+           // calling `emscripten_webgpu_release_js_handle` after importing the object.
+-          //
+-          // (see
+-          // https://github.com/emscripten-core/emscripten/blob/0e63f74f36b06849ef1c777b130783a43316ade0/src/library_html5_webgpu.js
+-          // for reference)
+-          return this._MakeGPUTextureSurface(
++          var surface = this._MakeGPUTextureSurface(
+               devCtx,
+               this.JsValStore.add(texture),
+               this.WebGPU.TextureFormat.indexOf(textureFormat),
+               width, height,
+               colorSpace);
++          if (surface) {
++            surface._deviceContext = devCtx;
++          }
++          return surface;
++      };
++
++      // Offscreen Graphite render target, the WebGPU counterpart of MakeRenderTarget:
++      // MakeGPURenderTarget(devCtx, width, height) or MakeGPURenderTarget(devCtx, imageInfo).
++      CanvasKit.MakeGPURenderTarget = function(devCtx, widthOrInfo, height) {
++        var info = widthOrInfo;
++        if (typeof widthOrInfo === 'number') {
++          info = {
++            'width': widthOrInfo,
++            'height': height,
++            'colorType': CanvasKit.ColorType.RGBA_8888,
++            'alphaType': CanvasKit.AlphaType.Premul,
++            'colorSpace': CanvasKit.ColorSpace.SRGB,
++          };
++        }
++        var surface = this._MakeGPURenderTarget(devCtx, normalizeImageInfo(info));
++        if (surface) {
++          surface._deviceContext = devCtx;
++        }
++        return surface;
++      };
++
++      // Uploads a CanvasImageSource (video, image, bitmap or canvas) to a new GPU texture.
++      // The texture is destroyed when the image is no longer used. Uses the most recently created
++      // device context unless devCtx is given.
++      CanvasKit.MakeLazyImageFromTextureSource = function(src, info, srcIsPremul, devCtx) {
++        devCtx = devCtx || CanvasKit._currentGPUDeviceContext;
++        if (!devCtx || devCtx.isDeleted() || devCtx._pendingDelete) {
++          return null;
++        }
++        info = info || {};
++        var width = info['width'] || CanvasKit._getWidth(src);
++        var height = info['height'] || CanvasKit._getHeight(src);
++        if (!width || !height) {
++          return null;
++        }
++        var device = devCtx._device;
++        var texture = device.createTexture({
++          size: [width, height],
++          format: 'rgba8unorm',
++          usage: TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST |
++                 TEXTURE_USAGE_COPY_SRC | TEXTURE_USAGE_RENDER_ATTACHMENT,
++        });
++        device.queue.copyExternalImageToTexture({source: src},
++                                                {texture: texture, premultipliedAlpha: true},
++                                                [width, height]);
++        return this._MakeImageFromGPUTexture(devCtx, this.JsValStore.add(texture),
++                                             CanvasKit.AlphaType.Premul,
++                                             info['colorSpace'] || null);
++      };
++
++      function normalizeImageInfo(info) {
++        return {
++          'width': info['width'],
++          'height': info['height'],
++          'colorType': info['colorType'] || CanvasKit.ColorType.RGBA_8888,
++          'alphaType': info['alphaType'] || CanvasKit.AlphaType.Unpremul,
++          'colorSpace': info['colorSpace'] || CanvasKit.ColorSpace.SRGB,
++        };
++      }
++
++      function readPixelsAsync(devCtx, start) {
++        return new Promise(function(resolve) {
++          var id = start();
++          if (!id) {
++            resolve(null);
++            return;
++          }
++          (function poll() {
++            if (devCtx.isDeleted()) {
++              resolve(null);
++              return;
++            }
++            var state = devCtx._checkAsyncRead(id);
++            if (state === 0) {
++              setTimeout(poll, 0);
++              return;
++            }
++            resolve(state > 0 ? devCtx._takeAsyncRead(id) : null);
++          })();
++        });
++      }
++
++      function typedPixels(bytes, info) {
++        if (bytes && info['colorType'] === CanvasKit.ColorType.RGBA_F32) {
++          return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
++        }
++        return bytes;
++      }
++
++      // Graphite has no synchronous GPU readback. Resolves with the pixels of
++      // [srcX, srcY, imageInfo.width, imageInfo.height] (Uint8Array, or Float32Array for
++      // RGBA_F32), or null on failure. Pending draws are submitted first.
++      CanvasKit.Surface.prototype.readPixelsAsync = function(srcX, srcY, imageInfo) {
++        var devCtx = this._deviceContext;
++        if (!devCtx) {
++          return Promise.resolve(null);
++        }
++        var info = normalizeImageInfo(imageInfo || this.imageInfo());
++        var self = this;
++        return readPixelsAsync(devCtx, function() {
++          return devCtx._asyncReadSurfacePixels(self, info, srcX || 0, srcY || 0);
++        }).then(function(bytes) { return typedPixels(bytes, info); });
+       };
+ 
+-      CanvasKit.Surface.prototype.assignCurrentSwapChainTexture = function() {
+-        // This feature is only supported for a Surface that was created via MakeGPUCanvasSurface.
+-        if (!this._canvasContext) {
+-          console.log('Surface is not bound to a canvas context');
+-          return false;
+-        }
+-        let ctx = this._canvasContext._inner;
+-        return this._replaceBackendTexture(
+-            CanvasKit.JsValStore.add(ctx.getCurrentTexture()),
+-            CanvasKit.WebGPU.TextureFormat.indexOf(this._canvasContext._textureFormat),
+-            ctx.canvas.width, ctx.canvas.height);
++      // Reads a Graphite-backed image (e.g. Surface.makeImageSnapshot()).
++      CanvasKit.Image.prototype.readPixelsAsync = function(srcX, srcY, imageInfo, devCtx) {
++        devCtx = devCtx || CanvasKit._currentGPUDeviceContext;
++        if (!devCtx || devCtx.isDeleted() || devCtx._pendingDelete) {
++          return Promise.resolve(null);
++        }
++        var info = normalizeImageInfo(imageInfo || this.getImageInfo());
++        var self = this;
++        return readPixelsAsync(devCtx, function() {
++          return devCtx._asyncReadImagePixels(self, info, srcX || 0, srcY || 0);
++        }).then(function(bytes) { return typedPixels(bytes, info); });
++      };
++
++      // Surfaces made from a WebGPU surface share its device context (flush, readPixelsAsync).
++      CanvasKit.Surface.prototype.makeSurface = function(imageInfo) {
++        var surface = this._makeSurface(imageInfo);
++        if (!surface) {
++          return null;
++        }
++        surface._context = this._context;
++        surface._deviceContext = this._deviceContext;
++        return surface;
+       };
+ 
+       CanvasKit.Surface.prototype.requestAnimationFrame = function(callback, dirtyRect) {
+-        if (!this.reportBackendTypeIsGPU()) {
++        if (!this.reportBackendTypeIsGPU() || !this._canvasContext) {
+           return this._requestAnimationFrameInternal(callback, dirtyRect);
+         }
+ 
++        // Graphite wraps each frame's swapchain texture in a new Surface.
++        var canvasCtx = this._canvasContext;
+         return requestAnimationFrame(function() {
+-          // Replace the render target of the Surface with the current swapchain surface if this is
+-          // bound to a canvas context.
+-          if (this._canvasContext && !this.assignCurrentSwapChainTexture()) {
+-            console.log('failed to replace GPU backend texture');
++          var surface = CanvasKit.MakeGPUCanvasSurface(canvasCtx);
++          if (!surface) {
++            console.error('Failed to create surface for current swapchain texture');
+             return;
+           }
+-          callback(this.getCanvas());
+-          this.flush(dirtyRect);
+-        }.bind(this));
++          callback(surface.getCanvas());
++          surface.flush(dirtyRect);
++          surface.dispose();
++        });
+       };
+ 
+       CanvasKit.Surface.prototype.drawOnce = function(callback, dirtyRect) {
+-        if (!this.reportBackendTypeIsGPU()) {
++        if (!this.reportBackendTypeIsGPU() || !this._canvasContext) {
+           this._drawOnceInternal(callback, dirtyRect);
+           return;
+         }
+ 
++        var canvasCtx = this._canvasContext;
++        var self = this;
+         requestAnimationFrame(function() {
+-          // Replace the render target of the Surface with the current swapchain surface if this is
+-          // bound to a canvas context.
+-          if (this._canvasContext && !this.assignCurrentSwapChainTexture()) {
+-            console.log('failed to replace GPU backend texture');
++          var surface = CanvasKit.MakeGPUCanvasSurface(canvasCtx);
++          if (!surface) {
++            console.error('Failed to create surface for current swapchain texture');
+             return;
+           }
+-          callback(this.getCanvas());
+-          this.flush(dirtyRect);
+-          this.dispose();
+-        }.bind(this));
++          callback(surface.getCanvas());
++          surface.flush(dirtyRect);
++          surface.dispose();
++          self.dispose();
++        });
+       };
+     });
+ }(Module));  // When this file is loaded in, the high level object is "Module".
+diff --git a/modules/canvaskit/webgpu_library.js b/modules/canvaskit/webgpu_library.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec70c117e972de1811309ea1a4f5202b5dd929b2
+--- /dev/null
++++ b/modules/canvaskit/webgpu_library.js
+@@ -0,0 +1,59 @@
++// Overrides Emscripten 4.0.7 -sUSE_WEBGPU entry points that break Graphite:
++//
++// Draw calls: WASM passes uint32_t arguments as signed i32, so values >= 2^31 reach WebIDL
++// [EnforceRange] unsigned long parameters as negative numbers and throw. Graphite's Dawn blit
++// (DawnResourceProvider::BlitWithDrawEncoder) packs a negative 16-bit y offset into the high bits
++// of firstInstance, so convert every unsigned argument with `>>> 0`. baseVertex is a signed long
++// in WebGPU and stays as is.
++addToLibrary({
++  wgpuRenderPassEncoderDraw__deps: ['$WebGPU'],
++  wgpuRenderPassEncoderDraw: (passId, vertexCount, instanceCount, firstVertex, firstInstance) => {
++    var pass = WebGPU.mgrRenderPassEncoder.get(passId);
++    pass.draw(vertexCount >>> 0, instanceCount >>> 0, firstVertex >>> 0, firstInstance >>> 0);
++  },
++  wgpuRenderPassEncoderDrawIndexed__deps: ['$WebGPU'],
++  wgpuRenderPassEncoderDrawIndexed: (passId, indexCount, instanceCount, firstIndex, baseVertex, firstInstance) => {
++    var pass = WebGPU.mgrRenderPassEncoder.get(passId);
++    pass.drawIndexed(indexCount >>> 0, instanceCount >>> 0, firstIndex >>> 0, baseVertex,
++                     firstInstance >>> 0);
++  },
++  wgpuRenderBundleEncoderDraw__deps: ['$WebGPU'],
++  wgpuRenderBundleEncoderDraw: (bundleId, vertexCount, instanceCount, firstVertex, firstInstance) => {
++    var bundle = WebGPU.mgrRenderBundleEncoder.get(bundleId);
++    bundle.draw(vertexCount >>> 0, instanceCount >>> 0, firstVertex >>> 0, firstInstance >>> 0);
++  },
++  wgpuRenderBundleEncoderDrawIndexed__deps: ['$WebGPU'],
++  wgpuRenderBundleEncoderDrawIndexed: (bundleId, indexCount, instanceCount, firstIndex, baseVertex, firstInstance) => {
++    var bundle = WebGPU.mgrRenderBundleEncoder.get(bundleId);
++    bundle.drawIndexed(indexCount >>> 0, instanceCount >>> 0, firstIndex >>> 0, baseVertex,
++                       firstInstance >>> 0);
++  },
++
++  // Same as Emscripten's version, except that unmapping after the GPUBuffer (or its device) was
++  // destroyed skips the copy: destroy() detaches the mapped ArrayBuffer and constructing a view
++  // on it throws, which would escape from Graphite's buffer cleanup.
++  wgpuBufferGetMappedRange__deps: ['$WebGPU', '$zeroMemory', 'memalign', 'free'],
++  wgpuBufferGetMappedRange: (bufferId, offset, size) => {
++    var bufferWrapper = WebGPU.mgrBuffer.objects[bufferId];
++    if (size == -1) size = undefined;
++    if (bufferWrapper.mapMode !== 2 /* WGPUMapMode_Write */) {
++      return 0;
++    }
++    var mapped;
++    try {
++      mapped = bufferWrapper.object.getMappedRange(offset, size);
++    } catch (ex) {
++      return 0;
++    }
++    var length = mapped.byteLength;
++    var data = _memalign(16, length);
++    zeroMemory(data, length);
++    bufferWrapper.onUnmap.push(() => {
++      if (mapped.byteLength === length) {
++        new Uint8Array(mapped).set(HEAPU8.subarray(data, data + length));
++      }
++      _free(data);
++    });
++    return data;
++  },
++});
+diff --git a/src/gpu/graphite/dawn/DawnBuffer.cpp b/src/gpu/graphite/dawn/DawnBuffer.cpp
+index 40ae5ea0c3cc10d481e7ad9437a3484b1183940a..1422ba0acda4652320c92f0ea9784699459a1491 100644
+--- a/src/gpu/graphite/dawn/DawnBuffer.cpp
++++ b/src/gpu/graphite/dawn/DawnBuffer.cpp
+@@ -27,6 +27,9 @@ void log_map_error(WGPUBufferMapAsyncStatus status, const char*) {
+     switch (status) {
+         case WGPUBufferMapAsyncStatus_ValidationError:
+             statusStr = "ValidationError";
++            // Emscripten reports every rejected mapAsync as ValidationError, including buffers
++            // destroyed with their device during teardown.
++            priority = SkLogPriority::kDebug;
+             break;
+         case WGPUBufferMapAsyncStatus_Unknown:
+             statusStr = "Unknown";
+@@ -55,7 +58,11 @@ void log_map_error(WGPUBufferMapAsyncStatus status, const char*) {
+             statusStr = "<other>";
+             break;
+     }
+-    SKIA_LOG(priority, "Buffer async map failed with status %s.", statusStr);
++    if (priority == SkLogPriority::kDebug) {
++        SKIA_LOG_D("Buffer async map failed with status %s.", statusStr);
++    } else {
++        SKIA_LOG_E("Buffer async map failed with status %s.", statusStr);
++    }
+ }
+ 
+ #else
+diff --git a/src/gpu/graphite/dawn/DawnCaps.cpp b/src/gpu/graphite/dawn/DawnCaps.cpp
+index 3a39e05a2654631d93860f971a9ff3003ee5fd8b..eae0c80d2903200edbeba3625acbe416421730b7 100644
+--- a/src/gpu/graphite/dawn/DawnCaps.cpp
++++ b/src/gpu/graphite/dawn/DawnCaps.cpp
+@@ -295,8 +295,8 @@ void DawnCaps::initCaps(const DawnBackendContext& backendContext, const ContextO
+ 
+ #if defined(__EMSCRIPTEN__)
+     wgpu::SupportedLimits supportedLimits;
+-    [[maybe_unused]] wgpu::Status status = backendContext.fDevice.GetLimits(&supportedLimits);
+-    SkASSERT(status == wgpu::Status::Success);
++    // Emscripten's -sUSE_WEBGPU headers return a bool here rather than wgpu::Status.
++    [[maybe_unused]] auto status = backendContext.fDevice.GetLimits(&supportedLimits);
+     wgpu::Limits& limits = supportedLimits.limits;
+ #else
+     wgpu::CompatibilityModeLimits compatLimits;
+@@ -477,10 +477,10 @@ void DawnCaps::initShaderCaps(const wgpu::Device& device) {
+     // discussions around enabling it using an extension in the future.
+     shaderCaps->fInfinitySupport = false;
+ 
++#if !defined(__EMSCRIPTEN__)
+     if (device.HasFeature(wgpu::FeatureName::DualSourceBlending)) {
+         shaderCaps->fDualSourceBlendingSupport = true;
+     }
+-#if !defined(__EMSCRIPTEN__)
+     if (device.HasFeature(wgpu::FeatureName::FramebufferFetch)) {
+         shaderCaps->fFBFetchSupport = true;
+     }
+diff --git a/src/gpu/graphite/dawn/DawnGraphiteUtils.cpp b/src/gpu/graphite/dawn/DawnGraphiteUtils.cpp
+index aa180fcd6f4444d89bbc97e34c0a6f73b8ba001d..9d583180473a26c9cf92f5cca9b698f4c100d61d 100644
+--- a/src/gpu/graphite/dawn/DawnGraphiteUtils.cpp
++++ b/src/gpu/graphite/dawn/DawnGraphiteUtils.cpp
+@@ -124,9 +124,19 @@ const DawnFormatCapabilityMap& DawnFormatCapabilityMap::Get() {
+     // Alias some commonly used feature names
+     using F = wgpu::FeatureName;
+     static constexpr std::optional<F> Compat = std::nullopt; // The baseline
++#if defined(__EMSCRIPTEN__)
++    // Emscripten's -sUSE_WEBGPU headers predate these features. Browser devices are core
++    // (non-compatibility) devices, so Core is the baseline; the rest are treated as unavailable.
++    static constexpr std::optional<F> Core = std::nullopt;
++    static constexpr F Tier1 = F::Undefined;
++    static constexpr F Tier2 = F::Undefined;
++    static constexpr F Float32Blendable = F::Undefined;
++#else
+     static constexpr F Core = F::CoreFeaturesAndLimits;
+     static constexpr F Tier1 = F::TextureFormatsTier1;
+     static constexpr F Tier2 = F::TextureFormatsTier2;
++    static constexpr F Float32Blendable = F::Float32Blendable;
++#endif
+ 
+     // To read this table with the HTML table in the links below, each format corresponds to a row
+     // in the original document. For a format, the first extension listed is the "Required feature"
+@@ -193,9 +203,11 @@ const DawnFormatCapabilityMap& DawnFormatCapabilityMap::Get() {
+         {BGRA8UnormSrgb, {Core   >> Filter | Render | Blend | MSAA | Resolve}},
+ 
+         // 16 bits per component
++#if !defined(__EMSCRIPTEN__)
+         {R16Unorm,       {Tier1  >> Render | Blend | MSAA | WriteOnly | ReadOnly}},
+ 
+         {R16Snorm,       {Tier1  >> Render | Blend | MSAA | WriteOnly | ReadOnly}},
++#endif
+ 
+         {R16Uint,        {Compat >> Render,
+                           Core   >> MSAA,
+@@ -211,9 +223,11 @@ const DawnFormatCapabilityMap& DawnFormatCapabilityMap::Get() {
+                           Tier1  >> WriteOnly | ReadOnly,
+                           Tier2  >> ReadWrite}},
+ 
++#if !defined(__EMSCRIPTEN__)
+         {RG16Unorm,      {Tier1 >> Render | Blend | MSAA | WriteOnly | ReadOnly}},
+ 
+         {RG16Snorm,      {Tier1 >> Render | Blend | MSAA | WriteOnly | ReadOnly}},
++#endif
+ 
+         {RG16Uint,       {Compat >> Render,
+                           Core   >> MSAA,
+@@ -226,9 +240,11 @@ const DawnFormatCapabilityMap& DawnFormatCapabilityMap::Get() {
+         {RG16Float,      {Compat >> Filter | Render | Blend | MSAA | Resolve,
+                           Tier1  >> WriteOnly | ReadOnly}},
+ 
++#if !defined(__EMSCRIPTEN__)
+         {RGBA16Unorm,    {Tier1  >> Render | Blend | MSAA | WriteOnly | ReadOnly}},
+ 
+         {RGBA16Snorm,    {Tier1  >> Render | Blend | MSAA | WriteOnly | ReadOnly}},
++#endif
+ 
+         {RGBA16Uint,     {Compat >> Render | WriteOnly | ReadOnly,
+                           Core   >> MSAA,
+@@ -250,7 +266,7 @@ const DawnFormatCapabilityMap& DawnFormatCapabilityMap::Get() {
+         {R32Float,       {Compat >> Render | WriteOnly | ReadOnly | ReadWrite,
+                           Core   >> MSAA,
+                           F::Float32Filterable >> Filter,
+-                          F::Float32Blendable  >> Blend}},
++                          Float32Blendable     >> Blend}},
+ 
+         {RG32Uint,       {Compat >> Render,
+                           Core   >> WriteOnly | ReadOnly}},
+@@ -261,7 +277,7 @@ const DawnFormatCapabilityMap& DawnFormatCapabilityMap::Get() {
+         {RG32Float,      {Compat >> Render,
+                           Core   >> WriteOnly | ReadOnly,
+                           F::Float32Filterable >> Filter,
+-                          F::Float32Blendable  >>  Blend}},
++                          Float32Blendable     >>  Blend}},
+ 
+         {RGBA32Uint,     {Compat >> Render | WriteOnly | ReadOnly,
+                           Tier2  >> ReadWrite}},
+@@ -272,7 +288,7 @@ const DawnFormatCapabilityMap& DawnFormatCapabilityMap::Get() {
+         {RGBA32Float,    {Compat >> Render|  WriteOnly | ReadOnly,
+                           Tier2  >> ReadWrite,
+                           F::Float32Filterable >> Filter,
+-                          F::Float32Blendable  >> Blend}},
++                          Float32Blendable     >> Blend}},
+ 
+         // mixed component width, 32 bits per texel
+         {RGB10A2Uint,    {Compat >> Render,
+@@ -336,12 +352,10 @@ SkEnumBitMask<DawnFormatFlag> DawnTextureFormatSupport(wgpu::Device device,
+ 
+ #define DAWN_FORMAT_MAPPING(M) \
+         M(TextureFormat::kR8,             wgpu::TextureFormat::R8Unorm)                     \
+-        M(TextureFormat::kR16,            wgpu::TextureFormat::R16Unorm)                    \
+         M(TextureFormat::kR16F,           wgpu::TextureFormat::R16Float)                    \
+         M(TextureFormat::kR32F,           wgpu::TextureFormat::R32Float)                    \
+         /*TextureFormat::kA8,             unsupported */                                    \
+         M(TextureFormat::kRG8,            wgpu::TextureFormat::RG8Unorm)                    \
+-        M(TextureFormat::kRG16,           wgpu::TextureFormat::RG16Unorm)                   \
+         M(TextureFormat::kRG16F,          wgpu::TextureFormat::RG16Float)                   \
+         M(TextureFormat::kRG32F,          wgpu::TextureFormat::RG32Float)                   \
+         /*TextureFormat::kRGB8,           unsupported */                                    \
+@@ -354,7 +368,6 @@ SkEnumBitMask<DawnFormatFlag> DawnTextureFormatSupport(wgpu::Device device,
+         /*TextureFormat::kRGB8_sRGB,      unsupported */                                    \
+         /*TextureFormat::kBGR10_XR,       unsupported */                                    \
+         M(TextureFormat::kRGBA8,          wgpu::TextureFormat::RGBA8Unorm)                  \
+-        M(TextureFormat::kRGBA16,         wgpu::TextureFormat::RGBA16Unorm)                 \
+         M(TextureFormat::kRGBA16F,        wgpu::TextureFormat::RGBA16Float)                 \
+         M(TextureFormat::kRGBA32F,        wgpu::TextureFormat::RGBA32Float)                 \
+         M(TextureFormat::kRGB10_A2,       wgpu::TextureFormat::RGB10A2Unorm)                \
+@@ -389,6 +402,9 @@ SkEnumBitMask<DawnFormatFlag> DawnTextureFormatSupport(wgpu::Device device,
+ 
+ #if !defined(__EMSCRIPTEN__)
+ #define DAWN_FORMAT_MAPPING_NATIVE_ONLY(M) \
++        M(TextureFormat::kR16,            wgpu::TextureFormat::R16Unorm)                    \
++        M(TextureFormat::kRG16,           wgpu::TextureFormat::RG16Unorm)                   \
++        M(TextureFormat::kRGBA16,         wgpu::TextureFormat::RGBA16Unorm)                 \
+         M(TextureFormat::kYUV8_P2_420,    wgpu::TextureFormat::R8BG8Biplanar420Unorm)       \
+         M(TextureFormat::kYUV10x6_P2_420, wgpu::TextureFormat::R10X6BG10X6Biplanar420Unorm) \
+         M(TextureFormat::kYUV8_P2_422,    wgpu::TextureFormat::R8BG8Biplanar422Unorm)       \
+diff --git a/third_party/dawn/BUILD.gn b/third_party/dawn/BUILD.gn
+index 03579f42cbcf120b67ebf42874e20c52ab0951c6..69bc950a96e3dbf680014fffd91dd273d6a953af 100644
+--- a/third_party/dawn/BUILD.gn
++++ b/third_party/dawn/BUILD.gn
+@@ -154,7 +154,10 @@ config("dawn_api_config") {
+   } else {
+     libs = []
+   }
+-  libs += [ "$root_out_dir/$_dawn_lib_name" ]
++  if (!is_canvaskit) {
++    # CanvasKit uses the browser's WebGPU implementation through Emscripten.
++    libs += [ "$root_out_dir/$_dawn_lib_name" ]
++  }
+ 
+   # https://dawn.googlesource.com/dawn/+/647c352f57aa8a4c2666258455158a36c0c385af/src/dawn/native/BUILD.gn#645
+   if (is_mac || is_ios) {
+@@ -314,7 +317,9 @@ config("dawn_defines") {
+ }
+ 
+ group("dawn") {
+-  public_deps = [ ":dawn_cmake" ]
++  if (!is_canvaskit) {
++    public_deps = [ ":dawn_cmake" ]
++  }
+ 
+   public_configs = [ ":dawn_api_config" ]
+ 
