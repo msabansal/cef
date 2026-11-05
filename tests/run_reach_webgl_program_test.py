@@ -38,9 +38,9 @@ def main():
         r"  GPU_CLIENT_VALIDATE_DESTINATION_INITALIZATION\([^;]+;",
         generated[start:end],
     )[0]
-    relative = "patch/patches/reach_webgl_commands.patch"
+    relative = "patch/patches/reach/webgl_commands.patch"
     patch = subprocess.check_output(
-        ["git", "show", args.baseline + ":" + relative], cwd=root, text=True,
+        ["git", "show", args.baseline + ":patch/patches/reach_webgl_commands.patch"], cwd=root, text=True,
     ) if args.baseline else (root / relative).read_text()
     name = "third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc"
     section = next(item for item in re.split(

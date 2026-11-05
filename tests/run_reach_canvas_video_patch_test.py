@@ -21,7 +21,7 @@ def main():
                         help="Unmodified Chromium files at the immutable pin.")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    patch = root / "patch" / "patches" / "reach_canvas_video.patch"
+    patch = root / "patch" / "patches" / "reach" / "canvas_video.patch"
     text = patch.read_text()
     files = json.loads(
         (root / "tests" / "reach_webgl_patch_baseline.json").read_text()
@@ -46,7 +46,7 @@ def main():
     exec((root / "patch" / "patch.cfg").read_text(), config)
     predecessors = []
     for entry in config["patches"]:
-        if entry["name"] == "reach_canvas_video":
+        if entry["name"] == "reach/canvas_video":
             break
         previous = root / "patch" / "patches" / (entry["name"] + ".patch")
         overlap = paths(previous.read_text()).intersection(files)

@@ -106,13 +106,15 @@ def main():
     )
     patch_texts = {}
     for name in selected:
-        relative = "patch/patches/" + name + ".patch"
+        relative = "patch/patches/" + name.replace("reach/", "reach_", 1) + ".patch"
         data = subprocess.check_output(
             ["git", "show", args.baseline + ":" + relative], cwd=root
         ) if args.baseline else (
             root / "patch" / "patches" / (name + ".patch")
         ).read_bytes()
-        (patches / (name + ".patch")).write_bytes(data)
+        output = patches / (name + ".patch")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(data)
         patch_texts[name] = data.decode()
     paths = {
         name for text in patch_texts.values()
@@ -125,17 +127,17 @@ def main():
     check_baseline(src, files)
     applied = run([sys.executable, str(patcher)], src)
     assert "3 patches total (3 applied, 0 skipped, 0 failed)" in applied, applied
-    check_patch_blobs(src, patch_texts["reach_webgl_commands"])
+    check_patch_blobs(src, patch_texts["reach/webgl_commands"])
     run([sys.executable, str(reset), "restore", str(src)], root)
     final = {
         name: (digest(src / name), (src / name).stat().st_mtime_ns)
         for name in files
     }
     skipped = run([
-        sys.executable, str(patcher), "--patch-file", "reach_webgl_commands"
+        sys.executable, str(patcher), "--patch-file", "reach/webgl_commands"
     ], src)
     assert "... already applied (skipping)." in skipped, skipped
-    webgl = patches / "reach_webgl_commands.patch"
+    webgl = patches / "reach" / "webgl_commands.patch"
     run(["git", "apply", "-p0", "--reverse", "--check",
          "--whitespace=error", str(webgl)], src)
     run(["git", "apply", "-p0", "--reverse", str(webgl)], src)

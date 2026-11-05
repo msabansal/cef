@@ -19,7 +19,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     output = root / ".artifacts" / "reach-canvas-video-test"
     output.mkdir(parents=True, exist_ok=True)
-    patch = root / "patch" / "patches" / "reach_canvas_video.patch"
+    patch = root / "patch" / "patches" / "reach" / "canvas_video.patch"
     assert patch.exists(), "native canvas video producer is not implemented"
     name = "third_party/blink/renderer/platform/graphics/reach_canvas_video.h"
     sections = re.split(r"(?=^diff --git )", patch.read_text(),

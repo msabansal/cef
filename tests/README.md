@@ -47,7 +47,7 @@ Automated unit test suite for CEF API validation.
 `python tests\run_reach_webgl_pending_test.py --compiler cl` runs the portable
 queue regression from a Visual Studio developer shell. On Linux, use
 `python3 tests/run_reach_webgl_pending_test.py --compiler c++`. The test extracts
-the production header from `reach_webgl_commands.patch`; it does not build CEF.
+the production header from `reach/webgl_commands.patch`; it does not build CEF.
 It covers 150,000 commands with applied-prefix retirement, non-destructive
 reads, duplicate/delayed/future/unread/unsent/stale-generation acknowledgements,
 original-byte delivery budgeting and the shared 256 MiB pending-memory bound.
@@ -77,7 +77,7 @@ children receive `--reach-drawing-commands --reach-webgl-video`. Values other
 than `"1"` do not enable video. Ordinary commands and full VIDEO are unchanged;
 the video switch excludes the WebGL journal even if its legacy flag is present.
 
-`reach_canvas_video.patch` snapshots the actual logical drawing buffer before
+`reach/canvas_video.patch` snapshots the actual logical drawing buffer before
 `MarkLayerComposited`, the canvas marker paint, `PostFinalizeFrame`'s early
 resource export, and canvas-listener export. Unchanged paints reuse owned
 pixels, not a reread of a discarded backbuffer. Default-buffer dirty revisions
@@ -149,7 +149,7 @@ python tests\run_reach_image_bitmap_test.py --compiler cl --fixture <patched-chr
 ```
 
 The fixture must be the Chromium revision pinned by
-`CHROMIUM_BUILD_COMPATIBILITY.txt`, with `reach_webgl_commands.patch` applied.
+`CHROMIUM_BUILD_COMPATIBILITY.txt`, with `reach/webgl_commands.patch` applied.
 The runner compiles the actual native ImageBitmap upload method, original
 capture methods, append/retirement methods and production ownership/queue
 headers. Chromium/Skia boundary objects are substituted; no CEF build or

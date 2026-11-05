@@ -2,5 +2,6 @@
 tools/testdata/make_generators/golden/** whitespace=blank-at-eol,-blank-at-eof,space-before-tab
 
 # Frozen Reach overlays/provenance retain their independently pinned bytes.
-patch/overlays/reach_*.patch -text whitespace=-blank-at-eol,-blank-at-eof
-patch/provenance/reach_*.patch -text whitespace=-blank-at-eol,-blank-at-eof
+patch/patches/reach/cef_command_export.patch -text whitespace=-blank-at-eol,-blank-at-eof
+patch/patches/reach/skia_command_export.patch -text whitespace=-blank-at-eol,-blank-at-eof
+patch/patches/reach/skia_webgpu_graphite.patch -text whitespace=-blank-at-eol,-blank-at-eof

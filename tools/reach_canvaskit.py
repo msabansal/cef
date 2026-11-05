@@ -55,7 +55,7 @@ def main():
         subprocess.run(["python3", "bin/activate-emsdk"], check=True)
     if "MakePictureWithMedia" not in (
             skia / "modules" / "canvaskit" / "skp.js").read_text():
-        parser.error("Apply the registered reach_canvaskit_picture_images patch first")
+        parser.error("Apply the registered reach/canvaskit_picture_images patch first")
     environment = dict(os.environ, EMSDK_QUIET="1")
     # Upstream's driver deletes archives unconditionally. Keep the same GN and
     # compiler commands, but let Ninja's dependency graph reuse valid outputs.

@@ -21,7 +21,7 @@ def main():
     patch = subprocess.check_output(
         ["git", "show", args.baseline + ":patch/patches/reach_webgl_commands.patch"],
         cwd=root, text=True,
-    ) if args.baseline else (root / "patch" / "patches" / "reach_webgl_commands.patch").read_text(
+    ) if args.baseline else (root / "patch" / "patches" / "reach" / "webgl_commands.patch").read_text(
         encoding="utf-8"
     )
     name = "third_party/blink/renderer/modules/webgl/reach_webgl_pending.h"
