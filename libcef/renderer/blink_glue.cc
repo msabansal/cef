@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <deque>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string_view>
@@ -19,8 +21,11 @@
 #include "base/functional/callback_helpers.h"
 #include "base/hash/hash.h"
 #include "base/json/json_writer.h"
+#include "base/location.h"
+#include "base/memory/scoped_refptr.h"
 #include "base/no_destructor.h"
 #include "base/strings/string_number_conversions.h"
+#include "base/task/single_thread_task_runner.h"
 #include "base/time/time.h"
 #include "base/values.h"
 #include "build/build_config.h"
@@ -274,6 +279,73 @@ void OnWebGlChanged(blink::HTMLCanvasElement* element) {
   }
 }
 
+class WebGlRetirement final : public blink::GarbageCollected<WebGlRetirement>,
+                              public blink::Supplement<blink::Document> {
+ public:
+  static const char kSupplementName[];
+
+  explicit WebGlRetirement(blink::Document& document)
+      : blink::Supplement<blink::Document>(document),
+        wake_(std::make_shared<Wake>(document)) {}
+
+  static std::function<void()> Notification(blink::Document& document) {
+    auto* retirement =
+        blink::Supplement<blink::Document>::From<WebGlRetirement>(document);
+    if (!retirement) {
+      retirement = blink::MakeGarbageCollected<WebGlRetirement>(document);
+      blink::Supplement<blink::Document>::ProvideTo(document, retirement);
+    }
+    return [wake = retirement->wake_] {
+      // Finalization must not inspect canvas, document, frame, or weak
+      // registry. One non-GC task state per document coalesces all collected
+      // journals.
+      if (wake->pending.exchange(true))
+        return;
+      wake->runner->PostTask(
+          FROM_HERE,
+          base::BindOnce(
+              [](std::shared_ptr<Wake> state) {
+                state->pending.store(false);
+                auto* current_document = state->document.Get();
+                auto* frame =
+                    current_document ? current_document->GetFrame() : nullptr;
+                if (!frame || !frame->IsAttached() ||
+                    frame->GetDocument() != current_document)
+                  return;
+                if (WebGlChangeCallback()) {
+                  if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(
+                          frame->LocalFrameRoot()))
+                    WebGlChangeCallback()(web_frame);
+                }
+              },
+              wake));
+    };
+  }
+
+  void Trace(blink::Visitor* visitor) const override {
+    blink::Supplement<blink::Document>::Trace(visitor);
+  }
+
+ private:
+  struct Wake {
+    explicit Wake(blink::Document& owner)
+        : runner(base::SingleThreadTaskRunner::GetCurrentDefault()),
+          document(&owner) {}
+
+    scoped_refptr<base::SingleThreadTaskRunner> runner;
+    blink::WeakPersistent<blink::Document> document;
+    std::atomic_bool pending{false};
+  };
+
+  std::shared_ptr<Wake> wake_;
+};
+
+const char WebGlRetirement::kSupplementName[] = "ReachWebGlRetirement";
+
+std::function<void()> OnWebGlRetirement(blink::HTMLCanvasElement* element) {
+  return WebGlRetirement::Notification(element->GetDocument());
+}
+
 bool WebGlDecimal(const std::string& text, uint64_t* value) {
   return !text.empty() && text.size() <= 20 &&
          base::StringToUint64(text, value) &&
@@ -294,6 +366,7 @@ void SetWebGlChangeCallback(
     return;
   }
   blink::ReachWebGLJournal::SetChangeCallback(&OnWebGlChanged);
+  blink::ReachWebGLJournal::SetRetirementCallback(&OnWebGlRetirement);
   blink::ReachWebGLJournal::SetOriginalHasher(
       [](base::span<const uint8_t> bytes) {
         return sk_reach::Hex(crypto::hash::Sha256(std::string_view(
