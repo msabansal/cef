@@ -78,6 +78,16 @@ struct CefDrawingCommands {
   int height = 0;
 };
 
+struct CefDrawingResourceSources {
+  std::string error;
+  // Original-byte identity -> JSON {url, frameId, loaderId}.
+  std::map<std::string, std::string> sources;
+};
+
+// Called in the serialization task, after animations/layout, not on a timer.
+BLINK_EXPORT CefDrawingResourceSources GetDrawingResourceSources(
+    blink::WebLocalFrame* frame);
+
 // Only for externally driven OSR sessions. This does not disable rasterization
 // in an ordinary CEF browser.
 BLINK_EXPORT CefDrawingCommands
