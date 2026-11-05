@@ -231,8 +231,8 @@ CefDrawingResourceSources GetDrawingResourceSources(
       }
       // Use the final response URL: replaying a redirect is not wire proof.
       const auto& url = resource->GetResponse().CurrentRequestUrl();
-      if (!url.ProtocolIs("https") || !url.User().IsEmpty() ||
-          !url.Pass().IsEmpty()) {
+      if (!url.ProtocolIs("https") || !url.User().empty() ||
+          !url.Pass().empty()) {
         continue;
       }
       auto source_url = url;
