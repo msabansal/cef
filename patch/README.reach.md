@@ -16,7 +16,7 @@ they are not an extra patch to apply to an already integrated fork.
 
 | File in `patches/reach/` | Reach integration |
 | --- | --- |
-| `wire_media.patch` | Browser-context original encoded responses, headers, cookies and cancellation. |
+| `wire_media.patch` | Browser-context original encoded responses, image/font destination and CSP, headers, cookies and cancellation. |
 | `canvas_frames.patch` | Canvas2D records and bounded local/out-of-process child-frame composition. |
 | `video_commands.patch` | Video paint-order markers without embedding source-decoded frames. |
 | `paint_chunks.patch` | Incremental drawing-command paint chunks. |
@@ -49,6 +49,16 @@ is `tools/reach_canvaskit.py`. Reach invokes it through
 `Deployment\build-vm\Invoke-ReleaseBuild.ps1` on its existing Azure build VM,
 with automatic deallocation. Moving these files does not rebuild or qualify
 any native/client artifact.
+
+Drawing originals use the integrated `Reach.DrawingOriginal.v2` event. Its
+optional source metadata comes from loaded Blink resource buffers at capture
+time, matches the original byte hash, and identifies the exporting frame and
+document loader. No DevTools polling/body-size discovery index is required.
+Fonts with different sanitized/decompressed bytes or unavailable raw buffers
+have no publisher source; their captured streams remain content-addressed.
+The updated agent rejects old original events explicitly: rebuild and qualify
+the matched native artifact before using this adapter, rather than relabeling
+an existing binary.
 
 ## Retired CEF-root overlays
 

@@ -21,6 +21,7 @@
 #include "base/json/json_writer.h"
 #include "base/no_destructor.h"
 #include "base/strings/string_number_conversions.h"
+#include "base/strings/string_util.h"
 #include "base/time/time.h"
 #include "base/values.h"
 #include "build/build_config.h"
@@ -77,6 +78,7 @@
 #include "third_party/blink/renderer/core/html/media/reach_media_journal.h"
 #include "third_party/blink/renderer/core/input/context_menu_allowed_scope.h"
 #include "third_party/blink/renderer/core/input/event_handler.h"
+#include "third_party/blink/renderer/core/inspector/identifiers_factory.h"
 #include "third_party/blink/renderer/core/layout/hit_test_location.h"
 #include "third_party/blink/renderer/core/layout/hit_test_request.h"
 #include "third_party/blink/renderer/core/layout/hit_test_result.h"
@@ -85,6 +87,7 @@
 #include "third_party/blink/renderer/core/layout/layout_object.h"
 #include "third_party/blink/renderer/core/layout/layout_view.h"
 #include "third_party/blink/renderer/core/loader/frame_load_request.h"
+#include "third_party/blink/renderer/core/loader/frame_loader.h"
 #include "third_party/blink/renderer/core/page/context_menu_controller.h"
 #include "third_party/blink/renderer/core/page/focus_controller.h"
 #include "third_party/blink/renderer/core/page/page.h"
@@ -108,6 +111,8 @@
 #include "third_party/blink/renderer/platform/graphics/paint/property_tree_state.h"
 #include "third_party/blink/renderer/platform/heap/persistent.h"
 #include "third_party/blink/renderer/platform/loader/fetch/resource_response.h"
+#include "third_party/blink/renderer/platform/loader/fetch/resource.h"
+#include "third_party/blink/renderer/platform/loader/fetch/resource_fetcher.h"
 #include "third_party/blink/renderer/platform/loader/fetch/script_fetch_options.h"
 #include "third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.h"
 #include "third_party/blink/renderer/platform/weborigin/scheme_registry.h"
@@ -144,6 +149,118 @@ CORE_EXPORT void SetReachFrameRequestHook(void (*hook)(LocalFrame&));
 }  // namespace blink
 
 namespace blink_glue {
+
+namespace {
+
+struct SourceDigest {
+  base::TimeTicks completed;
+  size_t size;
+  std::string hash;
+};
+
+// Inspector request IDs are not pointers and survive neither replacement nor
+// revalidation. Completion time and size also guard a reused resource request.
+std::string ResourceDigest(const blink::Resource& resource,
+                           const blink::SharedBuffer& buffer) {
+  static base::NoDestructor<std::map<uint64_t, SourceDigest>> cache;
+  static base::NoDestructor<std::deque<uint64_t>> order;
+  const auto id = resource.InspectorId();
+  const auto completed = resource.LoadResponseEnd();
+  const auto found = cache->find(id);
+  if (id && !completed.is_null() && found != cache->end() &&
+      found->second.completed == completed &&
+      found->second.size == buffer.size()) {
+    return found->second.hash;
+  }
+  crypto::hash::Hasher hasher(crypto::hash::kSha256);
+  for (const auto& segment : buffer)
+    hasher.Update(base::as_bytes(segment));
+  std::array<uint8_t, crypto::hash::kSha256Size> digest;
+  hasher.Finish(digest);
+  const auto hash = base::ToLowerASCII(base::HexEncode(digest));
+  if (id && !completed.is_null()) {
+    if (cache->insert_or_assign(
+            id, SourceDigest{completed, buffer.size(), hash}).second) {
+      order->push_back(id);
+      if (order->size() > 4096) {
+        cache->erase(order->front());
+        order->pop_front();
+      }
+    }
+  }
+  return hash;
+}
+
+}  // namespace
+
+CefDrawingResourceSources GetDrawingResourceSources(
+    blink::WebLocalFrame* web_frame) {
+  CefDrawingResourceSources result;
+  auto* root = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
+  if (!root || !root->IsAttached()) {
+    result.error = "Original resource source frame is detached";
+    return result;
+  }
+  size_t metadata = 0;
+  size_t frames = 0;
+  for (blink::Frame* frame = root; frame;
+       frame = frame->Tree().TraverseNext(root)) {
+    if (++frames > 256) {
+      result.error = "Original resource source frame budget exceeded";
+      return result;
+    }
+    auto* local = blink::DynamicTo<blink::LocalFrame>(frame);
+    auto* document = local ? local->GetDocument() : nullptr;
+    if (!document || !document->Fetcher())
+      continue;
+    const auto frame_id = blink::IdentifiersFactory::FrameId(local).Utf8();
+    const auto loader_id = blink::IdentifiersFactory::LoaderId(
+        local->Loader().GetDocumentLoader()).Utf8();
+    for (const auto& entry : document->Fetcher()->AllResources()) {
+      const auto* resource = entry.value.Get();
+      if (!resource || !resource->IsLoaded() || resource->ErrorOccurred() ||
+          (resource->GetType() != blink::ResourceType::kImage &&
+           resource->GetType() != blink::ResourceType::kFont)) {
+        continue;
+      }
+      // Use the final response URL: replaying a redirect is not wire proof.
+      const auto& url = resource->GetResponse().CurrentRequestUrl();
+      if (!url.ProtocolIs("https") || !url.User().IsEmpty() ||
+          !url.Pass().IsEmpty()) {
+        continue;
+      }
+      auto source_url = url;
+      source_url.RemoveFragmentIdentifier();
+      const auto source = source_url.GetString().Utf8();
+      if (source.empty() || source.size() > 4096)
+        continue;
+      metadata += source.size() + frame_id.size() + loader_id.size() + 256;
+      if (metadata > 4 * 1024 * 1024) {
+        result.error = "Original resource source metadata budget exceeded";
+        return result;
+      }
+      // Fonts may discard their wire buffer after sanitizing/decompressing it.
+      // Never associate a publisher WOFF hash with a different SkTypeface stream.
+      const auto buffer = resource->ResourceBuffer();
+      if (!buffer || !buffer->size() || buffer->size() > 32 * 1024 * 1024)
+        continue;
+      base::DictValue value;
+      value.Set("url", source);
+      value.Set("frameId", frame_id);
+      value.Set("loaderId", loader_id);
+      const auto json = base::WriteJson(value);
+      if (!json || frame_id.empty() || loader_id.empty()) {
+        result.error = "Original resource source document identity unavailable";
+        return result;
+      }
+      result.sources.try_emplace(
+          (resource->GetType() == blink::ResourceType::kFont ? "font:" : "image:") +
+              ResourceDigest(*resource, *buffer),
+          *json);
+    }
+  }
+  return result;
+}
 
 namespace {
 
