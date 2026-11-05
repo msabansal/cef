@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be found
 // in the LICENSE file.
 
-#include "base/command_line.h"
 #include "build/build_config.h"
 
 // Enable deprecation warnings on Windows. See http://crbug.com/585142.
@@ -43,12 +42,6 @@ void CefRenderFrameObserver::DidCommitProvisionalLoad(
   }
 
   frame_->OnDidCommitProvisionalLoad();
-
-  const auto* command_line = base::CommandLine::ForCurrentProcess();
-  if (command_line->HasSwitch("reach-drawing-commands") ||
-      command_line->HasSwitch("reach-video-sink")) {
-    blink_glue::HideMainFrameScrollbars(render_frame()->GetWebFrame());
-  }
 
   if (frame_->GetParent() == nullptr) {
     blink::WebLocalFrame* frame = render_frame()->GetWebFrame();

@@ -1,0 +1,56 @@
+diff --git a/third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc b/third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc
+index b010478..69eba20 100644
+--- a/third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc
++++ b/third_party/blink/renderer/core/paint/paint_layer_scrollable_area.cc
+@@ -47,6 +47,7 @@
+ #include <optional>
+ #include <utility>
+
++#include "base/command_line.h"
+ #include "base/numerics/checked_math.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "cc/animation/animation_timeline.h"
+@@ -137,6 +138,25 @@
+
+ namespace blink {
+
++namespace {
++
++bool ShouldHideScrollbars(const LayoutBox& box) {
++  const auto* frame = box.GetFrame();
++  if (frame->GetSettings()->GetHideScrollbars()) {
++    return true;
++  }
++  if (!box.IsLayoutView() || !frame->IsMainFrame()) {
++    return false;
++  }
++  // Root scrollbar modes also determine UserInputScrollable. Suppress only
++  // scrollbar creation and reserved space, not native scrolling permission.
++  const auto* command_line = base::CommandLine::ForCurrentProcess();
++  return command_line->HasSwitch("reach-drawing-commands") ||
++         command_line->HasSwitch("reach-video-sink");
++}
++
++}  // namespace
++
+ PaintLayerScrollableAreaRareData::PaintLayerScrollableAreaRareData() = default;
+
+ void PaintLayerScrollableAreaRareData::Trace(Visitor* visitor) const {
+@@ -1720,7 +1740,7 @@ gfx::Size PaintLayerScrollableArea::ComputeScrollbarWidthsForViewportUnits(
+   DCHECK(!GetLayoutBox()->IsFrameSet()) << "root element can't be a frameset";
+   DCHECK(GetLayoutBox()->GetFrame()->GetSettings());
+   if (VisualViewportSuppliesScrollbars() ||
+-      GetLayoutBox()->GetFrame()->GetSettings()->GetHideScrollbars() ||
++      ShouldHideScrollbars(*GetLayoutBox()) ||
+       GetPageScrollbarTheme().UsesOverlayScrollbars() ||
+       scrollbar_properties.width == EScrollbarWidth::kNone) {
+     return gfx::Size();
+@@ -1764,7 +1784,7 @@ void PaintLayerScrollableArea::ComputeScrollbarExistence(
+   DCHECK(GetLayoutBox()->GetFrame()->GetSettings());
+   if (VisualViewportSuppliesScrollbars() ||
+       !CanHaveOverflowScrollbars(*GetLayoutBox()) ||
+-      GetLayoutBox()->GetFrame()->GetSettings()->GetHideScrollbars() ||
++      ShouldHideScrollbars(*GetLayoutBox()) ||
+       GetLayoutBox()->IsFieldset() || GetLayoutBox()->IsFrameSet() ||
+       GetLayoutBox()->StyleRef().UsedScrollbarWidth() ==
+           EScrollbarWidth::kNone) {

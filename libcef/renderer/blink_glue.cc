@@ -1725,15 +1725,6 @@ void GoForward(blink::WebView* view) {
   }
 }
 
-void HideMainFrameScrollbars(blink::WebLocalFrame* web_frame) {
-  auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
-  if (frame && frame->IsAttached() && frame->IsMainFrame() && frame->View()) {
-    // Unlike Settings::SetHideScrollbars, this changes only the frame viewport,
-    // not overflow scrollers in the document or its shadow trees.
-    frame->View()->SetCanHaveScrollbars(false);
-  }
-}
-
 bool IsInBackForwardCache(blink::WebLocalFrame* frame) {
   blink::Frame* core_frame = blink::WebFrame::ToCoreFrame(*frame);
   return blink::To<blink::LocalFrame>(core_frame)
