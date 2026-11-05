@@ -1137,10 +1137,15 @@ void CefFrameImpl::SendMessage(const std::string& name,
               frame_, arguments[2].GetString(), children);
         } else {
           std::function<void(const std::string&, const void*, size_t)> sink;
+          std::optional<blink_glue::CefDrawingResourceSources> sources;
           if (mode == 1) {
-            sink = [this, request = arguments[0].GetInt()](
+            sink = [this, &sources, request = arguments[0].GetInt()](
                 const std::string& id, const void* bytes, size_t size) {
-              auto event = CefProcessMessage::Create("Reach.DrawingOriginal.v1");
+              if (!sources)
+                sources = blink_glue::GetDrawingResourceSources(frame_);
+              if (!sources->error.empty())
+                return;
+              auto event = CefProcessMessage::Create("Reach.DrawingOriginal.v2");
               auto values = event->GetArgumentList();
               values->SetInt(0, request);
               values->SetString(1, id);
@@ -1149,6 +1154,11 @@ void CefFrameImpl::SendMessage(const std::string& name,
                 values->SetBinary(2, CefBinaryValue::Create(bytes, size));
               else
                 values->SetNull(2);
+              const auto source = sources->sources.find(id);
+              if (source != sources->sources.end())
+                values->SetString(3, source->second);
+              else
+                values->SetNull(3);
               SendProcessMessage(PID_BROWSER, event);
             };
           }
@@ -1186,6 +1196,8 @@ void CefFrameImpl::SendMessage(const std::string& name,
             capture = blink_glue::CaptureDrawingCommands(
                 frame_, arguments[2].GetString(), children, resources, sink);
           }
+          if (sources && !sources->error.empty())
+            capture.error = sources->error;
         }
       }
     }

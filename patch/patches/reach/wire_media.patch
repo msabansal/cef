@@ -27,7 +27,7 @@ index 6cca7077489c57c80389103acb7f89206be64e95..81641468c8f54b8268a18b1446e175f5
    DownloadAsStream();
  }
  
-@@ -52,7 +55,10 @@ DevToolsNetworkResourceLoader::Create(
+@@ -52,7 +55,11 @@ DevToolsNetworkResourceLoader::Create(
      Credentials include_credentials,
      CompletionCallback completion_callback,
      bool is_outermost_main_frame,
@@ -35,25 +35,28 @@ index 6cca7077489c57c80389103acb7f89206be64e95..81641468c8f54b8268a18b1446e175f5
 +    RedirectCheckCallback redirect_check_callback,
 +    bool wire_representation,
 +    const net::HttpRequestHeaders& wire_headers,
-+    std::string wire_request_id) {
++    std::string wire_request_id,
++    bool wire_font) {
    network::ResourceRequest resource_request;
    resource_request.url = std::move(gurl);
    resource_request.request_initiator = origin;
-@@ -62,6 +68,13 @@ DevToolsNetworkResourceLoader::Create(
+@@ -62,6 +69,15 @@ DevToolsNetworkResourceLoader::Create(
      resource_request.load_flags |= net::LOAD_BYPASS_CACHE;
    }
    resource_request.mode = network::mojom::RequestMode::kNoCors;
 +  if (wire_representation) {
 +    resource_request.client_side_content_decoding_enabled = true;
 +    resource_request.headers = wire_headers;
-+    resource_request.destination = network::mojom::RequestDestination::kImage;
++    resource_request.destination = wire_font
++        ? network::mojom::RequestDestination::kFont
++        : network::mojom::RequestDestination::kImage;
 +    blink::network_utils::SetAcceptHeader(resource_request.headers,
 +                                         resource_request.destination);
 +  }
    resource_request.credentials_mode =
        include_credentials == Credentials::kInclude
            ? network::mojom::CredentialsMode::kInclude
-@@ -96,7 +109,7 @@ DevToolsNetworkResourceLoader::Create(
+@@ -96,7 +112,7 @@ DevToolsNetworkResourceLoader::Create(
    return base::WrapUnique(new DevToolsNetworkResourceLoader(
        std::move(resource_request), traffic_annotation,
        std::move(url_loader_factory), std::move(completion_callback),
@@ -62,7 +65,7 @@ index 6cca7077489c57c80389103acb7f89206be64e95..81641468c8f54b8268a18b1446e175f5
  }
  
  void DevToolsNetworkResourceLoader::OnRetry(base::OnceClosure start_retry) {
-@@ -108,6 +121,7 @@ void DevToolsNetworkResourceLoader::DownloadAsStream() {
+@@ -108,6 +124,7 @@ void DevToolsNetworkResourceLoader::DownloadAsStream() {
    loader_ = network::SimpleURLLoader::Create(
        std::make_unique<network::ResourceRequest>(resource_request_),
        traffic_annotation_);
@@ -70,7 +73,7 @@ index 6cca7077489c57c80389103acb7f89206be64e95..81641468c8f54b8268a18b1446e175f5
    loader_->SetOnRedirectCallback(base::BindRepeating(
        &DevToolsNetworkResourceLoader::OnRedirect, base::Unretained(this)));
    loader_->DownloadAsStream(url_loader_factory_.get(), this);
-@@ -118,8 +132,9 @@ void DevToolsNetworkResourceLoader::OnRedirect(
+@@ -118,8 +135,9 @@ void DevToolsNetworkResourceLoader::OnRedirect(
      const net::RedirectInfo& redirect_info,
      const network::mojom::URLResponseHead& response_head,
      std::vector<std::string>* /*removed_headers*/) {
@@ -82,7 +85,7 @@ index 6cca7077489c57c80389103acb7f89206be64e95..81641468c8f54b8268a18b1446e175f5
      const net::HttpResponseHeaders* response_headers =
          response_head.headers.get();
      loader_.reset();
-@@ -131,6 +146,13 @@ void DevToolsNetworkResourceLoader::OnRedirect(
+@@ -131,6 +149,13 @@ void DevToolsNetworkResourceLoader::OnRedirect(
  
  void DevToolsNetworkResourceLoader::OnDataReceived(std::string_view chunk,
                                                     base::OnceClosure resume) {
@@ -96,7 +99,7 @@ index 6cca7077489c57c80389103acb7f89206be64e95..81641468c8f54b8268a18b1446e175f5
    content_.append(chunk);
    std::move(resume).Run();
  }
-@@ -142,6 +164,14 @@ void DevToolsNetworkResourceLoader::OnComplete(bool success) {
+@@ -142,6 +167,14 @@ void DevToolsNetworkResourceLoader::OnComplete(bool success) {
    if (info && info->headers) {
      response_headers = info->headers.get();
    }
@@ -115,7 +118,7 @@ diff --git content/browser/devtools/protocol/devtools_network_resource_loader.h 
 index 58b3220ef4aeaa4c14f0ff692cc90334ac2576d0..2073f55f5068c5411f6874e1d52139a7933299b9 100644
 --- content/browser/devtools/protocol/devtools_network_resource_loader.h
 +++ content/browser/devtools/protocol/devtools_network_resource_loader.h
-@@ -53,7 +53,16 @@ class CONTENT_EXPORT DevToolsNetworkResourceLoader
+@@ -53,7 +53,17 @@ class CONTENT_EXPORT DevToolsNetworkResourceLoader
        Credentials include_credentials,
        CompletionCallback complete_callback,
        bool is_outermost_main_frame = false,
@@ -123,7 +126,8 @@ index 58b3220ef4aeaa4c14f0ff692cc90334ac2576d0..2073f55f5068c5411f6874e1d52139a7
 +      RedirectCheckCallback redirect_check_callback = {},
 +      bool wire_representation = false,
 +      const net::HttpRequestHeaders& wire_headers = {},
-+      std::string wire_request_id = {});
++      std::string wire_request_id = {},
++      bool wire_font = false);
 +
 +  bool wire_representation() const {
 +    return resource_request_.client_side_content_decoding_enabled;
@@ -133,7 +137,7 @@ index 58b3220ef4aeaa4c14f0ff692cc90334ac2576d0..2073f55f5068c5411f6874e1d52139a7
  
    ~DevToolsNetworkResourceLoader() override;
  
-@@ -68,7 +77,8 @@ class CONTENT_EXPORT DevToolsNetworkResourceLoader
+@@ -68,7 +78,8 @@ class CONTENT_EXPORT DevToolsNetworkResourceLoader
        const net::NetworkTrafficAnnotationTag& traffic_annotation,
        mojo::Remote<network::mojom::URLLoaderFactory> url_loader_factory,
        CompletionCallback complete_callback,
@@ -143,7 +147,7 @@ index 58b3220ef4aeaa4c14f0ff692cc90334ac2576d0..2073f55f5068c5411f6874e1d52139a7
    void DownloadAsStream();
  
    void OnDataReceived(std::string_view chunk,
-@@ -90,6 +100,7 @@ class CONTENT_EXPORT DevToolsNetworkResourceLoader
+@@ -90,6 +101,7 @@ class CONTENT_EXPORT DevToolsNetworkResourceLoader
    CompletionCallback completion_callback_;
    RedirectCheckCallback redirect_check_callback_;
    std::string content_;
@@ -174,11 +178,12 @@ index 7a9d60a1e3bf3cf217cf88ab760dfcb7e37b25ed..3713c107d8623df0793d696b771e9311
  
    if (net_error != net::OK) {
      result->SetNetError(net_error);
-@@ -4180,6 +4183,55 @@ void NetworkHandler::LoadNetworkResource(
+@@ -4180,6 +4183,58 @@ void NetworkHandler::LoadNetworkResource(
      std::unique_ptr<LoadNetworkResourceCallback> callback) {
    GURL gurl(url);
    const bool is_gurl_valid = gurl.is_valid();
 +  const bool wire_representation = options->GetWireRepresentation(false);
++  const bool wire_font = options->GetDestination("") == "font";
 +  const std::string wire_request_id = options->GetWireRequestId("");
 +  net::HttpRequestHeaders wire_headers;
 +  if (wire_representation) {
@@ -222,6 +227,8 @@ index 7a9d60a1e3bf3cf217cf88ab760dfcb7e37b25ed..3713c107d8623df0793d696b771e9311
 +    if (destination == "image") {
 +      wire_headers.SetHeader(net::HttpRequestHeaders::kAccept,
 +                             blink::network_utils::ImageAcceptHeader());
++    } else if (wire_font) {
++      wire_headers.SetHeader(net::HttpRequestHeaders::kAccept, "*/*");
 +    } else if (!destination.empty()) {
 +      callback->sendFailure(Response::InvalidParams("Invalid wire destination"));
 +      return;
@@ -230,24 +237,26 @@ index 7a9d60a1e3bf3cf217cf88ab760dfcb7e37b25ed..3713c107d8623df0793d696b771e9311
    if (!is_gurl_valid) {
      callback->sendFailure(Response::InvalidParams("The url must be valid"));
      return;
-@@ -4234,7 +4286,9 @@ void NetworkHandler::LoadNetworkResource(
+@@ -4234,7 +4289,11 @@ void NetworkHandler::LoadNetworkResource(
  
      network::CSPCheckResult result = csp_context.IsAllowedByCsp(
          frame->policy_container_host()->policies().content_security_policies,
 -        network::mojom::CSPDirectiveName::ConnectSrc, gurl, gurl,
-+        wire_representation ? network::mojom::CSPDirectiveName::ImgSrc
-+                            : network::mojom::CSPDirectiveName::ConnectSrc,
++        wire_representation
++            ? (wire_font ? network::mojom::CSPDirectiveName::FontSrc
++                         : network::mojom::CSPDirectiveName::ImgSrc)
++            : network::mojom::CSPDirectiveName::ConnectSrc,
 +        gurl, gurl,
          /*has_followed_redirect=*/false, /*source_location=*/nullptr,
          network::CSPContext::CHECK_ENFORCED_CSP,
          /*is_opaque_fenced_frame=*/false);
-@@ -4290,10 +4344,16 @@ void NetworkHandler::LoadNetworkResource(
+@@ -4290,10 +4349,16 @@ void NetworkHandler::LoadNetworkResource(
          std::move(url_loader_factory), std::move(gurl),
          frame->GetLastCommittedOrigin(), frame->ComputeSiteForCookies(),
          caching, include_credentials, std::move(complete_callback),
 -        frame->IsOutermostMainFrame(), std::move(redirect_check));
 +        frame->IsOutermostMainFrame(), std::move(redirect_check),
-+        wire_representation, wire_headers, wire_request_id);
++        wire_representation, wire_headers, wire_request_id, wire_font);
      loaders_.emplace(std::move(loader), std::move(callback));
      return;
    }
@@ -259,7 +268,7 @@ index 7a9d60a1e3bf3cf217cf88ab760dfcb7e37b25ed..3713c107d8623df0793d696b771e9311
    scoped_refptr<DevToolsAgentHostImpl> host =
        DevToolsAgentHostImpl::GetForId(host_id_);
    if (host) {
-@@ -4316,6 +4376,22 @@ void NetworkHandler::LoadNetworkResource(
+@@ -4316,6 +4381,22 @@ void NetworkHandler::LoadNetworkResource(
    callback->sendFailure(Response::ServerError("Target not supported"));
  }
  
@@ -311,19 +320,22 @@ diff --git services/network/public/cpp/content_security_policy/content_security_
 index e2a8ce30fdaf6bb243e59d5ce17bc525aa9143d9..236da6220c1ece7d6028be79a47cc14719c59f36 100644
 --- services/network/public/cpp/content_security_policy/content_security_policy.cc
 +++ services/network/public/cpp/content_security_policy/content_security_policy.cc
-@@ -269,13 +269,15 @@ std::string ErrorMessage(CSPDirectiveName directive,
+@@ -269,13 +269,17 @@ std::string ErrorMessage(CSPDirectiveName directive,
      case CSPDirectiveName::ConnectSrc:
        action = "Connecting to '$1'";
        break;
 +    case CSPDirectiveName::ImgSrc:
 +      action = "Loading the image '$1'";
 +      break;
++    case CSPDirectiveName::FontSrc:
++      action = "Loading the font '$1'";
++      break;
  
      case CSPDirectiveName::BaseURI:
      case CSPDirectiveName::BlockAllMixedContent:
      case CSPDirectiveName::ChildSrc:
      case CSPDirectiveName::DefaultSrc:
-     case CSPDirectiveName::FontSrc:
+-    case CSPDirectiveName::FontSrc:
 -    case CSPDirectiveName::ImgSrc:
      case CSPDirectiveName::ManifestSrc:
      case CSPDirectiveName::MediaSrc:
@@ -353,7 +365,7 @@ index 0161e0583b8ff7baedf8626a36a87b07c8ca17db..a137904b64875252589038d8f74bd3ab
 +      optional string ifRange
 +      optional string ifNoneMatch
 +      optional string ifModifiedSince
-+      # Reach: request destination; only "image" (sends the image Accept).
++      # Reach: request destination; "image" or "font" (matching Accept and CSP).
 +      optional string destination
  
    # Fetches the resource and returns the content.
