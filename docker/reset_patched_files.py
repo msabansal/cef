@@ -26,11 +26,23 @@ def digest(path):
         return hashlib.sha256(file.read()).hexdigest()
 
 
+def tracked_names(repo, names):
+    """Names present in HEAD, using one git process for the whole repository."""
+    query = ''.join('HEAD:%s\n' % name for name in names)
+    result = subprocess.run(['git', '-C', repo, 'cat-file', '--batch-check'],
+                            input=query, capture_output=True, text=True, check=True)
+    lines = result.stdout.splitlines()
+    if len(lines) != len(names):
+        sys.exit('unexpected git cat-file output for %s' % repo)
+    return [name for name, line in zip(names, lines) if not line.endswith(' missing')]
+
+
 if mode == 'reset':
     scope = {}
     config = os.path.join(src, 'cef', 'patch', 'patch.cfg')
     exec(compile(open(config, 'rb').read(), config, 'exec'), scope)
     state = {}
+    repos = {}
     for entry in scope['patches']:
         repo = os.path.join(src, entry.get('path', ''))
         patch = os.path.join(src, 'cef', 'patch', 'patches', entry['name'] + '.patch')
@@ -42,11 +54,18 @@ if mode == 'reset':
             if path in state:
                 continue
             state[path] = (digest(path), os.stat(path).st_mtime_ns) if os.path.isfile(path) else None
-            tracked = subprocess.run(['git', '-C', repo, 'cat-file', '-e', 'HEAD:' + name],
-                                     capture_output=True).returncode == 0
-            if tracked:
-                subprocess.run(['git', '-C', repo, 'checkout', '-q', 'HEAD', '--', name], check=True)
-            elif os.path.isfile(path):
+            repos.setdefault(repo, []).append(name)
+    # Per-file git calls reload Chromium's large index each time; batch them
+    # so resetting hundreds of patched files costs one checkout per repository.
+    for repo, names in repos.items():
+        tracked = tracked_names(repo, names)
+        if tracked:
+            subprocess.run(['git', '-C', repo, 'checkout', '-q', 'HEAD',
+                            '--pathspec-from-file=-', '--pathspec-file-nul'],
+                           input='\0'.join(tracked), text=True, check=True)
+        for name in set(names) - set(tracked):
+            path = os.path.join(repo, name)
+            if os.path.isfile(path):
                 os.remove(path)
     os.makedirs(os.path.dirname(state_path), exist_ok=True)
     with open(state_path, 'w') as file:
