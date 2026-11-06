@@ -281,7 +281,7 @@ index 00000000..b144d2c1
 +#include <vector>
 +
 +namespace sk_reach {
-+constexpr size_t kImageBytes = 4 * 1024 * 1024;
++constexpr size_t kImageBytes = 256 * 1024 * 1024;  // Format ceiling only.
 +constexpr size_t kFontBytes = 32 * 1024 * 1024;
 +constexpr size_t kDescriptorBytes = 4096;
 +constexpr size_t kHeaderBytes = 48;

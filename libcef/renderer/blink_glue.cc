@@ -879,7 +879,13 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
               [&] { return sk_sp<const SkData>(encoded); }, pixels)) {
         if (state->budget_only)
           return SkData::MakeEmpty();
-        return sk_reach::Write(sk_reach::kImage, digest.hash, digest.size);
+        // A null reference would make Skia inline the encoded original.
+        if (auto reference =
+                sk_reach::Write(sk_reach::kImage, digest.hash, digest.size)) {
+          return reference;
+        }
+        state->error = "Original image reference exceeds the resource format";
+        return SkData::MakeEmpty();
       }
     }
     if (state->error.empty()) {
@@ -962,7 +968,10 @@ SkSerialReturnType SerializeOriginalTypeface(SkTypeface* face, void* context) {
           if (state->budget_only) return SkData::MakeEmpty();
           const auto bytes = stream.TakeBytes();
           auto meta = SkData::MakeWithCopy(bytes.data(), bytes.size());
-          return sk_reach::Write(sk_reach::kFont, hash, digest.size, meta.get());
+          if (auto reference = sk_reach::Write(sk_reach::kFont, hash,
+                                               digest.size, meta.get())) {
+            return reference;
+          }
         }
       }
     }
