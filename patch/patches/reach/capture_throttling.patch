@@ -1,0 +1,77 @@
+diff --git third_party/blink/renderer/core/frame/local_frame_view.h third_party/blink/renderer/core/frame/local_frame_view.h
+--- third_party/blink/renderer/core/frame/local_frame_view.h
++++ third_party/blink/renderer/core/frame/local_frame_view.h
+@@ -60,6 +60,7 @@
+ #include "third_party/blink/renderer/platform/graphics/subtree_paint_property_update_reason.h"
+ #include "third_party/blink/renderer/platform/heap/collection_support/heap_hash_map.h"
+ #include "third_party/blink/renderer/platform/heap/collection_support/heap_linked_hash_set.h"
++#include "third_party/blink/renderer/platform/heap/persistent.h"
+ #include "third_party/blink/renderer/platform/scheduler/public/post_cancellable_task.h"
+ #include "third_party/blink/renderer/platform/timer.h"
+ #include "third_party/blink/renderer/platform/wtf/allocator/allocator.h"
+@@ -974,6 +975,22 @@
+     base::AutoReset<bool> value_;
+   };
+ 
++  // Required command pictures can include cross-site frames outside the visible
++  // viewport. Unthrottle only their capture, not background renderer scheduling.
++  class CORE_EXPORT ReachCommandCaptureScope {
++    STACK_ALLOCATED();
++
++   public:
++    explicit ReachCommandCaptureScope(LocalFrameView&);
++    ReachCommandCaptureScope(const ReachCommandCaptureScope&) = delete;
++    ReachCommandCaptureScope& operator=(const ReachCommandCaptureScope&) = delete;
++    ~ReachCommandCaptureScope() = default;
++
++   private:
++    Persistent<LocalFrameView> frame_view_;
++    base::AutoReset<bool> value_;
++  };
++
+   // The logic to determine whether a view can be render throttled is delicate,
+   // but in some cases we want to unconditionally force all views in a local
+   // frame tree to be throttled. Having ForceThrottlingScope on the stack will
+@@ -1249,7 +1266,9 @@
+   // Used by AllowThrottlingScope and DisallowThrottlingScope
+   bool allow_throttling_ = false;
+   // Used by ForceThrottlingScope
+   bool force_throttling_ = false;
++  // Set on the local root only while exporting a required command picture.
++  bool reach_command_capture_ = false;
+ 
+   // This is set on the local root frame view only.
+   DocumentLifecycle::LifecycleState target_state_;
+diff --git third_party/blink/renderer/core/frame/local_frame_view.cc third_party/blink/renderer/core/frame/local_frame_view.cc
+--- third_party/blink/renderer/core/frame/local_frame_view.cc
++++ third_party/blink/renderer/core/frame/local_frame_view.cc
+@@ -4365,6 +4365,11 @@
+     : value_(&frame_view.GetFrame().LocalFrameRoot().View()->allow_throttling_,
+              false) {}
+ 
++LocalFrameView::ReachCommandCaptureScope::ReachCommandCaptureScope(
++    LocalFrameView& frame_view)
++    : frame_view_(frame_view.GetFrame().LocalFrameRoot().View()),
++      value_(&frame_view_->reach_command_capture_, true) {}
++
+ LocalFrameView::ForceThrottlingScope::ForceThrottlingScope(
+     const LocalFrameView& frame_view)
+     : allow_scope_(frame_view),
+@@ -5061,8 +5067,15 @@
+ }
+ 
+ bool LocalFrameView::CanThrottleRendering() const {
+-  if (lifecycle_updates_throttled_ || IsSubtreeThrottled() ||
+-      IsDisplayLocked() || throttled_for_view_transition_) {
++  if (lifecycle_updates_throttled_ || IsDisplayLocked() ||
++      throttled_for_view_transition_) {
++    return true;
++  }
++  const auto* local_root_view = GetFrame().LocalFrameRoot().View();
++  if (local_root_view && local_root_view->reach_command_capture_) {
++    return false;
++  }
++  if (IsSubtreeThrottled()) {
+     return true;
+   }
+   // We only throttle hidden cross-origin frames. This is to avoid a situation

@@ -2219,6 +2219,10 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame,
     result.error = "Frame is detached or not ready";
     return result;
   }
+  std::optional<blink::LocalFrameView::ReachCommandCaptureScope> capture_scope;
+  if (!raster && blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
+    capture_scope.emplace(*frame->View());
+  }
   frame->View()->UpdateAllLifecyclePhasesExceptPaint(
       blink::DocumentUpdateReason::kInspector);
   const auto bounds = frame->View()->LayoutViewport()->VisibleContentRect(
@@ -3431,6 +3435,10 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
     return result;
   }
   blink::Persistent<blink::Page> page = frame->GetPage();
+  std::optional<blink::LocalFrameView::ReachCommandCaptureScope> capture_scope;
+  if (blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
+    capture_scope.emplace(*frame->View());
+  }
   // Visual update requests made from here on (including by this capture's own
   // animation and lifecycle steps) are reported again for the next capture.
   RequestedFrameRoots().erase(&frame->LocalFrameRoot());

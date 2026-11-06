@@ -39,6 +39,7 @@ Chromium's original path. This patch targets Chromium `156.0.8078.0`.
 | `paint_chunks.patch` | Incremental drawing-command paint chunks. |
 | `frame_requests.patch` | On-demand command-capture visual update notifications, also waking document-scoped animation demand in Blink glue before any WebGL context exists. |
 | `command_presentation.patch` | Successful command-capture presentation/timing completion. |
+| `capture_throttling.patch` | Capture-scoped painting of required cross-site frames outside the viewport; background throttling, loading, display locks and view transitions remain intact. |
 | `media_journal.patch` | Ordered same-thread MediaSource operations. |
 | `webgl_commands.patch` | Converted WebGL commands, resources, retirement and client composition. |
 | `canvas_video.patch` | Explicit opt-in per-canvas owned RGBA snapshots and paint markers. |
