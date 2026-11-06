@@ -1,0 +1,37 @@
+diff --git third_party/blink/renderer/core/scroll/scrollbar.cc third_party/blink/renderer/core/scroll/scrollbar.cc
+index 2268783..b25349d 100644
+--- third_party/blink/renderer/core/scroll/scrollbar.cc
++++ third_party/blink/renderer/core/scroll/scrollbar.cc
+@@ -27,6 +27,7 @@
+
+ #include <algorithm>
+
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/input/web_gesture_event.h"
+@@ -703,6 +704,24 @@ void Scrollbar::InjectScrollGesture(WebInputEvent::Type gesture_type,
+       !DeltaWillScroll(delta))
+     return;
+
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "reach-drawing-commands")) {
++    // Command capture holds compositor commits. Preserve native scrollbar
++    // capture and deltas, but apply scrolling on the owning Blink thread.
++    if (gesture_type == WebInputEvent::Type::kGestureScrollEnd) {
++      injected_gesture_scroll_begin_ = false;
++      scrollable_area_->SnapAfterScrollbarScrolling(
++          orientation_, cc::ScrollSourceType::kAbsoluteScroll);
++    } else {
++      injected_gesture_scroll_begin_ = true;
++      if (gesture_type == WebInputEvent::Type::kGestureScrollUpdate) {
++        scrollable_area_->UserScroll(
++            granularity, delta, cc::ScrollSourceType::kAbsoluteScroll, {});
++      }
++    }
++    return;
++  }
++
+   if (gesture_type == WebInputEvent::Type::kGestureScrollUpdate &&
+       !injected_gesture_scroll_begin_) {
+     // If we're injecting a scroll update, but haven't yet injected a scroll

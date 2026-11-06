@@ -23,10 +23,17 @@ combine this with CDP `Emulation.setScrollbarsHidden(true)`, which hides all
 scrollbars. The patch is gated by the existing Reach renderer capture switches
 and must be rebuilt and qualified with the agent's removal of that CDP override.
 
+Command capture also holds compositor commits. Its native scrollbar gestures
+therefore apply through Blink's owning `ScrollableArea::UserScroll`, retaining
+native hit testing, capture, axis/granularity, bounds and release-time snapping
+instead of queuing an unserviced compositor gesture. Other capture modes retain
+Chromium's original path. This patch targets Chromium `156.0.8078.0`.
+
 | File in `patches/reach/` | Reach integration |
 | --- | --- |
 | `wire_media.patch` | Browser-context original encoded responses, image/font destination and CSP, headers, cookies and cancellation. |
 | `root_scrollbars.patch` | Main-frame viewport scrollbar suppression without disabling native root input. |
+| `scrollbar_input.patch` | Native scrollbar input for command capture without compositor commits. |
 | `canvas_frames.patch` | Canvas2D records and bounded local/out-of-process child-frame composition. |
 | `video_commands.patch` | Video paint-order markers without embedding source-decoded frames. |
 | `paint_chunks.patch` | Incremental drawing-command paint chunks. |
