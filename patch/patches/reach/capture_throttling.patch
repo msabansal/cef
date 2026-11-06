@@ -9,9 +9,9 @@ diff --git third_party/blink/renderer/core/frame/local_frame_view.h third_party/
  #include "third_party/blink/renderer/platform/scheduler/public/post_cancellable_task.h"
  #include "third_party/blink/renderer/platform/timer.h"
  #include "third_party/blink/renderer/platform/wtf/allocator/allocator.h"
-@@ -974,6 +975,22 @@
-     base::AutoReset<bool> value_;
-   };
+@@ -694,6 +695,22 @@
+   // Same as ShouldThrottleRendering, but with an AllowThrottlingScope in scope.
+   bool ShouldThrottleRenderingForTest() const;
  
 +  // Required command pictures can include cross-site frames outside the visible
 +  // viewport. Unthrottle only their capture, not background renderer scheduling.
@@ -29,9 +29,9 @@ diff --git third_party/blink/renderer/core/frame/local_frame_view.h third_party/
 +    base::AutoReset<bool> value_;
 +  };
 +
-   // The logic to determine whether a view can be render throttled is delicate,
-   // but in some cases we want to unconditionally force all views in a local
-   // frame tree to be throttled. Having ForceThrottlingScope on the stack will
+   bool CanThrottleRendering() const override;
+   void UpdateRenderThrottlingStatus(bool hidden_for_throttling,
+                                     bool subtree_throttled,
 @@ -1249,7 +1266,9 @@
    // Used by AllowThrottlingScope and DisallowThrottlingScope
    bool allow_throttling_ = false;
