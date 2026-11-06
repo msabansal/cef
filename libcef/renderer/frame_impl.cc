@@ -1114,8 +1114,8 @@ void CefFrameImpl::SendMessage(const std::string& name,
       size_t bytes = 0;
       for (const auto [key, value] : arguments[3].GetDict()) {
         if (key.size() > 128 || !value.is_blob() ||
-            value.GetBlob().size() > 8 * 1024 * 1024 ||
-            (bytes += value.GetBlob().size()) > 32 * 1024 * 1024) {
+            (bytes += value.GetBlob().size()) >
+                blink_glue::MaxDrawingPaintBytes()) {
           capture.error = "Invalid child-frame picture or byte budget exceeded";
           break;
         }
@@ -1125,7 +1125,8 @@ void CefFrameImpl::SendMessage(const std::string& name,
         const bool image = key.starts_with("image:") && key.size() == 70;
         const bool font = key.starts_with("font:") && key.size() == 69;
         if ((!image && !font) || !value.is_blob() || value.GetBlob().empty() ||
-            (bytes += value.GetBlob().size()) > 32 * 1024 * 1024) {
+            (bytes += value.GetBlob().size()) >
+                blink_glue::MaxDrawingPaintBytes()) {
           capture.error = "Invalid original resource or composition byte budget exceeded";
           break;
         }

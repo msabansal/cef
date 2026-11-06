@@ -637,10 +637,25 @@ std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
   return {};
 }
 
+// One aggregate bounds each capture's serialized paint, including any single
+// picture, chunk, skeleton or scroll layout within it. The agent projects its
+// validated capture.maxPaintBytes; the renderer applies the same range.
+size_t MaxDrawingPaintBytes() {
+  static const size_t bytes = [] {
+    constexpr size_t kDefault = 32 * 1024 * 1024;
+    const char* value = getenv("REACH_DRAWING_MAX_PAINT_BYTES");
+    size_t parsed = 0;
+    if (!value || !base::StringToSizeT(value, &parsed) ||
+        parsed < 1024 * 1024 || parsed > 256 * 1024 * 1024) {
+      return kDefault;
+    }
+    return parsed;
+  }();
+  return bytes;
+}
+
 namespace {
 
-constexpr size_t kMaxPictureBytes = 8 * 1024 * 1024;
-constexpr size_t kMaxPaintBytes = 32 * 1024 * 1024;
 constexpr size_t kMaxFilterDepth = 32;
 // Shared filter nodes are revisited per reference; bound total traversal work
 // so a small graph cannot fan out exponentially. Not a capability cap.
@@ -749,7 +764,7 @@ struct PaintSerialization {
       font_bytes += size;
     }
     identity_bytes += key.size() + 64;
-    if (bytes + font_bytes + identity_bytes > kMaxPaintBytes) {
+    if (bytes + font_bytes + identity_bytes > MaxDrawingPaintBytes()) {
       error = "Aggregate original resource budget exceeded";
       return false;
     }
@@ -778,7 +793,7 @@ struct PaintSerialization {
       return false;
     }
     // Originals are bounded by the aggregate paint budget, not per resource.
-    if (size == 0 || size > kMaxPaintBytes - bytes) {
+    if (size == 0 || size > MaxDrawingPaintBytes() - bytes) {
       error = "Aggregate original resource budget exceeded or resource "
               "unavailable";
       return false;
@@ -854,7 +869,7 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
   if (state->error.empty()) {
     auto encoded = image->refEncodedData();
     if (encoded && encoded->size()) {
-      if (encoded->size() > kMaxPaintBytes) {
+      if (encoded->size() > MaxDrawingPaintBytes()) {
         state->error = "Aggregate original resource budget exceeded";
         return SkData::MakeEmpty();
       }
@@ -1087,7 +1102,7 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
       }
     }
     if (encoded && encoded->size() > 0) {
-      if (encoded->size() > kMaxPaintBytes) {
+      if (encoded->size() > MaxDrawingPaintBytes()) {
         state->error = "Aggregate original resource budget exceeded";
         return false;
       }
@@ -1102,7 +1117,8 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
         return false;
       }
       if (inserted) {
-        if (digest.size > kMaxPaintBytes - state->image_metadata_bytes) {
+        if (digest.size >
+            MaxDrawingPaintBytes() - state->image_metadata_bytes) {
           state->error = "Aggregate original resource budget exceeded";
           return false;
         }
@@ -1487,7 +1503,7 @@ bool CheckPaintRecord(PaintSerialization* state,
     return false;
   }
   if (depth >= kMaxRecordDepth ||
-      record.bytes_used() > kMaxPaintBytes - state->record_bytes) {
+      record.bytes_used() > MaxDrawingPaintBytes() - state->record_bytes) {
     state->error = "Nested paint-record depth or byte budget exceeded";
     return false;
   }
@@ -2668,7 +2684,7 @@ std::vector<uint8_t> CaptureScrollLayout(
     auto picture = record.ToSkPicture(picture_bounds, nullptr, callbacks);
     if (!picture)
       return {};
-    BoundedPaintStream stream(kMaxPictureBytes);
+    BoundedPaintStream stream(MaxDrawingPaintBytes());
     picture->serialize(&stream, &procs);
     if (stream.failed() || !stream.bytesWritten())
       return {};
@@ -2723,7 +2739,7 @@ std::vector<uint8_t> CaptureScrollLayout(
     AppendLE(&out, bytes.size(), 4);
     out.insert(out.end(), bytes.begin(), bytes.end());
   }
-  if (out.size() > kMaxPictureBytes)
+  if (out.size() > MaxDrawingPaintBytes())
     return {};
   return out;
 }
@@ -3221,7 +3237,7 @@ CefDrawingCommands CaptureIncrementalPicture(
     }
     // Replaying into a recorder keeps placeholder references intact.
     picture->playback(media_canvas);
-    BoundedPaintStream stream(kMaxPictureBytes);
+    BoundedPaintStream stream(MaxDrawingPaintBytes());
     FinishViewportPicture(&media_recorder, viewport)->serialize(&stream, &procs);
     if (stream.failed())
       return std::nullopt;
@@ -3299,7 +3315,7 @@ CefDrawingCommands CaptureIncrementalPicture(
         SkSerialProcs scratch_procs = chunk_procs;
         scratch_procs.fImageCtx = &scratch;
         scratch_procs.fTypefaceCtx = &scratch;
-        BoundedPaintStream stream(kMaxPictureBytes);
+        BoundedPaintStream stream(MaxDrawingPaintBytes());
         if (auto verified = chunk.record.ToSkPicture(chunk.bounds, nullptr,
                                                      chunk_callbacks)) {
           verified = WithImageStates(std::move(verified),
@@ -3325,7 +3341,7 @@ CefDrawingCommands CaptureIncrementalPicture(
       if (found != known.end() && found->second == hit->hash)
         continue;
       new_bytes += hit->bytes.size();
-      if (new_bytes > kMaxPaintBytes) {
+      if (new_bytes > MaxDrawingPaintBytes()) {
         result.error = "Aggregate new paint chunk budget exceeded";
         return result;
       }
@@ -3350,7 +3366,7 @@ CefDrawingCommands CaptureIncrementalPicture(
           state.error.empty() ? "Skia chunk recording failed" : state.error;
       return result;
     }
-    BoundedPaintStream stream(kMaxPictureBytes);
+    BoundedPaintStream stream(MaxDrawingPaintBytes());
     mark = base::TimeTicks::Now();
     chunk_picture->serialize(&stream, &chunk_procs);
     serializing += base::TimeTicks::Now() - mark;
@@ -3371,7 +3387,7 @@ CefDrawingCommands CaptureIncrementalPicture(
     const bool held = found != known.end() && found->second == hash;
     if (!held) {
       new_bytes += bytes.size();
-      if (new_bytes > kMaxPaintBytes) {
+      if (new_bytes > MaxDrawingPaintBytes()) {
         result.error = "Aggregate new paint chunk budget exceeded";
         return result;
       }
@@ -3398,12 +3414,12 @@ CefDrawingCommands CaptureIncrementalPicture(
                              " hash=" + base::NumberToString(hashing.InMilliseconds()));
   const size_t paint_bytes =
       new_bytes + state.bytes + state.font_bytes + state.identity_bytes;
-  if (result.picture.size() + paint_bytes > kMaxPaintBytes &&
+  if (result.picture.size() + paint_bytes > MaxDrawingPaintBytes() &&
       !damage.empty()) {
     if (auto plain = serialize_skeleton(false); plain && state.error.empty())
       result.picture = std::move(*plain);
   }
-  if (result.picture.size() + paint_bytes > kMaxPaintBytes) {
+  if (result.picture.size() + paint_bytes > MaxDrawingPaintBytes()) {
     result.error = "Aggregate picture and original resource budget exceeded";
     return result;
   }
@@ -3545,7 +3561,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
         }
         const auto found = children.find(DrawingFrameIdentity(child));
         if (found == children.end() ||
-            (child_bytes += found->second.size()) > kMaxPaintBytes) {
+            (child_bytes += found->second.size()) > MaxDrawingPaintBytes()) {
           result.error =
               "Missing child frame picture or composition byte budget exceeded";
           return result;
@@ -3818,7 +3834,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   procs.fImageCtx = &state;
   procs.fTypefaceProc = &SerializeOriginalTypeface;
   procs.fTypefaceCtx = &state;
-  BoundedPaintStream stream(kMaxPictureBytes);
+  BoundedPaintStream stream(MaxDrawingPaintBytes());
   picture->serialize(&stream, &procs);
   if (!state.error.empty() || stream.failed()) {
     result.error = state.error.empty() ? "Serialized picture budget exceeded"
@@ -3827,7 +3843,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   }
   result.picture = stream.TakeBytes();
   if (result.picture.size() + state.bytes + state.font_bytes +
-          state.identity_bytes > kMaxPaintBytes) {
+          state.identity_bytes > MaxDrawingPaintBytes()) {
     result.error = "Aggregate picture and original resource budget exceeded";
     return result;
   }
@@ -3938,7 +3954,7 @@ CefDrawingCommands CaptureRasterFallback(
     const auto found = children.find(DrawingFrameIdentity(child));
     if (found == children.end() ||
         (child_bytes += found->second.size()) >
-            kMaxPaintBytes - dependencies.record_bytes) {
+            MaxDrawingPaintBytes() - dependencies.record_bytes) {
       result.error = "Raster fallback missing child picture or byte budget exceeded";
       return result;
     }
@@ -3982,7 +3998,7 @@ CefDrawingCommands CaptureRasterFallback(
     return result;
   }
   picture->playback(surface->getCanvas());
-  BoundedPaintStream stream(kMaxPictureBytes);
+  BoundedPaintStream stream(MaxDrawingPaintBytes());
   SkPixmap pixels;
   if (!surface->peekPixels(&pixels) ||
       !SkPngRustEncoder::Encode(&stream, pixels, {}) || stream.failed()) {

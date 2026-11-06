@@ -115,6 +115,9 @@ CaptureRasterFallback(
 BLINK_EXPORT CefDrawingCommands
 GetDrawingFrameInfo(blink::WebLocalFrame* frame, bool raster = false);
 
+// Serialized-paint budget per drawing capture (agent capture.maxPaintBytes).
+BLINK_EXPORT size_t MaxDrawingPaintBytes();
+
 // Command mode only: |callback| runs once for a local root that needs a visual
 // update, then again only after that root's next drawing-command capture.
 BLINK_EXPORT void SetDrawingFrameRequestCallback(
