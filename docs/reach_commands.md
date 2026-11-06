@@ -45,8 +45,11 @@ raster fallback (or requests its frame metadata). Streaming emits
 `Reach.DrawingOriginal.v1` events containing request ID, `image:`/`font:` SHA-256
 identity, and original binary bytes directly from the Skia serialization callback,
 before the final picture reply. There is no fixed resource-count ceiling.
-The 4 MiB image, 32 MiB aggregate/font, individual-resource and decoded-pixel
-budgets remain. Identity/event overhead also counts toward the native transaction
+There is no per-image byte cap: the configurable aggregate paint budget
+(`REACH_DRAWING_MAX_PAINT_BYTES`, from the agent's `capture.maxPaintBytes`;
+32 MiB by default, 256 MiB at most) bounds originals, together with the 32 MiB
+font and decoded-pixel budgets. A reference that cannot be written fails the
+capture; Skia never inlines encoded originals. Identity/event overhead also counts toward the native transaction
 budget. The renderer does not retain an additional originals map in stream mode.
 It never waits for a browser acknowledgement on its synchronous renderer thread.
 The browser drains the byte-bounded IPC queue into a bounded asynchronous sink;
@@ -122,7 +125,7 @@ surfaces. Resets clear history; pixel readback, raw pixel writes, GPU and
 OffscreenCanvas contexts reject explicitly. Attached local and isolated remote
 frames compose bottom-up using original embedded fonts and encoded images.
 Flattened command playback avoids duplicate nested resource tables without
-raising the 4 MiB original-resource budget. Document/embedding/viewport checks
+raising the aggregate original-resource budget. Document/embedding/viewport checks
 reject inconsistent frame trees; this is not an atomic compositor snapshot.
 Local documents that have not yet received an embedding token use their existing
 document token consistently in metadata, composition and input routing. Remote
