@@ -1,5 +1,39 @@
+diff --git a/include/gpu/ganesh/GrContextOptions.h b/include/gpu/ganesh/GrContextOptions.h
+index 923d0a0..de3c9e9 100644
+--- a/include/gpu/ganesh/GrContextOptions.h
++++ b/include/gpu/ganesh/GrContextOptions.h
+@@ -141,6 +141,14 @@ struct SK_API GrContextOptions {
+      */
+     Enable fReduceOpsTaskSplitting = Enable::kDefault;
+ 
++    /**
++     * Synchronize a direct context at a completed Device draw when newly queued picture-shader
++     * tiles reach this byte threshold. Zero disables the policy. Nested shader construction and
++     * Device draws complete before submission. This is not a hard memory limit: one outermost
++     * draw, including its nested tiles, can exceed the threshold.
++     */
++    size_t fPictureShaderPendingBytesFlushThreshold = 0;
++
+     /**
+      * This affects the usage of the PersistentCache. We can cache SkSL, backend source (GLSL), or
+      * backend binaries (GL program binaries). By default we cache binaries, but if the driver's
+diff --git a/include/gpu/ganesh/GrRecordingContext.h b/include/gpu/ganesh/GrRecordingContext.h
+index fe76deb..bf53a25 100644
+--- a/include/gpu/ganesh/GrRecordingContext.h
++++ b/include/gpu/ganesh/GrRecordingContext.h
+@@ -283,6 +283,10 @@ private:
+     std::unique_ptr<GrDrawingManager> fDrawingManager;
+     std::unique_ptr<SkGaneshRecorder> fRecorder;
+ 
++    size_t fPendingPictureShaderBytes = 0;
++    int fPictureShaderBuildDepth = 0;
++    int fDeviceDrawDepth = 0;
++
+ #if defined(GPU_TEST_UTILS)
+     int fSuppressWarningMessages = 0;
+ #endif
 diff --git a/modules/canvaskit/canvaskit_bindings.cpp b/modules/canvaskit/canvaskit_bindings.cpp
-index 279ebb8c..d1fe64a5 100644
+index 279ebb8..9109684 100644
 --- a/modules/canvaskit/canvaskit_bindings.cpp
 +++ b/modules/canvaskit/canvaskit_bindings.cpp
 @@ -43,6 +43,8 @@
@@ -19,7 +53,19 @@ index 279ebb8c..d1fe64a5 100644
  #include "include/utils/SkShadowUtils.h"
  #include "src/core/SkFloatBits.h"
  #include "src/core/SkPathPriv.h"
-@@ -1213,7 +1216,11 @@ EMSCRIPTEN_BINDINGS(Skia) {
+@@ -288,8 +291,9 @@ sk_sp<GrDirectContext> MakeGrContext() {
+     // desired WebGL Context.
+     // setup interface.
+     auto interface = GrGLInterfaces::MakeWebGL();
+-    // setup context
+-    return GrDirectContexts::MakeGL(interface);
++    GrContextOptions options;
++    options.fPictureShaderPendingBytesFlushThreshold = 64 * 1024 * 1024;
++    return GrDirectContexts::MakeGL(interface, options);
+ }
+ 
+ sk_sp<SkSurface> MakeOnScreenGLSurface(sk_sp<GrDirectContext> dContext,
+@@ -1213,7 +1217,11 @@ EMSCRIPTEN_BINDINGS(Skia) {
  
  #ifdef CK_SERIALIZE_SKP
      function("_MakePicture",
@@ -32,7 +78,7 @@ index 279ebb8c..d1fe64a5 100644
                   uint8_t* d = reinterpret_cast<uint8_t*>(dPtr);
                   sk_sp<SkData> data = SkData::MakeFromMalloc(d, bytes);
  
-@@ -1226,28 +1233,181 @@ EMSCRIPTEN_BINDINGS(Skia) {
+@@ -1226,28 +1234,181 @@ EMSCRIPTEN_BINDINGS(Skia) {
                   });
  #endif
  
@@ -222,7 +268,7 @@ index 279ebb8c..d1fe64a5 100644
               allow_raw_pointers());
  #endif
 diff --git a/modules/canvaskit/skp.js b/modules/canvaskit/skp.js
-index 9248d763..76a8b29a 100644
+index 9248d76..76a8b29 100644
 --- a/modules/canvaskit/skp.js
 +++ b/modules/canvaskit/skp.js
 @@ -1,17 +1,35 @@
@@ -265,7 +311,7 @@ index 9248d763..76a8b29a 100644
  });
 diff --git a/src/core/SkReachResource.h b/src/core/SkReachResource.h
 new file mode 100644
-index 00000000..b144d2c1
+index 0000000..b144d2c
 --- /dev/null
 +++ b/src/core/SkReachResource.h
 @@ -0,0 +1,92 @@
@@ -361,8 +407,304 @@ index 00000000..b144d2c1
 +}
 +}  // namespace sk_reach
 +#endif
+diff --git a/src/gpu/ganesh/Device.cpp b/src/gpu/ganesh/Device.cpp
+index d61e230..f16f428 100644
+--- a/src/gpu/ganesh/Device.cpp
++++ b/src/gpu/ganesh/Device.cpp
+@@ -428,6 +428,7 @@ bool Device::isClipAntiAliased() const {
+ 
+ void Device::drawPaint(const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawPaint", fContext.get());
+ 
+     GrPaint grPaint;
+@@ -443,6 +444,7 @@ void Device::drawPaint(const SkPaint& paint) {
+ 
+ void Device::drawPoints(SkCanvas::PointMode mode, SkSpan<const SkPoint> pts, const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawPoints", fContext.get());
+     SkScalar width = paint.getStrokeWidth();
+     if (width < 0) {
+@@ -552,6 +554,7 @@ void Device::drawPoints(SkCanvas::PointMode mode, SkSpan<const SkPoint> pts, con
+ 
+ void Device::drawRect(const SkRect& rect, const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawRect", fContext.get());
+ 
+     GrStyle style(paint);
+@@ -613,6 +616,7 @@ void Device::drawEdgeAAQuad(const SkRect& rect,
+ 
+ void Device::drawRRect(const SkRRect& rrect, const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawRRect", fContext.get());
+ 
+     auto mf = paint.getMaskFilter();
+@@ -650,6 +654,7 @@ void Device::drawRRect(const SkRRect& rrect, const SkPaint& paint) {
+ 
+ void Device::drawDRRect(const SkRRect& outer, const SkRRect& inner, const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawDRRect", fContext.get());
+     if (outer.isEmpty()) {
+        return;
+@@ -701,6 +706,7 @@ void Device::drawDRRect(const SkRRect& outer, const SkRRect& inner, const SkPain
+ 
+ void Device::drawRegion(const SkRegion& region, const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+ 
+     if (paint.getMaskFilter()) {
+         SkPath path = region.getBoundaryPath();
+@@ -723,6 +729,7 @@ void Device::drawRegion(const SkRegion& region, const SkPaint& paint) {
+ 
+ void Device::drawOval(const SkRect& oval, const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawOval", fContext.get());
+ 
+     if (paint.getMaskFilter()) {
+@@ -743,6 +750,7 @@ void Device::drawOval(const SkRect& oval, const SkPaint& paint) {
+ 
+ void Device::drawArc(const SkArc& arc, const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawArc", fContext.get());
+     if (paint.getMaskFilter()) {
+         this->SkDevice::drawArc(arc, paint);
+@@ -771,6 +779,7 @@ void Device::drawPath(const SkPath& origSrcPath, const SkPaint& paint) {
+     }
+ #endif
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawPath", fContext.get());
+     if (!paint.getMaskFilter()) {
+         GrPaint grPaint;
+@@ -877,6 +886,7 @@ void Device::drawDevice(SkDevice* device,
+                         const SkSamplingOptions& sampling,
+                         const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     // clear of the source device must occur before CHECK_SHOULD_DRAW
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawDevice", fContext.get());
+     this->SkDevice::drawDevice(device, sampling, paint);
+@@ -889,6 +899,7 @@ void Device::drawImageRect(const SkImage* image,
+                            const SkPaint& paint,
+                            SkCanvas::SrcRectConstraint constraint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+ 
+     GrAA aa = fSurfaceDrawContext->chooseAA(paint);
+     SkCanvas::QuadAAFlags aaFlags = (aa == GrAA::kYes) ? SkCanvas::kAll_QuadAAFlags
+@@ -1006,6 +1017,7 @@ void Device::drawImageLattice(const SkImage* image,
+                               SkFilterMode filter,
+                               const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     auto iter = std::make_unique<SkLatticeIter>(lattice, dst);
+ 
+     auto [view, ct] = skgpu::ganesh::AsView(this->recordingContext(),
+@@ -1024,6 +1036,7 @@ void Device::drawVertices(const SkVertices* vertices,
+                           const SkPaint& paint,
+                           bool skipColorXform) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawVertices", fContext.get());
+     SkASSERT(vertices);
+ 
+@@ -1054,6 +1067,7 @@ void Device::drawVertices(const SkVertices* vertices,
+ 
+ void Device::drawMesh(const SkMesh& mesh, sk_sp<SkBlender> blender, const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawMesh", fContext.get());
+     if (!mesh.isValid()) {
+         return;
+@@ -1105,6 +1119,7 @@ void Device::drawAtlas(SkSpan<const SkRSXform> xform,
+                        sk_sp<SkBlender> blender,
+                        const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawAtlas", fContext.get());
+ 
+     GrPaint grPaint;
+@@ -1135,6 +1150,7 @@ void Device::onDrawGlyphRunList(SkCanvas* canvas,
+                                 const sktext::GlyphRunList& glyphRunList,
+                                 const SkPaint& paint) {
+     ASSERT_SINGLE_OWNER
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     GR_CREATE_TRACE_MARKER_CONTEXT("skgpu::ganesh::Device", "drawGlyphRunList", fContext.get());
+     SkASSERT(!glyphRunList.hasRSXForm());
+ 
+@@ -1430,6 +1446,7 @@ static bool valid_slug_matrices(const SkMatrix& creationMatrix, const SkMatrix&
+ void Device::drawSlug(SkCanvas* canvas, const sktext::gpu::Slug* slug, const SkPaint& paint) {
+     SkASSERT(canvas);
+     SkASSERT(slug);
++    GrRecordingContextPriv::AutoDeviceDraw pictureShaderDrawGuard(fContext.get());
+     const sktext::gpu::SlugImpl* slugImpl = static_cast<const sktext::gpu::SlugImpl*>(slug);
+ #if defined(SK_DEBUG)
+     if (!fContext->priv().options().fSupportBilerpFromGlyphAtlas) {
+diff --git a/src/gpu/ganesh/GrDrawingManager.cpp b/src/gpu/ganesh/GrDrawingManager.cpp
+index 348e071..f38f0e2 100644
+--- a/src/gpu/ganesh/GrDrawingManager.cpp
++++ b/src/gpu/ganesh/GrDrawingManager.cpp
+@@ -142,6 +142,8 @@ GrDirectContext::FlushResult GrDrawingManager::flush(SkSpan<GrSurfaceProxy*> pro
+     SkASSERT(gpu);
+ 
+     fFlushing = true;
++    GrRecordingContextPriv::AutoPictureShaderBuild pictureShaderFlushGuard(fContext);
++    fContext->priv().resetPendingPictureShaderBytes();
+ 
+     auto resourceProvider = dContext->priv().resourceProvider();
+     auto resourceCache = dContext->priv().getResourceCache();
+diff --git a/src/gpu/ganesh/GrFragmentProcessors.cpp b/src/gpu/ganesh/GrFragmentProcessors.cpp
+index bfb26ea..23af871 100644
+--- a/src/gpu/ganesh/GrFragmentProcessors.cpp
++++ b/src/gpu/ganesh/GrFragmentProcessors.cpp
+@@ -758,6 +758,9 @@ static std::unique_ptr<GrFragmentProcessor> make_shader_fp(const SkPictureShader
+         const bool isProtected =
+                 args.fSurfaceDrawContext->asSurfaceProxy()->isProtected() ==
+                 GrProtected::kYes;
++        // Cache miss: tile replay below may recursively build picture shaders. No automatic
++        // flush may happen until the outermost construction is done.
++        GrRecordingContextPriv::AutoPictureShaderBuild shaderBuildGuard(ctx);
+         auto image = info.makeImage(SkSurfaces::RenderTarget(ctx,
+                                                              skgpu::Budgeted::kYes,
+                                                              info.imageInfo,
+@@ -777,6 +780,9 @@ static std::unique_ptr<GrFragmentProcessor> make_shader_fp(const SkPictureShader
+         auto [v, ct] = skgpu::ganesh::AsView(ctx, image, skgpu::Mipmapped::kNo, targetSurface);
+         view = std::move(v);
+         provider->assignUniqueKeyToProxy(key, view.asTextureProxy());
++        if (view.asTextureProxy()) {
++            ctx->priv().addPendingPictureShaderBytes(view.asTextureProxy()->gpuMemorySize());
++        }
+     }
+ 
+     const GrSamplerState sampler(static_cast<GrSamplerState::WrapMode>(shader->tileModeX()),
+diff --git a/src/gpu/ganesh/GrRecordingContext.cpp b/src/gpu/ganesh/GrRecordingContext.cpp
+index 47e0cea..20d8775 100644
+--- a/src/gpu/ganesh/GrRecordingContext.cpp
++++ b/src/gpu/ganesh/GrRecordingContext.cpp
+@@ -13,6 +13,7 @@
+ #include "include/gpu/ganesh/GrBackendSurface.h"
+ #include "include/gpu/ganesh/GrContextOptions.h"
+ #include "include/gpu/ganesh/GrContextThreadSafeProxy.h"
++#include "include/gpu/ganesh/GrDirectContext.h"
+ #include "include/gpu/ganesh/GrTypes.h"
+ #include "include/private/SkDebug.h"
+ #include "include/private/SkMacros.h"
+@@ -24,6 +25,7 @@
+ #include "src/gpu/ganesh/GrDrawingManager.h"
+ #include "src/gpu/ganesh/GrProgramDesc.h"
+ #include "src/gpu/ganesh/GrProxyProvider.h"
++#include "src/gpu/ganesh/GrRecordingContextPriv.h"
+ #include "src/gpu/ganesh/PathRendererChain.h"
+ #include "src/gpu/ganesh/SkGaneshRecorder.h"
+ #include "src/gpu/ganesh/ops/AtlasTextOp.h"
+@@ -90,6 +92,23 @@ bool GrRecordingContext::init() {
+     return true;
+ }
+ 
++void GrRecordingContextPriv::maybeFlushForPictureShaderBytes() {
++    GrRecordingContext* context = this->context();
++    const size_t threshold = this->options().fPictureShaderPendingBytesFlushThreshold;
++    if (threshold == 0 || context->fPictureShaderBuildDepth != 0 ||
++        context->fDeviceDrawDepth != 0 || context->fPendingPictureShaderBytes < threshold) {
++        return;
++    }
++    GrDirectContext* direct = context->asDirectContext();
++    if (!direct || direct->abandoned()) {
++        return;
++    }
++    // On-flush callbacks must not re-enter this policy while resources are being submitted.
++    AutoPictureShaderBuild buildGuard(context);
++    AutoDeviceDraw drawGuard(context);
++    direct->flushAndSubmit(GrSyncCpu::kYes);
++}
++
+ void GrRecordingContext::abandonContext() {
+     GrImageContext::abandonContext();
+ 
+diff --git a/src/gpu/ganesh/GrRecordingContextPriv.h b/src/gpu/ganesh/GrRecordingContextPriv.h
+index a66feeb..26f0569 100644
+--- a/src/gpu/ganesh/GrRecordingContextPriv.h
++++ b/src/gpu/ganesh/GrRecordingContextPriv.h
+@@ -20,6 +20,8 @@
+ #include "src/gpu/ganesh/GrImageContextPriv.h"
+ #include "src/text/gpu/SubRunControl.h"
+ 
++#include <cstddef>
++#include <limits>
+ #include <memory>
+ #include <string_view>
+ 
+@@ -69,6 +71,61 @@ public:
+         return static_cast<const GrRecordingContext*>(fContext);
+     }
+ 
++    void addPendingPictureShaderBytes(size_t bytes) {
++        if (!this->pictureShaderFlushEnabled()) {
++            return;
++        }
++        size_t& pendingBytes = this->context()->fPendingPictureShaderBytes;
++        constexpr size_t kMaximum = std::numeric_limits<size_t>::max();
++        pendingBytes = bytes > kMaximum - pendingBytes ? kMaximum : pendingBytes + bytes;
++    }
++    void resetPendingPictureShaderBytes() { this->context()->fPendingPictureShaderBytes = 0; }
++
++    bool pictureShaderFlushEnabled() const {
++        return this->options().fPictureShaderPendingBytesFlushThreshold != 0;
++    }
++
++    class AutoPictureShaderBuild {
++    public:
++        explicit AutoPictureShaderBuild(GrRecordingContext* context)
++                : fContext(context->priv().pictureShaderFlushEnabled() ? context : nullptr) {
++            if (fContext) {
++                ++fContext->fPictureShaderBuildDepth;
++            }
++        }
++        ~AutoPictureShaderBuild() {
++            if (fContext) {
++                --fContext->fPictureShaderBuildDepth;
++            }
++        }
++        AutoPictureShaderBuild(const AutoPictureShaderBuild&) = delete;
++        AutoPictureShaderBuild& operator=(const AutoPictureShaderBuild&) = delete;
++    private:
++        GrRecordingContext* fContext;
++    };
++
++    class AutoDeviceDraw {
++    public:
++        explicit AutoDeviceDraw(GrRecordingContext* context)
++                : fContext(context->priv().pictureShaderFlushEnabled() ? context : nullptr) {
++            if (fContext) {
++                ++fContext->fDeviceDrawDepth;
++            }
++        }
++        ~AutoDeviceDraw() {
++            if (fContext) {
++                --fContext->fDeviceDrawDepth;
++                fContext->priv().maybeFlushForPictureShaderBytes();
++            }
++        }
++        AutoDeviceDraw(const AutoDeviceDraw&) = delete;
++        AutoDeviceDraw& operator=(const AutoDeviceDraw&) = delete;
++    private:
++        GrRecordingContext* fContext;
++    };
++
++    void maybeFlushForPictureShaderBytes();
++
+     GrProxyProvider* proxyProvider() { return this->context()->proxyProvider(); }
+     const GrProxyProvider* proxyProvider() const { return this->context()->proxyProvider(); }
+ 
 diff --git a/src/ports/SkFontHost_FreeType.cpp b/src/ports/SkFontHost_FreeType.cpp
-index 1534ed36..7069b1ef 100644
+index 1534ed3..7069b1e 100644
 --- a/src/ports/SkFontHost_FreeType.cpp
 +++ b/src/ports/SkFontHost_FreeType.cpp
 @@ -2002,14 +2002,23 @@ void SkTypeface_FreeType::FontDataPaletteToDescriptorPalette(const SkFontData& f
@@ -422,7 +764,7 @@ index 1534ed36..7069b1ef 100644
  
  SkFontScanner_FreeType::SkFontScanner_FreeType() : fLibrary(nullptr) {
 diff --git a/src/ports/SkTypeface_FreeType.h b/src/ports/SkTypeface_FreeType.h
-index b07f6337..0cda9fa6 100644
+index b07f633..0cda9fa 100644
 --- a/src/ports/SkTypeface_FreeType.h
 +++ b/src/ports/SkTypeface_FreeType.h
 @@ -96,10 +96,14 @@ private:
