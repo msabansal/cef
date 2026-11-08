@@ -83,7 +83,8 @@ struct CefDrawingResourceSources {
 
 // Called in the serialization task, after animations/layout, not on a timer.
 BLINK_EXPORT CefDrawingResourceSources GetDrawingResourceSources(
-    blink::WebLocalFrame* frame);
+    blink::WebLocalFrame* frame,
+    const std::set<std::string>* original_images = nullptr);
 
 // Only for externally driven OSR sessions. This does not disable rasterization
 // in an ordinary CEF browser.

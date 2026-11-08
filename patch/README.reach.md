@@ -78,6 +78,14 @@ The updated agent rejects old original events explicitly: rebuild and qualify
 the matched native artifact before using this adapter, rather than relabeling
 an existing binary.
 
+WebGL whole reads also carry a required `sources` map alongside their command
+batch; sliced reads carry it in the first command header and an empty map in
+later headers. The same source resolver matches only journal-admitted originals,
+including loaded raw fetch buffers when available. The agent verifies the
+original bytes before admitting source/document context and publishing the
+optional URL to the client. Rebuild this glue and use the matched agent/protocol
+client together; old WebGL envelopes are rejected, not assumed source-free.
+
 ## Retired CEF-root overlays
 
 The old optional cursor, wire-media and video-sink overlays are retired.

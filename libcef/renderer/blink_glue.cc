@@ -20,6 +20,7 @@
 #include "base/functional/bind.h"
 #include "base/functional/callback_helpers.h"
 #include "base/hash/hash.h"
+#include "base/json/json_reader.h"
 #include "base/json/json_writer.h"
 #include "base/location.h"
 #include "base/memory/scoped_refptr.h"
@@ -200,7 +201,8 @@ std::string ResourceDigest(const blink::Resource& resource,
 }  // namespace
 
 CefDrawingResourceSources GetDrawingResourceSources(
-    blink::WebLocalFrame* web_frame) {
+    blink::WebLocalFrame* web_frame,
+    const std::set<std::string>* original_images) {
   CefDrawingResourceSources result;
   auto* root = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
   if (!root || !root->IsAttached()) {
@@ -226,7 +228,9 @@ CefDrawingResourceSources GetDrawingResourceSources(
       const auto* resource = entry.value.Get();
       if (!resource || !resource->IsLoaded() || resource->ErrorOccurred() ||
           (resource->GetType() != blink::ResourceType::kImage &&
-           resource->GetType() != blink::ResourceType::kFont)) {
+           resource->GetType() != blink::ResourceType::kFont &&
+           !(original_images &&
+             resource->GetType() == blink::ResourceType::kRaw))) {
         continue;
       }
       // Use the final response URL: replaying a redirect is not wire proof.
@@ -240,16 +244,23 @@ CefDrawingResourceSources GetDrawingResourceSources(
       const auto source = source_url.GetString().Utf8();
       if (source.empty() || source.size() > 4096)
         continue;
-      metadata += source.size() + frame_id.size() + loader_id.size() + 256;
-      if (metadata > 4 * 1024 * 1024) {
-        result.error = "Original resource source metadata budget exceeded";
-        return result;
-      }
+      // Fetch-backed ImageBitmaps may retain bytes as a raw resource. Only
+      // associate one when its buffer matches a journal-admitted image hash.
       // Fonts may discard their wire buffer after sanitizing/decompressing it.
       // Never associate a publisher WOFF hash with a different SkTypeface stream.
       const auto buffer = resource->ResourceBuffer();
       if (!buffer || !buffer->size() || buffer->size() > 32 * 1024 * 1024)
         continue;
+      const auto key =
+          (resource->GetType() == blink::ResourceType::kFont ? "font:" : "image:") +
+          ResourceDigest(*resource, *buffer);
+      if (original_images && !original_images->contains(key))
+        continue;
+      metadata += source.size() + frame_id.size() + loader_id.size() + 256;
+      if (metadata > 4 * 1024 * 1024) {
+        result.error = "Original resource source metadata budget exceeded";
+        return result;
+      }
       base::DictValue value;
       value.Set("url", source);
       value.Set("frameId", frame_id);
@@ -259,10 +270,7 @@ CefDrawingResourceSources GetDrawingResourceSources(
         result.error = "Original resource source document identity unavailable";
         return result;
       }
-      result.sources.try_emplace(
-          (resource->GetType() == blink::ResourceType::kFont ? "font:" : "image:") +
-              ResourceDigest(*resource, *buffer),
-          *json);
+      result.sources.try_emplace(key, *json);
     }
   }
   return result;
@@ -591,6 +599,52 @@ std::string WebGlRequest(
     output->assign(json.begin(), json.end());
     return {};
   }
+  auto with_sources = [&](bool slice, bool discover_sources) -> std::string {
+    auto value = base::JSONReader::Read(
+        std::string(output->begin(), output->end()),
+        base::JSON_PARSE_CHROMIUM_EXTENSIONS);
+    if (!value || !value->is_dict())
+      return "WebGL original metadata is invalid";
+    base::DictValue sources;
+    const auto* image = slice ? value->GetDict().FindString("image") : nullptr;
+    if (discover_sources &&
+        ((!slice && !originals->empty()) ||
+         (slice && image && !image->empty()))) {
+      std::set<std::string> requested;
+      if (slice) {
+        requested.insert("image:" + *image);
+      } else {
+        for (const auto& [key, data] : *originals)
+          requested.insert(key);
+      }
+      const auto discovered = GetDrawingResourceSources(web_frame, &requested);
+      if (!discovered.error.empty())
+        return discovered.error;
+      for (const auto& [key, source] : discovered.sources) {
+        if (slice ? key == "image:" + *image : originals->contains(key))
+          sources.Set(key, source);
+      }
+    }
+    base::DictValue envelope;
+    if (slice) {
+      envelope = std::move(value->GetDict());
+    } else {
+      envelope.Set("batch", std::move(*value));
+    }
+    envelope.Set("sources", std::move(sources));
+    const auto json = base::WriteJson(envelope);
+    if (!json)
+      return "WebGL original metadata serialization failed";
+    size_t bytes = json->size();
+    if (!slice) {
+      for (const auto& [key, data] : *originals)
+        bytes += data.size();
+    }
+    if (bytes > (slice ? 10 * 1024 : static_cast<size_t>(max_bytes)))
+      return "WebGL original metadata exceeds read budget";
+    output->assign(json->begin(), json->end());
+    return {};
+  };
   if (operation == "Reach.WebGlCommandSlice.v2" ||
       operation == "Reach.WebGlOriginalSlice.v2") {
     uint64_t start = 0;
@@ -598,14 +652,22 @@ std::string WebGlRequest(
         max_bytes <= 0 ||
         max_bytes > static_cast<int>(blink::ReachWebGLPending::kMaxSlice))
       return "Invalid WebGL byte slice offset or budget";
-    return journal->ReadSlice(
+    const auto error = journal->ReadSlice(
         cursor, static_cast<size_t>(start), static_cast<size_t>(max_bytes),
         operation == "Reach.WebGlOriginalSlice.v2", output, originals);
+    if (!error.empty())
+      return error;
+    return with_sources(
+        true, operation == "Reach.WebGlCommandSlice.v2" && start == 0);
   }
   if (operation != "Reach.WebGlRead.v2" || max_bytes <= 256 ||
       max_bytes > 8 * 1024 * 1024)
     return "Invalid WebGL read budget";
-  return journal->Read(cursor, static_cast<size_t>(max_bytes), output, originals);
+  const auto error =
+      journal->Read(cursor, static_cast<size_t>(max_bytes), output, originals);
+  if (!error.empty())
+    return error;
+  return with_sources(false, true);
 }
 
 std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
