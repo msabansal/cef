@@ -126,6 +126,22 @@ on `master`. Registered server-side Skia patches are unchanged from the parent
 all-canvas candidate. The new native revision still requires its own matched
 build and qualification.
 
+The canvas-video inventory has no independent fixed stream-count cap, including
+for small Canvas2D widgets in closed shadow roots. Aggregate limits remain
+4,194,304 even-padded pixels, 16 MiB of native RGBA snapshots and 320 MiB of
+conservative codec reservations. Preflight derives its maximum inventory length
+from the minimum possible codec reservation, including one padded macroblock
+and per-stream overhead; actual geometry must still fit the aggregate budgets.
+This is independent of the four-frame presentation window. Native capture,
+agent admission and client decoding must use matching reservation accounting.
+Only viewport-affecting canvas markers receive snapshots and active streams.
+Visibility reuses the drawing damage walk's transforms, clips and conservative
+layer-effect bounds, including closed shadow roots and nested scrollers.
+Off-viewport canvas markers are omitted from full and prefetched chunk output;
+visibility changes invalidate their serialized chunk contents. Leaving view
+releases native snapshot/admission state and removes the authoritative stream,
+retiring agent encoders and client workers. Re-entry receives a fresh identity.
+
 Reach staging accepts the renamed source inputs but deliberately retains the
 artifact-internal paths `provenance/skia-command-export.patch` and
 `provenance/skia-webgpu-graphite.patch`. Their hashes, manifest keys, matched

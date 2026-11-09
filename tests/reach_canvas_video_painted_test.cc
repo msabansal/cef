@@ -16,8 +16,27 @@ int main() {
   for (const auto& [width, height] : *many)
     assert(inventory.Add(width, height));
   assert(!blink::ReachCanvasVideo::Plan({{4096, 4096}}));
+  const std::vector<std::pair<int, int>> weather(5, {32, 28});
+  assert(blink::ReachCanvasVideo::Plan(weather) == weather);
+  const std::vector<std::pair<int, int>> tiny(79, {8, 8});
+  assert(blink::ReachCanvasVideo::Plan(tiny) == tiny);
   assert(!blink::ReachCanvasVideo::Plan(
-      {{1, 1}, {1, 1}, {1, 1}, {1, 1}, {1, 1}}));
+      std::vector<std::pair<int, int>>(80, {1, 1})));
+  const auto thin = blink::ReachCanvasVideo::Plan(
+      std::vector<std::pair<int, int>>(79, {3840, 1}));
+  assert(thin && thin->size() == 79 && thin->front().first < 3840);
+  blink::ReachCanvasVideo::Inventory thin_inventory;
+  for (const auto& [width, height] : *thin)
+    assert(thin_inventory.Add(width, height));
+  blink::ReachCanvasVideo::Inventory codec_boundary;
+  for (unsigned stream = 0; stream < 32; ++stream)
+    assert(codec_boundary.Add(1024, 96));
+  assert(codec_boundary.codec == 320 * 1024 * 1024);
+  assert(!codec_boundary.Add(1, 1));
+  blink::ReachCanvasVideo::Inventory codec_overflow;
+  for (unsigned stream = 0; stream < 29; ++stream)
+    assert(codec_overflow.Add(1024, 97));
+  assert(!codec_overflow.Add(1024, 97));
 
   auto budget = std::make_shared<blink::ReachCanvasVideo::Budget>();
   blink::ReachCanvasVideo visible;

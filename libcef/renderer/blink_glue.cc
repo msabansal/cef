@@ -3061,6 +3061,44 @@ class DamageCanvas final : public SkNoDrawCanvas {
   bool overflowed_ = false;
 };
 
+std::optional<std::set<uint32_t>> VisiblePaintMarkers(
+    const cc::PaintRecord& recording, const gfx::Rect& bounds,
+    const std::set<uint32_t>& ids) {
+  if (ids.empty())
+    return std::set<uint32_t>();
+  std::map<uint32_t, sk_sp<SkPicture>> pictures;
+  std::map<const SkPicture*, size_t> placeholders;
+  for (const auto id : ids) {
+    auto picture = SkPicture::MakePlaceholder(SkRect::MakeWH(1, 1));
+    placeholders.emplace(picture.get(), id);
+    pictures.emplace(id, std::move(picture));
+  }
+  cc::PlaybackCallbacks callbacks;
+  callbacks.custom_callback = base::BindRepeating(
+      [](const std::map<uint32_t, sk_sp<SkPicture>>* pictures,
+         SkCanvas* canvas, uint32_t id) {
+        const auto found = pictures->find(id);
+        if (found != pictures->end())
+          canvas->drawPicture(found->second);
+      }, base::Unretained(&pictures));
+  auto picture = recording.ToSkPicture(
+      SkRect::MakeWH(bounds.width(), bounds.height()), nullptr, callbacks);
+  if (!picture)
+    return std::nullopt;
+  // Use paint transforms, clips and conservative layer-effect bounds, not
+  // DOM rectangles: closed shadow roots and nested scrollers paint normally.
+  DamageCanvas coverage(bounds.width(), bounds.height(), &placeholders);
+  picture->playback(&coverage);
+  if (coverage.overflowed())
+    return std::nullopt;
+  std::set<uint32_t> visible;
+  for (const auto& entry : coverage.entries()) {
+    if (!entry.rect.isEmpty())
+      visible.insert(static_cast<uint32_t>(entry.index));
+  }
+  return visible;
+}
+
 void AppendHex(std::string* out, base::span<const uint8_t> bytes) {
   static constexpr std::string_view kDigits = "0123456789abcdef";
   for (const uint8_t byte : bytes) {
@@ -3148,6 +3186,7 @@ CefDrawingCommands CaptureIncrementalPicture(
     blink::LocalFrame* frame, const gfx::Rect& bounds,
     const std::map<uint32_t, sk_sp<SkPicture>>& frame_pictures,
     const std::map<uint32_t, sk_sp<SkData>>& media_states,
+    const std::set<uint32_t>& culled_canvas_ids,
     const std::vector<uint8_t>& known_bytes,
     const std::function<void(const std::string&, const void*, size_t)>& sink,
     const std::set<std::string>* known_originals) {
@@ -3225,7 +3264,8 @@ CefDrawingCommands CaptureIncrementalPicture(
     }
   }
   state.collect_paint_ids = false;
-  state.media_ids.clear();
+  state.culled_paint_ids = culled_canvas_ids;
+  state.media_ids = culled_canvas_ids;
   for (const auto& [id, picture] : frame_pictures)
     state.media_ids.insert(id);
   for (const auto& [id, data] : media_states)
@@ -3347,6 +3387,8 @@ CefDrawingCommands CaptureIncrementalPicture(
          const std::map<uint32_t, sk_sp<SkPicture>>* frames,
          PaintSerialization* state, SkCanvas* canvas, uint32_t id) {
         ++state->markers;
+        if (state->culled_paint_ids.contains(id))
+          return;
         const auto child = frames->find(id);
         if (child != frames->end()) {
           SkAutoCanvasRestore restore(canvas, true);
@@ -3670,6 +3712,12 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   size_t canvas_index = 0;
   size_t canvas_bytes = 0;
   if (canvas_video) {
+    const auto visible = VisiblePaintMarkers(
+        recording, bounds, dependencies.media_ids);
+    if (!visible) {
+      result.error = "Canvas visibility recording failed or exceeded paint budget";
+      return result;
+    }
     for (blink::Frame* tree_frame = frame.Get(); tree_frame;
          tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
       if (!IsInlinePaintFrame(frame.Get(), tree_frame))
@@ -3684,13 +3732,18 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
         auto* context = canvas ? canvas->RenderingContext() : nullptr;
         if (!context)
           continue;
+        const auto id = canvas->GetDomNodeId();
+        if (dependencies.media_ids.contains(id) && !visible->contains(id)) {
+          dependencies.culled_paint_ids.insert(id);
+          dependencies.media_ids.erase(id);
+        }
         if (!dependencies.media_ids.contains(canvas->GetDomNodeId()) ||
             context->isContextLost() || canvas->Size().IsEmpty()) {
           context->ReleaseReachCanvasVideo();
           continue;
         }
         const auto size = context->ReachCanvasVideoSize();
-        if (canvas_sources.size() == 4) {
+        if (canvas_sources.size() >= blink::ReachCanvasVideo::kMaxStreams) {
           result.error = "Painted canvas video stream budget exceeded";
           return result;
         }
@@ -3899,7 +3952,8 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   if (known) {
     auto incremental =
         CaptureIncrementalPicture(frame.Get(), bounds, frame_pictures,
-                                  media_states, *known, sink, known_originals);
+                                  media_states, dependencies.culled_paint_ids,
+                                  *known, sink, known_originals);
     incremental.canvas_video = std::move(result.canvas_video);
     return incremental;
   }
@@ -3924,8 +3978,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       [](const std::map<uint32_t, sk_sp<SkData>>* states,
          const std::map<uint32_t, sk_sp<SkPicture>>* frames,
          PaintSerialization* state, SkCanvas* canvas, uint32_t id) {
-        if (state->culled_paint_ids.contains(id) &&
-            canvas->quickReject(SkRect::MakeWH(1, 1))) {
+        if (state->culled_paint_ids.contains(id)) {
           return;
         }
         const auto child = frames->find(id);
