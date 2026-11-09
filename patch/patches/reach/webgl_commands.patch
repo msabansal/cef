@@ -635,10 +635,10 @@ index 0000000..6a04ffa
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 new file mode 100644
-index 0000000..a5558ae
+index 0000000..c70510f
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,768 @@
+@@ -0,0 +1,820 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -652,12 +652,33 @@ index 0000000..a5558ae
 +#include "gpu/command_buffer/client/gles2_interface.h"
 +#include "third_party/blink/renderer/bindings/modules/v8/v8_webgl_context_attributes.h"
 +#include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
++#include "third_party/blink/renderer/core/page/page.h"
 +#include "third_party/blink/renderer/modules/webgl/webgl_program.h"
 +#include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
 +#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
++#include "third_party/blink/renderer/platform/supplementable.h"
 +
 +namespace blink {
 +namespace {
++
++class TextureLimits final : public GarbageCollected<TextureLimits>,
++                            public Supplement<Page> {
++ public:
++  static const char kSupplementName[];
++  TextureLimits(Page& page, int texture, int cube, int renderbuffer)
++      : Supplement<Page>(page),
++        texture(texture),
++        cube(cube),
++        renderbuffer(renderbuffer) {}
++  void Trace(Visitor* visitor) const override {
++    Supplement<Page>::Trace(visitor);
++  }
++  const int texture;
++  const int cube;
++  const int renderbuffer;
++};
++
++const char TextureLimits::kSupplementName[] = "ReachWebGLTextureLimits";
 +
 +constexpr uint64_t kJournalBit = uint64_t{1} << 63;
 +constexpr size_t kMaxCommandBytes = ReachWebGLPending::kLimit;
@@ -688,6 +709,37 @@ index 0000000..a5558ae
 +}
 +
 +}  // namespace
++
++void SetReachWebGLTextureLimits(Page& page,
++                               int texture,
++                               int cube,
++                               int renderbuffer) {
++  CHECK(!Supplement<Page>::From<TextureLimits>(page));
++  CHECK(texture > 0 && texture <= 32768);
++  CHECK(cube > 0 && cube <= 32768);
++  CHECK(renderbuffer > 0 && renderbuffer <= 32768);
++  Supplement<Page>::ProvideTo(
++      page, MakeGarbageCollected<TextureLimits>(page, texture, cube, renderbuffer));
++}
++
++int ClampReachWebGLTextureLimit(HTMLCanvasElement* canvas,
++                               unsigned parameter,
++                               int hardware_limit) {
++  auto* page = canvas ? canvas->GetDocument().GetPage() : nullptr;
++  auto* limits = page ? Supplement<Page>::From<TextureLimits>(*page) : nullptr;
++  if (!limits)
++    return hardware_limit;
++  switch (parameter) {
++    case GL_MAX_TEXTURE_SIZE:
++      return std::min(hardware_limit, limits->texture);
++    case GL_MAX_CUBE_MAP_TEXTURE_SIZE:
++      return std::min(hardware_limit, limits->cube);
++    case GL_MAX_RENDERBUFFER_SIZE:
++      return std::min(hardware_limit, limits->renderbuffer);
++    default:
++      return hardware_limit;
++  }
++}
 +
 +std::atomic_size_t& ReachWebGLJournal::Budget() {
 +  return RetainedBytes();
@@ -1409,10 +1461,10 @@ index 0000000..a5558ae
 +}  // namespace blink
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.h third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
 new file mode 100644
-index 0000000..69cab47
+index 0000000..3e959c1
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.h
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,303 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_JOURNAL_H_
 +
@@ -1450,9 +1502,18 @@ index 0000000..69cab47
 +
 +class Document;
 +class HTMLCanvasElement;
++class Page;
 +class ScriptState;
 +class WebGLProgram;
 +class WebGLRenderingContextBase;
++
++MODULES_EXPORT void SetReachWebGLTextureLimits(Page&,
++                                             int texture,
++                                             int cube,
++                                             int renderbuffer);
++MODULES_EXPORT int ClampReachWebGLTextureLimit(HTMLCanvasElement*,
++                                             unsigned parameter,
++                                             int hardware_limit);
 +
 +struct ReachWebGLCommand {
 +  base::DictValue value;
@@ -1972,7 +2033,7 @@ index 0000000..6d4db0f
 +}  // namespace blink
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_PENDING_H_
 diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index b17f336..af26033 100644
+index b17f336..cc9abfc 100644
 --- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -44,6 +44,8 @@
@@ -1984,7 +2045,32 @@ index b17f336..af26033 100644
  #include "build/build_config.h"
  #include "components/viz/common/gpu/raster_context_provider.h"
  #include "components/viz/common/resources/shared_image_format_utils.h"
-@@ -1574,6 +1576,7 @@ void WebGLRenderingContextBase::InitializeNewContext() {
+@@ -1480,11 +1482,15 @@ void WebGLRenderingContextBase::InitializeNewContext() {
+ 
+   max_texture_size_ = 0;
+   ContextGL()->GetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size_);
++  max_texture_size_ = ClampReachWebGLTextureLimit(
++      canvas(), GL_MAX_TEXTURE_SIZE, max_texture_size_);
+   max_texture_level_ =
+       WebGLTexture::ComputeLevelCount(max_texture_size_, max_texture_size_, 1);
+   max_cube_map_texture_size_ = 0;
+   ContextGL()->GetIntegerv(GL_MAX_CUBE_MAP_TEXTURE_SIZE,
+                            &max_cube_map_texture_size_);
++  max_cube_map_texture_size_ = ClampReachWebGLTextureLimit(
++      canvas(), GL_MAX_CUBE_MAP_TEXTURE_SIZE, max_cube_map_texture_size_);
+   max3d_texture_size_ = 0;
+   max3d_texture_level_ = 0;
+   max_array_texture_layers_ = 0;
+@@ -1499,6 +1505,8 @@ void WebGLRenderingContextBase::InitializeNewContext() {
+       max_cube_map_texture_size_, max_cube_map_texture_size_, 1);
+   max_renderbuffer_size_ = 0;
+   ContextGL()->GetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_renderbuffer_size_);
++  max_renderbuffer_size_ = ClampReachWebGLTextureLimit(
++      canvas(), GL_MAX_RENDERBUFFER_SIZE, max_renderbuffer_size_);
+ 
+   // These two values from EXT_draw_buffers are lazily queried.
+   max_draw_buffers_ = 0;
+@@ -1574,6 +1582,7 @@ void WebGLRenderingContextBase::InitializeNewContext() {
    // initialized. Restore it now.
    GetDrawingBuffer()->RestoreAllState();
    ActivateContext(this);
@@ -1992,7 +2078,7 @@ index b17f336..af26033 100644
  }
  
  void WebGLRenderingContextBase::SetupFlags() {
-@@ -1766,6 +1769,17 @@ void WebGLRenderingContextBase::OnErrorMessage(const char* message,
+@@ -1766,6 +1775,17 @@ void WebGLRenderingContextBase::OnErrorMessage(const char* message,
    NotifyWebGLErrorOrWarning(message);
  }
  
@@ -2010,7 +2096,7 @@ index b17f336..af26033 100644
  WebGLRenderingContextBase::HowToClear
  WebGLRenderingContextBase::ClearIfComposited(
      WebGLRenderingContextBase::ClearCaller caller,
-@@ -1805,6 +1819,8 @@ WebGLRenderingContextBase::ClearIfComposited(
+@@ -1805,6 +1825,8 @@ WebGLRenderingContextBase::ClearIfComposited(
    // clear.
    bool combined_clear =
        mask && !scissor_enabled_ && back_draw_buffer_ == GL_BACK;
@@ -2019,7 +2105,7 @@ index b17f336..af26033 100644
  
    ContextGL()->Disable(GL_SCISSOR_TEST);
    if (combined_clear && (mask & GL_COLOR_BUFFER_BIT)) {
-@@ -2455,6 +2471,8 @@ void WebGLRenderingContextBase::Reshape(int width, int height) {
+@@ -2455,6 +2477,8 @@ void WebGLRenderingContextBase::Reshape(int width, int height) {
    // buffer will also start off clear (and this matches what reshape will do).
    GetDrawingBuffer()->Resize(gfx::Size(width, height));
    GetDrawingBuffer()->MarkContentsChanged();
@@ -2028,7 +2114,7 @@ index b17f336..af26033 100644
  
    Host()->UpdateMemoryUsage();
  
-@@ -3875,6 +3893,8 @@ WebGLExtension* WebGLRenderingContextBase::EnableExtensionIfSupported(
+@@ -3875,6 +3899,8 @@ WebGLExtension* WebGLRenderingContextBase::EnableExtensionIfSupported(
      }
  
      MarkExtensionEnabled(extension->GetName());
@@ -2037,7 +2123,26 @@ index b17f336..af26033 100644
      return extension;
    }
  
-@@ -5609,6 +5629,12 @@ void WebGLRenderingContextBase::GetCurrentUnpackState(TexImageParams& params) {
+@@ -4088,15 +4114,15 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+     case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS:
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_CUBE_MAP_TEXTURE_SIZE:
+-      return GetIntParameter(script_state, pname);
++      return WebGLAny(script_state, max_cube_map_texture_size_);
+     case GL_MAX_FRAGMENT_UNIFORM_VECTORS:
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_RENDERBUFFER_SIZE:
+-      return GetIntParameter(script_state, pname);
++      return WebGLAny(script_state, max_renderbuffer_size_);
+     case GL_MAX_TEXTURE_IMAGE_UNITS:
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_TEXTURE_SIZE:
+-      return GetIntParameter(script_state, pname);
++      return WebGLAny(script_state, max_texture_size_);
+     case GL_MAX_VARYING_VECTORS:
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VERTEX_ATTRIBS:
+@@ -5609,6 +5635,12 @@ void WebGLRenderingContextBase::GetCurrentUnpackState(TexImageParams& params) {
  void WebGLRenderingContextBase::TexImageSkImage(TexImageParams params,
                                                  sk_sp<SkImage> image) {
    const char* func_name = GetTexImageFunctionName(params.function_id);
@@ -2050,7 +2155,7 @@ index b17f336..af26033 100644
  
    bool selecting_sub_rectangle = false;
    if (!ValidateTexImageSubRectangle(params, image.get(),
-@@ -5747,6 +5773,52 @@ void WebGLRenderingContextBase::TexImageSkImage(TexImageParams params,
+@@ -5747,6 +5779,52 @@ void WebGLRenderingContextBase::TexImageSkImage(TexImageParams params,
      params.height = pixmap.height();
    if (!params.depth)
      params.depth = 1;
@@ -2103,7 +2208,7 @@ index b17f336..af26033 100644
    TexImageBase(params, gl_data);
  }
  
-@@ -6192,6 +6264,59 @@ void WebGLRenderingContextBase::TexImageHelperHTMLImageElement(
+@@ -6192,6 +6270,59 @@ void WebGLRenderingContextBase::TexImageHelperHTMLImageElement(
      SynthesizeGLError(GL_INVALID_VALUE, func_name, "bad image data");
      return;
    }
@@ -2163,7 +2268,7 @@ index b17f336..af26033 100644
    TexImageSkImage(params, std::move(sk_image));
  }
  
-@@ -6824,6 +6949,7 @@ void WebGLRenderingContextBase::TexImageHelperImageBitmap(
+@@ -6824,6 +6955,7 @@ void WebGLRenderingContextBase::TexImageHelperImageBitmap(
    if (!ValidateTexImageBinding(params))
      return;
  
@@ -2171,7 +2276,7 @@ index b17f336..af26033 100644
    if (!params.width)
      params.width = bitmap->width();
    if (!params.height)
-@@ -6842,6 +6968,41 @@ void WebGLRenderingContextBase::TexImageHelperImageBitmap(
+@@ -6842,6 +6974,41 @@ void WebGLRenderingContextBase::TexImageHelperImageBitmap(
    auto static_bitmap_image = bitmap->BitmapImage();
    DCHECK(static_bitmap_image);
  
@@ -2213,7 +2318,7 @@ index b17f336..af26033 100644
    // When TexImage is called with an ImageBitmap, the values of UNPACK_FLIP_Y,
    // UNPACK_PREMULTIPLY_ALPHA, and UNPACK_COLORSPACE_CONVERSION are to be
    // ignored. Set `adjusted_params` such that no conversions will be made using
-@@ -9266,6 +9427,7 @@ void WebGLRenderingContextBase::SynthesizeGLError(
+@@ -9266,6 +9433,7 @@ void WebGLRenderingContextBase::SynthesizeGLError(
      const char* function_name,
      const char* description,
      ConsoleDisplayPreference display) {

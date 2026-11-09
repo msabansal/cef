@@ -4,6 +4,9 @@
 
 #include "cef/libcef/renderer/render_manager.h"
 
+#include "third_party/blink/renderer/core/exported/web_view_impl.h"
+#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
+
 #include <tuple>
 
 #include "build/build_config.h"
@@ -323,6 +326,17 @@ CefRefPtr<CefBrowserImpl> CefRenderManager::MaybeCreateBrowser(
   CefRefPtr<CefBrowserImpl> browser = new CefBrowserImpl(
       web_view, params->browser_id, params->config->is_popup, *config);
   browsers_.insert(std::make_pair(web_view, browser));
+
+  if (params->extra_info && params->extra_info->FindInt("reachMaxTextureSize")) {
+    const auto texture = params->extra_info->FindInt("reachMaxTextureSize");
+    const auto cube = params->extra_info->FindInt("reachMaxCubeMapTextureSize");
+    const auto renderbuffer =
+        params->extra_info->FindInt("reachMaxRenderbufferSize");
+    CHECK(texture && cube && renderbuffer);
+    blink::SetReachWebGLTextureLimits(
+        *static_cast<blink::WebViewImpl*>(web_view)->GetPage(), *texture, *cube,
+        *renderbuffer);
+  }
 
   // Notify the render process handler.
   CefRefPtr<CefApp> application = CefAppManager::Get()->GetApplication();
