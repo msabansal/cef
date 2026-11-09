@@ -1735,12 +1735,6 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
           context->ReleaseReachCanvasVideo();
           continue;
         }
-        if (!context->CheckpointReachCanvasVideo()) {
-          const auto* snapshot = context->GetReachCanvasVideo();
-          dependencies->error = snapshot ? snapshot->error()
-                                         : "Canvas video snapshot unavailable";
-          return std::nullopt;
-        }
         continue;
       }
       if (context && context->IsWebGL()) {
@@ -3671,7 +3665,47 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   if (canvas_video)
     result.canvas_video.emplace();
   blink::ReachCanvasVideo::Inventory canvas_inventory;
+  std::vector<std::pair<int, int>> canvas_sources;
+  std::optional<std::vector<std::pair<int, int>>> canvas_plan;
+  size_t canvas_index = 0;
   size_t canvas_bytes = 0;
+  if (canvas_video) {
+    for (blink::Frame* tree_frame = frame.Get(); tree_frame;
+         tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
+      if (!IsInlinePaintFrame(frame.Get(), tree_frame))
+        continue;
+      auto* tree_document =
+          blink::To<blink::LocalFrame>(tree_frame)->GetDocument();
+      if (!tree_document)
+        continue;
+      for (auto& node :
+           blink::FlatTreeTraversal::DescendantsOf(*tree_document)) {
+        auto* canvas = blink::DynamicTo<blink::HTMLCanvasElement>(node);
+        auto* context = canvas ? canvas->RenderingContext() : nullptr;
+        if (!context)
+          continue;
+        if (!dependencies.media_ids.contains(canvas->GetDomNodeId()) ||
+            context->isContextLost() || canvas->Size().IsEmpty()) {
+          context->ReleaseReachCanvasVideo();
+          continue;
+        }
+        const auto size = context->ReachCanvasVideoSize();
+        if (canvas_sources.size() == 4) {
+          result.error = "Painted canvas video stream budget exceeded";
+          return result;
+        }
+        canvas_sources.emplace_back(size.width(), size.height());
+        // Replace the previous inventory atomically before any snapshot read.
+        context->PrepareReachCanvasVideoCapture();
+      }
+      canvas_plan = blink::ReachCanvasVideo::Plan(canvas_sources);
+      if (!canvas_plan) {
+        result.error =
+            "Painted canvas video source dimensions or stream budget exceeded";
+        return result;
+      }
+    }
+  }
   for (blink::Frame* tree_frame = frame.Get(); tree_frame;
        tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
     if (!IsInlinePaintFrame(frame.Get(), tree_frame)) {
@@ -3687,6 +3721,8 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
          blink::FlatTreeTraversal::DescendantsOf(*media_document)) {
       if (auto* canvas = blink::DynamicTo<blink::HTMLCanvasElement>(node);
           canvas && canvas_video) {
+        if (!dependencies.media_ids.contains(canvas->GetDomNodeId()))
+          continue;
         if (canvas->IsOffscreenCanvasRegistered()) {
           result.error = "Worker OffscreenCanvas video is unsupported";
           return result;
@@ -3698,6 +3734,20 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
           context->ReleaseReachCanvasVideo();
           continue;
         }
+        if (!canvas_plan || canvas_index >= canvas_plan->size()) {
+          result.error = "Canvas video painted inventory changed during capture";
+          return result;
+        }
+        const auto [width, height] = (*canvas_plan)[canvas_index++];
+        const auto* previous = context->GetReachCanvasVideo();
+        if (gfx::Size(width, height) != context->ReachCanvasVideoSize() &&
+            (!previous || previous->width() != width ||
+             previous->height() != height)) {
+          logging::LogMessage(__FILE__, __LINE__, logging::LOGGING_INFO).stream()
+              << "Canvas video scaled to bounded transport size "
+              << width << "x" << height;
+        }
+        context->PrepareReachCanvasVideoCapture(gfx::Size(width, height));
         if (web_frame->Parent() || !context->CheckpointReachCanvasVideo()) {
           const auto* snapshot = context->GetReachCanvasVideo();
           result.error =
@@ -3712,6 +3762,8 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
           return result;
         }
         canvas_bytes += snapshot.rgba().size();
+        if (context->IsWebGL())
+          context->MarkLayerComposited();
         result.canvas_video->push_back(
             {static_cast<uint32_t>(canvas->GetDomNodeId()),
              document->Token().ToString(),

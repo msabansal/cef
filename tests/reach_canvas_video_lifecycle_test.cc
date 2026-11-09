@@ -44,6 +44,7 @@ struct LayoutObject {
 };
 struct HTMLCanvasElement {
   bool IsOffscreenCanvas() const { return false; }
+  bool isConnected() const { return true; }
   void NotifyGpuContextLost() {}
   LayoutObject* GetLayoutObject() { return &layout; }
   LayoutObject layout;
@@ -58,6 +59,7 @@ struct CanvasRenderingContext {
   HTMLCanvasElement* Host() { return &host; }
   void ReachCanvasVideoChanged(bool epoch);
   void ReleaseReachCanvasVideo();
+  bool reach_canvas_video_capture_prepared_ = false;
   std::unique_ptr<ReachCanvasVideo> reach_canvas_video_;
   HTMLCanvasElement host;
 };

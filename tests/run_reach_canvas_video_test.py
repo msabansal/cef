@@ -27,6 +27,8 @@ def main():
     section = next(item for item in sections if f"+++ {name}\n" in item)
     header = "\n".join(line[1:] for line in section.splitlines()
                        if line.startswith("+") and not line.startswith("+++"))
+    if args.fixture:
+        header = (args.fixture / name).read_text()
     (output / "reach_canvas_video.h").write_text(header + "\n")
     def method_body(text, signature, result_type="void"):
         start = text.index(result_type + " " + signature + "(")
@@ -42,6 +44,8 @@ def main():
         "AttachCanvasVideo")
     (output / "reach_canvas_video_ipc.inc").write_text(packing)
     sources = ["reach_canvas_video_test", "reach_canvas_video_ipc_test"]
+    if "ReleaseAdmission()" in header:
+        sources.append("reach_canvas_video_painted_test")
     if args.fixture:
         hooks = []
         methods = [
