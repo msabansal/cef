@@ -3743,8 +3743,9 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
         if (gfx::Size(width, height) != context->ReachCanvasVideoSize() &&
             (!previous || previous->width() != width ||
              previous->height() != height)) {
-          LOG(INFO) << "Canvas video scaled to bounded transport size "
-                    << width << "x" << height;
+          logging::LogMessage(__FILE__, __LINE__, logging::LOGGING_INFO).stream()
+              << "Canvas video scaled to bounded transport size "
+              << width << "x" << height;
         }
         context->PrepareReachCanvasVideoCapture(gfx::Size(width, height));
         if (web_frame->Parent() || !context->CheckpointReachCanvasVideo()) {
