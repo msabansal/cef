@@ -43,7 +43,7 @@ Chromium's original path. This patch targets Chromium `156.0.8078.0`.
 | `media_journal.patch` | Ordered same-thread MediaSource operations. |
 | `webgl_commands.patch` | Converted WebGL commands, resources, retirement and client composition. |
 | `canvas_video.patch` | Explicit opt-in per-canvas owned RGBA snapshots and paint markers. |
-| `canvas_video_all.patch` | Apply that transport selection to painted Canvas2D as well as WebGL, restoring native raster providers only for canvas video. Preflight the complete painted inventory before snapshots; hidden source buffers stay native without streams. HTML remains command replay; unsupported snapshots fail explicitly. |
+| `canvas_video_all.patch` | Apply that transport selection to painted Canvas2D as well as WebGL, restoring native raster providers only for canvas video. Preflight the complete painted inventory before snapshots; hidden source buffers stay native without streams. Uniformly downsample oversized painted inventories within the unchanged transport pixel, snapshot and codec budgets; keep native canvas dimensions and page semantics unchanged. HTML remains command replay; unsupported source dimensions or snapshots fail explicitly. |
 | `display_lock_unlock.patch` | Reach-maintained backport of upstream `491571b360` (crbug.com/40063752), not original Reach authorship. |
 | `simplified_layout_lock.patch` | Preserve descendant state across display-locked simplified layout. |
 | `canvaskit_picture_images.patch` | Skia/CanvasKit original-image resources and ordered media substitution. |

@@ -4,6 +4,21 @@
 #include <iostream>
 
 int main() {
+  const std::vector<std::pair<int, int>> small{{71, 37}, {73, 39}};
+  assert(blink::ReachCanvasVideo::Plan(small) == small);
+  const auto maps = blink::ReachCanvasVideo::Plan({{2816, 1792}});
+  assert(maps && maps->size() == 1);
+  assert(maps->front().first < 2816 && maps->front().second < 1792);
+  const auto many = blink::ReachCanvasVideo::Plan(
+      {{3840, 2160}, {3840, 2160}, {3840, 2160}, {3840, 2160}});
+  assert(many && many->size() == 4);
+  blink::ReachCanvasVideo::Inventory inventory;
+  for (const auto& [width, height] : *many)
+    assert(inventory.Add(width, height));
+  assert(!blink::ReachCanvasVideo::Plan({{4096, 4096}}));
+  assert(!blink::ReachCanvasVideo::Plan(
+      {{1, 1}, {1, 1}, {1, 1}, {1, 1}, {1, 1}}));
+
   auto budget = std::make_shared<blink::ReachCanvasVideo::Budget>();
   blink::ReachCanvasVideo visible;
   visible.SetBudget(budget);
