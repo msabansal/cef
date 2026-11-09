@@ -1,0 +1,322 @@
+diff --git third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
+index 085dad1..81b28fd 100644
+--- third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
++++ third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
+@@ -80,12 +80,16 @@ void CanvasRenderingContext::SetReachCanvasVideoChangeCallback(
+ }
+ 
+ void CanvasRenderingContext::ReachCanvasVideoChanged(bool epoch) {
+-  if (!Canvas2DBitmapProvider::IsReachWebGLVideoMode() || !IsWebGL() ||
++  if (!Canvas2DBitmapProvider::IsReachWebGLVideoMode() ||
+       !Host() || Host()->IsOffscreenCanvas())
+     return;
++  auto* canvas = static_cast<HTMLCanvasElement*>(Host());
++  if (!canvas->isConnected()) {
++    ReleaseReachCanvasVideo();
++    return;
++  }
+   if (!reach_canvas_video_) {
+     reach_canvas_video_ = std::make_unique<ReachCanvasVideo>();
+-    auto* canvas = static_cast<HTMLCanvasElement*>(Host());
+     // Replace any cached paint recorded while this context was lost.
+     if (auto* layout = canvas->GetLayoutObject())
+       layout->SetShouldDoFullPaintInvalidation();
+@@ -98,6 +102,10 @@ void CanvasRenderingContext::ReachCanvasVideoChanged(bool epoch) {
+     reach_canvas_video_change_callback(static_cast<HTMLCanvasElement*>(Host()));
+ }
+ 
++gfx::Size CanvasRenderingContext::ReachCanvasVideoSize() const {
++  return Host() ? Host()->Size() : gfx::Size();
++}
++
+ void CanvasRenderingContext::ReleaseReachCanvasVideo() {
+   if (!reach_canvas_video_)
+     return;
+@@ -113,7 +121,7 @@ void CanvasRenderingContext::ReleaseReachCanvasVideo() {
+ }
+ 
+ bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
+-  if (!Canvas2DBitmapProvider::IsReachWebGLVideoMode() || !IsWebGL())
++  if (!Canvas2DBitmapProvider::IsReachWebGLVideoMode())
+     return true;
+   if (!Host() || Host()->IsOffscreenCanvas())
+     return false;
+@@ -127,11 +135,11 @@ bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
+     ReachCanvasVideoChanged();
+   auto& capture = *reach_canvas_video_;
+   if (frame->LocalFrameRoot().Tree().Parent())
+-    return capture.Fail("Out-of-process WebGL video is unsupported");
++    return capture.Fail("Out-of-process canvas video is unsupported");
+   if (isContextLost())
+-    return capture.Fail("WebGL video context is lost");
++    return capture.Fail("Canvas video context is lost");
+   if (!ReachCanvasVideoIsSDR())
+-    return capture.Fail("HDR or F16 WebGL video is unsupported");
++    return capture.Fail("HDR or F16 canvas video is unsupported");
+   using Budgets =
+       std::map<LocalFrame*, std::weak_ptr<ReachCanvasVideo::Budget>>;
+   static base::NoDestructor<Budgets> budgets;
+@@ -147,15 +155,17 @@ bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
+   const auto size = ReachCanvasVideoSize();
+   if (size != canvas->Size())
+     return capture.Fail(
+-        "WebGL video drawing buffer differs from logical canvas");
++        "Canvas video drawing buffer differs from logical canvas");
+   auto* document = &canvas->GetDocument();
+   return capture.Checkpoint(size.width(), size.height(), [&] {
+-    auto snapshot = GetRGBAUnacceleratedStaticBitmapImage(kBackBuffer);
++    auto snapshot = IsWebGL()
++                        ? GetRGBAUnacceleratedStaticBitmapImage(kBackBuffer)
++                        : PaintRenderingResultsToSnapshot(kBackBuffer);
+     if (!snapshot || snapshot->GetSize() != size ||
+         snapshot->GetColorSpace().IsHDR() ||
+         snapshot->PaintImageForCurrentFrame().GetColorType() ==
+             kRGBA_F16_SkColorType) {
+-      capture.Fail("WebGL video SDR snapshot unavailable");
++      capture.Fail("Canvas video SDR snapshot unavailable");
+       return std::vector<uint8_t>();
+     }
+     const auto info =
+@@ -165,7 +175,7 @@ bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
+     if (!canvas->isConnected() || canvas->RenderingContext() != this ||
+         &canvas->GetDocument() != document || !frame->IsAttached() ||
+         isContextLost() || ReachCanvasVideoSize() != size) {
+-      capture.Fail("WebGL video context changed during snapshot");
++      capture.Fail("Canvas video context changed during snapshot");
+       return std::vector<uint8_t>();
+     }
+     return std::vector<uint8_t>(bytes.begin(), bytes.end());
+diff --git third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
+index 78d7ea7..7811c75 100644
+--- third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
++++ third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
+@@ -144,8 +144,8 @@ class CORE_EXPORT CanvasRenderingContext
+   void ReachCanvasVideoChanged(bool epoch = false);
+   void ReleaseReachCanvasVideo();
+   bool CheckpointReachCanvasVideo();
+-  virtual gfx::Size ReachCanvasVideoSize() const { return {}; }
+-  virtual bool ReachCanvasVideoIsSDR() const { return false; }
++  virtual gfx::Size ReachCanvasVideoSize() const;
++  virtual bool ReachCanvasVideoIsSDR() const { return true; }
+   static void SetReachCanvasVideoChangeCallback(void (*)(HTMLCanvasElement*));
+ 
+   // ActiveScriptWrappable
+diff --git third_party/blink/renderer/core/html/canvas/html_canvas_element.cc third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index 937b02c..ea967e4 100644
+--- third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -690,6 +690,8 @@ void HTMLCanvasElement::DidDraw(const gfx::Rect& rect) {
+   if (rect.IsEmpty()) {
+     return;
+   }
++  if (context_ && !context_->IsWebGL())
++    context_->ReachCanvasVideoChanged();
+ 
+   // To avoid issuing invalidations multiple times, we can check |dirty_rect_|
+   // and only issue invalidations the first time it becomes non-empty.
+@@ -1337,9 +1339,9 @@ void HTMLCanvasElement::Paint(GraphicsContext& context,
+ 
+ void HTMLCanvasElement::PaintInternal(GraphicsContext& context,
+                                       const PhysicalRect& r) {
+-  if ((Canvas2DBitmapProvider::IsReachWebGLCommandMode() ||
+-       Canvas2DBitmapProvider::IsReachWebGLVideoMode()) &&
+-      IsReachMediaCapture() && IsWebGL()) {
++  if (IsReachMediaCapture() && RenderingContext() &&
++      ((Canvas2DBitmapProvider::IsReachWebGLCommandMode() && IsWebGL()) ||
++       Canvas2DBitmapProvider::IsReachWebGLVideoMode())) {
+     if (!RenderingContext()->CheckpointReachCanvasVideo())
+       return;
+     auto* target = context.Canvas();
+@@ -1348,10 +1350,11 @@ void HTMLCanvasElement::PaintInternal(GraphicsContext& context,
+     target->scale(r.Width(), r.Height());
+     target->clipRect(SkRect::MakeWH(1, 1));
+     target->recordCustomData(GetDomNodeId());
+-    RenderingContext()->MarkLayerComposited();
++    if (IsWebGL())
++      RenderingContext()->MarkLayerComposited();
+     return;
+   }
+-  if (Canvas2DBitmapProvider::IsReachCommandMode() &&
++  if (Canvas2DBitmapProvider::IsReachCanvasCommandMode() &&
+       IsRenderingContext2D()) {
+     RenderingContext()->FlushCanvas(FlushReason::kPrinting);
+     const auto& recording = RenderingContext()->GetLastRecording();
+diff --git third_party/blink/renderer/core/paint/html_canvas_painter.cc third_party/blink/renderer/core/paint/html_canvas_painter.cc
+index 6f0eb64..63cc67c 100644
+--- third_party/blink/renderer/core/paint/html_canvas_painter.cc
++++ third_party/blink/renderer/core/paint/html_canvas_painter.cc
+@@ -68,10 +68,10 @@ void HTMLCanvasPainter::PaintReplaced(const PaintInfo& paint_info,
+     return;
+   }
+ 
+-  const bool reach_webgl_commands =
+-      (Canvas2DBitmapProvider::IsReachWebGLCommandMode() ||
+-       Canvas2DBitmapProvider::IsReachWebGLVideoMode()) &&
+-      IsReachMediaCapture() && canvas->IsWebGL();
++  const bool reach_canvas_commands =
++      IsReachMediaCapture() &&
++      ((Canvas2DBitmapProvider::IsReachWebGLCommandMode() && canvas->IsWebGL()) ||
++       Canvas2DBitmapProvider::IsReachWebGLVideoMode());
+   if (auto* layer = canvas->ContentsCcLayer()) {
+     // TODO(crbug.com/705019): For a texture layer canvas, setting the layer
+     // background color to an opaque color will cause the layer to be treated as
+@@ -85,7 +85,7 @@ void HTMLCanvasPainter::PaintReplaced(const PaintInfo& paint_info,
+     }
+     // We do not take the foreign layer code path when printing because it
+     // prevents painting canvas content as vector graphics.
+-    if (!reach_webgl_commands && !paint_info.ShouldOmitCompositingInfo() &&
++    if (!reach_canvas_commands && !paint_info.ShouldOmitCompositingInfo() &&
+         !canvas->IsPrinting()) {
+       gfx::Rect pixel_snapped_rect = ToPixelSnappedRect(paint_rect);
+       layer->SetBounds(pixel_snapped_rect.size());
+diff --git third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
+index dcf8225..29b7297 100644
+--- third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
++++ third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
+@@ -225,6 +225,7 @@ V8RenderingContext* CanvasRenderingContext2D::AsV8RenderingContext() {
+ CanvasRenderingContext2D::~CanvasRenderingContext2D() = default;
+ 
+ void CanvasRenderingContext2D::ResetInternal() {
++  ReachCanvasVideoChanged(true);
+   if (IsHibernating()) {
+     CanvasHibernationHandler::ReportHibernationEvent(
+         CanvasHibernationHandler::HibernationEvent::kHibernationEndedOnReset);
+@@ -354,7 +355,7 @@ bool CanvasRenderingContext2D::WritePixels(const SkImageInfo& orig_info,
+                                            size_t row_bytes,
+                                            int x,
+                                            int y) {
+-  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++  if (Canvas2DBitmapProvider::IsReachCanvasCommandMode()) {
+     reach_recording_failed_ = true;
+     last_recording_.reset();
+     return false;
+@@ -511,7 +512,7 @@ MemoryManagedPaintCanvas* CanvasRenderingContext2D::GetOrCreatePaintCanvas() {
+ 
+ void CanvasRenderingContext2D::RecordingCleared() {
+   BaseRenderingContext2D::RecordingCleared();
+-  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++  if (Canvas2DBitmapProvider::IsReachCanvasCommandMode()) {
+     last_recording_.reset();
+     reach_recording_failed_ = false;
+   }
+@@ -548,7 +549,7 @@ std::optional<cc::PaintRecord> CanvasRenderingContext2D::FlushCanvas(
+   if (!canvas()) {
+     return std::nullopt;
+   }
+-  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++  if (Canvas2DBitmapProvider::IsReachCanvasCommandMode()) {
+     auto* recorder = Recorder();
+     if (!recorder || !recorder->HasReleasableDrawOps()) {
+       return std::nullopt;
+@@ -822,11 +823,15 @@ CanvasRenderingContext2D::PaintRenderingResultsToResource(
+ scoped_refptr<StaticBitmapImage>
+ CanvasRenderingContext2D::PaintRenderingResultsToSnapshot(
+     SourceDrawingBuffer source_buffer) {
+-  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++  if (Canvas2DBitmapProvider::IsReachCanvasCommandMode()) {
+     reach_recording_failed_ = true;
+     last_recording_.reset();
+     return nullptr;
+   }
++  if (Canvas2DBitmapProvider::IsReachWebGLVideoMode() &&
++      !IsResourceProviderValid() && !GetOrCreatePaintCanvas()) {
++    return nullptr;
++  }
+   if (!IsResourceProviderValid()) {
+     return nullptr;
+   }
+@@ -847,7 +852,7 @@ bool CanvasRenderingContext2D::CanCreateResourceProvider() {
+ }
+ 
+ scoped_refptr<StaticBitmapImage> blink::CanvasRenderingContext2D::GetImage() {
+-  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++  if (Canvas2DBitmapProvider::IsReachCanvasCommandMode()) {
+     if (!GetOrCreatePaintCanvas() || isContextLost()) {
+       return nullptr;
+     }
+@@ -892,7 +897,7 @@ ImageData* CanvasRenderingContext2D::getImageDataInternal(
+     int sh,
+     ImageDataSettings* image_data_settings,
+     ExceptionState& exception_state) {
+-  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++  if (Canvas2DBitmapProvider::IsReachCanvasCommandMode()) {
+     reach_recording_failed_ = true;
+     last_recording_.reset();
+   }
+@@ -1204,7 +1209,7 @@ void CanvasRenderingContext2D::Dispose() {
+ void CanvasRenderingContext2D::CreateProvider() {
+   CHECK(!shared_image_provider_ && !bitmap_provider_);
+ 
+-  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++  if (Canvas2DBitmapProvider::IsReachCanvasCommandMode()) {
+     bitmap_provider_ = Canvas2DBitmapProvider::CreateWithClear(
+         canvas()->Size(), color_params_.GetSharedImageFormat(),
+         color_params_.GetAlphaType(), color_params_.GetGfxColorSpace(),
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
+index 788efd3..5118b84 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
++++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
+@@ -44,6 +44,10 @@ bool Canvas2DBitmapProvider::IsReachCommandMode() {
+       "reach-drawing-commands");
+ }
+ 
++bool Canvas2DBitmapProvider::IsReachCanvasCommandMode() {
++  return IsReachCommandMode() && !IsReachWebGLVideoMode();
++}
++
+ bool Canvas2DBitmapProvider::IsReachWebGLCommandMode() {
+   static const bool enabled = [] {
+     auto environment = base::Environment::Create();
+@@ -164,7 +168,7 @@ Canvas2DBitmapProvider::GetOrCreateSWCanvasImageProvider() {
+ 
+ scoped_refptr<StaticBitmapImage> Canvas2DBitmapProvider::Snapshot(
+     ImageOrientation orientation) {
+-  if (IsReachCommandMode()) {
++  if (IsReachCanvasCommandMode()) {
+     return nullptr;
+   }
+   TRACE_EVENT0("blink", "Canvas2DBitmapProvider::Snapshot");
+@@ -243,7 +247,7 @@ void Canvas2DBitmapProvider::ApplyAnimatedImageFrameIndexesForId(
+ }
+ 
+ void Canvas2DBitmapProvider::ClearAtCreation() {
+-  if (IsReachCommandMode()) {
++  if (IsReachCanvasCommandMode()) {
+     return;
+   }
+   DCHECK(IsValid());
+@@ -258,7 +262,7 @@ void Canvas2DBitmapProvider::ClearAtCreation() {
+ }
+ 
+ void Canvas2DBitmapProvider::RasterRecord(cc::PaintRecord last_recording) {
+-  CHECK(!IsReachCommandMode());
++  CHECK(!IsReachCanvasCommandMode());
+   if (!skia_canvas_) {
+     skia_canvas_ = std::make_unique<cc::SkiaPaintCanvas>(
+         GetSkSurface()->getCanvas(), GetOrCreateSWCanvasImageProvider());
+@@ -279,7 +283,7 @@ bool Canvas2DBitmapProvider::WritePixels(const SkImageInfo& orig_info,
+                                         size_t row_bytes,
+                                         int x,
+                                         int y) {
+-  if (IsReachCommandMode()) {
++  if (IsReachCanvasCommandMode()) {
+     return false;
+   }
+   TRACE_EVENT0("blink", "Canvas2DBitmapProvider::WritePixels");
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
+index 6ead245..b95e49b 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
++++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
+@@ -70,10 +70,11 @@ class PLATFORM_EXPORT Canvas2DBitmapProvider final
+   ~Canvas2DBitmapProvider() override;
+ 
+   static bool IsReachCommandMode();
++  static bool IsReachCanvasCommandMode();
+   static bool IsReachWebGLCommandMode();
+   static bool IsReachWebGLVideoMode();
+   static std::atomic_size_t& ReachWebGLPendingBytes();
+-  bool IsValid() const { return IsReachCommandMode() || GetSkSurface(); }
++  bool IsValid() const { return IsReachCanvasCommandMode() || GetSkSurface(); }
+   void SetDelegate(CanvasResourceProviderDelegate* delegate) {
+     delegate_ = delegate;
+   }

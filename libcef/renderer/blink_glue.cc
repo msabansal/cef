@@ -1725,23 +1725,25 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
         dependencies->error = "Worker OffscreenCanvas video is unsupported";
         return std::nullopt;
       }
-      if (context && context->IsWebGL()) {
-        if (!dependencies->raster &&
-            blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode()) {
-          if (web_frame->Parent()) {
-            dependencies->error = "Out-of-process WebGL video is unsupported";
-            return std::nullopt;
-          }
-          if (context->isContextLost())
-            continue;
-          if (!context->CheckpointReachCanvasVideo()) {
-            const auto* snapshot = context->GetReachCanvasVideo();
-            dependencies->error = snapshot ? snapshot->error()
-                                           : "WebGL video snapshot unavailable";
-            return std::nullopt;
-          }
+      if (context && !dependencies->raster &&
+          blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode()) {
+        if (web_frame->Parent()) {
+          dependencies->error = "Out-of-process canvas video is unsupported";
+          return std::nullopt;
+        }
+        if (context->isContextLost() || element->Size().IsEmpty()) {
+          context->ReleaseReachCanvasVideo();
           continue;
         }
+        if (!context->CheckpointReachCanvasVideo()) {
+          const auto* snapshot = context->GetReachCanvasVideo();
+          dependencies->error = snapshot ? snapshot->error()
+                                         : "Canvas video snapshot unavailable";
+          return std::nullopt;
+        }
+        continue;
+      }
+      if (context && context->IsWebGL()) {
         const auto size = element->Size();
         const uint64_t pixels =
             uint64_t(std::max(0, size.width())) * std::max(0, size.height());
@@ -3690,19 +3692,23 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
           return result;
         }
         auto* context = canvas->RenderingContext();
-        if (!context || !context->IsWebGL() || context->isContextLost())
+        if (!context)
           continue;
+        if (context->isContextLost() || canvas->Size().IsEmpty()) {
+          context->ReleaseReachCanvasVideo();
+          continue;
+        }
         if (web_frame->Parent() || !context->CheckpointReachCanvasVideo()) {
           const auto* snapshot = context->GetReachCanvasVideo();
           result.error =
-              snapshot ? snapshot->error() : "WebGL video snapshot unavailable";
+              snapshot ? snapshot->error() : "Canvas video snapshot unavailable";
           return result;
         }
         const auto& snapshot = *context->GetReachCanvasVideo();
         if (!canvas_inventory.Add(snapshot.width(), snapshot.height()) ||
             snapshot.rgba().empty() ||
             snapshot.rgba().size() > 16 * 1024 * 1024 - canvas_bytes) {
-          result.error = "WebGL video inventory budget exceeded";
+          result.error = "Canvas video inventory budget exceeded";
           return result;
         }
         canvas_bytes += snapshot.rgba().size();
@@ -3723,7 +3729,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
           state.Set("height", snapshot.height());
           auto json = base::WriteJson(state);
           if (!json) {
-            result.error = "WebGL video state serialization failed";
+            result.error = "Canvas video state serialization failed";
             return result;
           }
           media_states.emplace(
