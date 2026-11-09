@@ -428,7 +428,7 @@ new file mode 100644
 index 0000000..57d40d8
 --- /dev/null
 +++ third_party/blink/renderer/platform/graphics/reach_canvas_video.h
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,171 @@
 +#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_CANVAS_VIDEO_H_
 +#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_CANVAS_VIDEO_H_
 +
@@ -446,20 +446,24 @@ index 0000000..57d40d8
 +// CPU-owned current content, never a queue of rendered historical frames.
 +class ReachCanvasVideo {
 + public:
++  static constexpr uint64_t kMaxCodecBytes = 320 * 1024 * 1024;
++  static constexpr uint64_t kStreamCodecBytes = 4 * 1024 * 1024;
++  static constexpr unsigned kMaxStreams =
++      kMaxCodecBytes / (16 * 16 * 64 + kStreamCodecBytes);
++
 +  struct Inventory {
 +    bool Add(int width, int height) {
-+      if (width < 1 || height < 1 || width > 3840 || height > 2160 ||
-+          count == 4)
++      if (width < 1 || height < 1 || width > 3840 || height > 2160)
 +        return false;
 +      const uint64_t even = uint64_t((width + 1) & ~1) * ((height + 1) & ~1);
 +      const uint64_t coded =
 +          uint64_t((width + 15) & ~15) * ((height + 15) & ~15);
 +      if (pixels + even > 4194304 ||
-+          codec + coded * 64 + 4 * 1024 * 1024 > 320 * 1024 * 1024)
++          codec + coded * 64 + kStreamCodecBytes > kMaxCodecBytes)
 +        return false;
 +      ++count;
 +      pixels += even;
-+      codec += coded * 64 + 4 * 1024 * 1024;
++      codec += coded * 64 + kStreamCodecBytes;
 +      return true;
 +    }
 +    unsigned count = 0;

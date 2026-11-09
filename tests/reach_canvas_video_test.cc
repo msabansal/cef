@@ -39,7 +39,8 @@ int main() {
   assert(inventory.Add(3840, 1080));
   assert(!inventory.Add(400, 400));  // Even-padded aggregate exceeds 4M.
   blink::ReachCanvasVideo::Inventory odd;
-  assert(odd.Add(1, 1) && odd.Add(1, 1) && odd.Add(1, 1) && odd.Add(1, 1));
+  for (unsigned index = 0; index < 79; ++index)
+    assert(odd.Add(1, 1));
   assert(!odd.Add(1, 1));
   blink::ReachCanvasVideo::Inventory full;
   assert(full.Add(2047, 2047));

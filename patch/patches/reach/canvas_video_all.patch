@@ -411,13 +411,12 @@ diff --git third_party/blink/renderer/platform/graphics/reach_canvas_video.h thi
 index 57d40d8..4fdaa28 100644
 --- third_party/blink/renderer/platform/graphics/reach_canvas_video.h
 +++ third_party/blink/renderer/platform/graphics/reach_canvas_video.h
-@@ -1,11 +1,14 @@
+@@ -1,11 +1,13 @@
  #ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_CANVAS_VIDEO_H_
  #define THIRD_PARTY_BLINK_RENDERER_PLATFORM_GRAPHICS_REACH_CANVAS_VIDEO_H_
  
 +#include <algorithm>
  #include <atomic>
-+#include <cmath>
  #include <cstdint>
  #include <limits>
  #include <map>
@@ -426,41 +425,49 @@ index 57d40d8..4fdaa28 100644
  #include <string>
  #include <utility>
  #include <vector>
-@@ -51,6 +54,33 @@ class ReachCanvasVideo {
+@@ -55,6 +57,41 @@ class ReachCanvasVideo {
      std::map<uint64_t, std::pair<int, int>> active;
    };
  
 +  static std::optional<std::vector<std::pair<int, int>>> Plan(
 +      const std::vector<std::pair<int, int>>& sources) {
-+    if (sources.size() > 4)
++    if (sources.size() > kMaxStreams)
 +      return std::nullopt;
-+    uint64_t pixels = 0;
 +    for (const auto& [width, height] : sources) {
 +      if (width < 1 || height < 1 || width > 3840 || height > 2160)
 +        return std::nullopt;
-+      pixels += uint64_t((width + 1) & ~1) * ((height + 1) & ~1);
 +    }
-+    double scale = pixels ? std::min(1.0, std::sqrt(4194304.0 / pixels)) : 1;
-+    for (unsigned attempt = 0; attempt < 64; ++attempt, scale *= 0.99) {
++    // A scale step changes every supported source dimension by less than
++    // one pixel. Search admission directly, including codec block padding.
++    constexpr int kScaleUnits = 4096;
++    int lower = 0;
++    int upper = kScaleUnits;
++    std::optional<std::vector<std::pair<int, int>>> best;
++    while (lower <= upper) {
++      const int scale = lower + (upper - lower) / 2;
 +      Inventory inventory;
 +      std::vector<std::pair<int, int>> planned;
 +      for (const auto& [width, height] : sources) {
-+        const int w = std::max(1, static_cast<int>(width * scale));
-+        const int h = std::max(1, static_cast<int>(height * scale));
++        const int w = std::max(1, width * scale / kScaleUnits);
++        const int h = std::max(1, height * scale / kScaleUnits);
 +        if (!inventory.Add(w, h))
 +          break;
 +        planned.emplace_back(w, h);
 +      }
-+      if (planned.size() == sources.size())
-+        return planned;
++      if (planned.size() == sources.size()) {
++        best = std::move(planned);
++        lower = scale + 1;
++      } else {
++        upper = scale - 1;
++      }
 +    }
-+    return std::nullopt;
++    return best;
 +  }
 +
    ReachCanvasVideo() : stream_(AllocateStream()) {
      if (!stream_)
        Fail("WebGL video stream identity exhausted");
-@@ -66,6 +96,10 @@ class ReachCanvasVideo {
+@@ -70,6 +107,10 @@ class ReachCanvasVideo {
        Epoch();
      }
    }
