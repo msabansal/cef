@@ -67,6 +67,7 @@
 #include "third_party/blink/renderer/core/events/pointer_event_factory.h"
 #include "third_party/blink/renderer/core/editing/serializers/serialization.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+#include "third_party/blink/renderer/core/exported/web_view_impl.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_state_observer.h"
 #include "third_party/blink/renderer/core/frame/frame_owner.h"
 #include "third_party/blink/renderer/core/frame/local_dom_window.h"
@@ -1880,6 +1881,15 @@ blink::ExecutionContext* GetExecutionContext(v8::Local<v8::Context> context) {
 }
 
 }  // namespace
+
+void SetWebGlTextureLimits(blink::WebView* view,
+                          int texture,
+                          int cube,
+                          int renderbuffer) {
+  blink::SetReachWebGLTextureLimits(
+      *static_cast<blink::WebViewImpl*>(view)->GetPage(), texture, cube,
+      renderbuffer);
+}
 
 bool CanGoBack(blink::WebView* view) {
   if (!view) {

@@ -4,9 +4,6 @@
 
 #include "cef/libcef/renderer/render_manager.h"
 
-#include "third_party/blink/renderer/core/exported/web_view_impl.h"
-#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
-
 #include <tuple>
 
 #include "build/build_config.h"
@@ -333,9 +330,7 @@ CefRefPtr<CefBrowserImpl> CefRenderManager::MaybeCreateBrowser(
     const auto renderbuffer =
         params->extra_info->FindInt("reachMaxRenderbufferSize");
     CHECK(texture && cube && renderbuffer);
-    blink::SetReachWebGLTextureLimits(
-        *static_cast<blink::WebViewImpl*>(web_view)->GetPage(), *texture, *cube,
-        *renderbuffer);
+    blink_glue::SetWebGlTextureLimits(web_view, *texture, *cube, *renderbuffer);
   }
 
   // Notify the render process handler.
