@@ -107,7 +107,7 @@ source folder.
 | File in `patches/reach/` | Generation/baseline | SHA256 |
 | --- | --- | --- |
 | `cef_command_export.patch` | Complete 33-section native delta from CEF `e537569ecda2e3f23ffdac559ecf7f80b8e59467` through `3ab5aef4270f83afdc4eb8b19fc001e18ccc5d08`; not an extra overlay or a snapshot of later documentation moves. | `123f5678331bd2d3f1ddfdd7ccd007454ee0bf69bfb3140ad246eb3141390d32` |
-| `skia_command_export.patch` | Full modified-client delta against Skia `a02d4982d7658aa18fbbdc8f136776a76e6d771f`. | `057a5170b132d7256f1e4463e8224c0adddc1b872d12c17c8d5a1f2d2e9a67a4` |
+| `skia_command_export.patch` | Previously qualified full modified-client delta against Skia `a02d4982d7658aa18fbbdc8f136776a76e6d771f`. | `31115c7a290fb259bb9927fe54e83b93b4869f664ac4a4d270c987e25d6c0587` |
 | `skia_webgpu_graphite.patch` | Client-only Graphite/WebGPU delta layered after `skia_command_export.patch` on that same Skia baseline. | `db8cc2fb1eee0367fc13c1c4882fa5ba5b76497f15d2fbd98cc84491b303ca29` |
 
 The frozen Chromium revision is
@@ -119,14 +119,12 @@ For a new client snapshot, generate the full diff from the recorded clean Skia
 baseline, keeping the layered Graphite delta separate. Do not regenerate these
 frozen files merely to rename them.
 
-The current client snapshot includes an opt-in Ganesh picture-shader submission
-threshold, enabled only by CanvasKit's WebGL context factory at 64 MiB of newly
-queued tile bytes. Submission waits for the GPU at completed outermost Device
-draws; nested draw/shader construction and flush callbacks cannot re-enter it.
-Tile dimensions, transforms, sampling, color and exact cache keys are unchanged.
-This is not a hard memory cap: one outermost draw can exceed the threshold.
-The registered server patches are unchanged. This client-only candidate requires
-new CanvasKit builds and actual panorama/pixel/memory qualification before release.
+This release source pairs all-canvas capture with the previously qualified
+CanvasKit snapshot. It does not promote the guarded picture-shader candidate
+from `0cba64fc9388248113ff5f56ccb00ae5a82ecf24`; that source remains preserved
+on `master`. Registered server-side Skia patches are unchanged from the parent
+all-canvas candidate. The new native revision still requires its own matched
+build and qualification.
 
 Reach staging accepts the renamed source inputs but deliberately retains the
 artifact-internal paths `provenance/skia-command-export.patch` and
