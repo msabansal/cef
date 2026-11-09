@@ -142,7 +142,7 @@ index 937b02c..ea967e4 100644
      RenderingContext()->FlushCanvas(FlushReason::kPrinting);
      const auto& recording = RenderingContext()->GetLastRecording();
 diff --git third_party/blink/renderer/core/paint/html_canvas_painter.cc third_party/blink/renderer/core/paint/html_canvas_painter.cc
-index 6f0eb64..63cc67c 100644
+index 6f0eb64..11a4f9c 100644
 --- third_party/blink/renderer/core/paint/html_canvas_painter.cc
 +++ third_party/blink/renderer/core/paint/html_canvas_painter.cc
 @@ -68,10 +68,10 @@ void HTMLCanvasPainter::PaintReplaced(const PaintInfo& paint_info,
@@ -169,6 +169,15 @@ index 6f0eb64..63cc67c 100644
          !canvas->IsPrinting()) {
        gfx::Rect pixel_snapped_rect = ToPixelSnappedRect(paint_rect);
        layer->SetBounds(pixel_snapped_rect.size());
+@@ -109,7 +109,7 @@ void HTMLCanvasPainter::PaintReplaced(const PaintInfo& paint_info,
+       context, InterpolationQualityForCanvas(layout_html_canvas_.StyleRef()),
+       layout_html_canvas_.StyleRef().GetDynamicRangeLimit());
+   canvas->Paint(context, paint_rect,
+-                reach_webgl_commands || paint_info.ShouldOmitCompositingInfo());
++                reach_canvas_commands || paint_info.ShouldOmitCompositingInfo());
+ }
+ 
+ }  // namespace blink
 diff --git third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
 index dcf8225..29b7297 100644
 --- third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
