@@ -44,6 +44,8 @@ def main():
         "AttachCanvasVideo")
     (output / "reach_canvas_video_ipc.inc").write_text(packing)
     sources = ["reach_canvas_video_test", "reach_canvas_video_ipc_test"]
+    if "ReleaseAdmission()" in header:
+        sources.append("reach_canvas_video_painted_test")
     if args.fixture:
         hooks = []
         methods = [
