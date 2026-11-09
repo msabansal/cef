@@ -635,10 +635,10 @@ index 0000000..6a04ffa
 +#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_REACH_WEBGL_CALL_H_
 diff --git third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
 new file mode 100644
-index 0000000..9df53ca
+index 0000000..a5558ae
 --- /dev/null
 +++ third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc
-@@ -0,0 +1,764 @@
+@@ -0,0 +1,768 @@
 +#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 +
 +#include <algorithm>
@@ -1129,13 +1129,17 @@ index 0000000..9df53ca
 +      command.error = "WebGL program attribute name is invalid";
 +      return;
 +    }
++    const std::string attribute_name(name.data(), length);
++    // ANGLE may enumerate built-ins, which have no bindable vertex location.
++    if (attribute_name.starts_with("gl_"))
++      continue;
 +    const GLint location =
 +        gl->GetAttribLocation(program->Object(), name.data());
 +    if (location < 0 || location > 31) {
 +      command.error = "WebGL program attribute location is invalid";
 +      return;
 +    }
-+    attributes.Set(std::string(name.data(), length), location);
++    attributes.Set(attribute_name, location);
 +  }
 +  command.value.Set("attributes", std::move(attributes));
 +  if (!context_->IsWebGL2())

@@ -43,7 +43,9 @@ struct DictValue {
 struct GL {
   GLint linked = 1;
   GLint attributes = 2;
-  GLint attribute_length = 9;
+  GLint attribute_length = 16;
+  std::vector<std::string> attribute_names{"position", "color"};
+  std::vector<GLint> attribute_locations{3, 7};
   GLint blocks = 1;
   GLint block_length = 12;
   bool lose_on_block_query = false;
@@ -68,16 +70,21 @@ struct GL {
   }
   void GetActiveAttrib(GLuint program, GLuint index, GLsizei capacity,
                        GLsizei* length, GLint* size, GLenum* type, char* name) {
-    assert(program == 17 && index < 2 && capacity >= 9);
-    const char* text = index == 0 ? "position" : "color";
+    assert(program == 17 && index < attribute_names.size());
+    const char* text = attribute_names[index].c_str();
     *length = static_cast<GLsizei>(std::strlen(text));
+    assert(capacity > *length);
     *size = 1;
     *type = 0x1406;
     std::memcpy(name, text, static_cast<size_t>(*length) + 1);
   }
   GLint GetAttribLocation(GLuint program, const char* name) {
     assert(program == 17);
-    return std::string(name) == "position" ? 3 : 7;
+    for (size_t index = 0; index < attribute_names.size(); ++index) {
+      if (attribute_names[index] == name)
+        return attribute_locations[index];
+    }
+    throw std::runtime_error("Unexpected attribute name");
   }
   void GetActiveUniformBlockName(GLuint program, GLuint index, GLsizei capacity,
                                  GLsizei* length, char* name) {
@@ -121,6 +128,34 @@ int main() {
     assert(command.value.dictionaries.at("uniformBlocks")
                .integers.at("FrameParams") == 0);
 
+    context.gl.attribute_names = {"gl_VertexID", "position", "gl_InstanceID"};
+    context.gl.attribute_locations = {-1, 3, -1};
+    context.gl.attributes = 3;
+    command = {};
+    journal.Program(command, &program);
+    assert(command.error.empty());
+    assert(command.value.dictionaries.at("attributes").integers ==
+           (std::map<std::string, int>{{"position", 3}}));
+
+    context.gl.attribute_names = {"gl_VertexID"};
+    context.gl.attribute_locations = {-1};
+    context.gl.attributes = 1;
+    command = {};
+    journal.Program(command, &program);
+    assert(command.error.empty());
+    assert(command.value.dictionaries.at("attributes").integers.empty());
+
+    context.gl.attribute_names = {"position", "color"};
+    context.gl.attribute_locations = {3, 7};
+    context.gl.attributes = 2;
+    for (const GLint location : {-1, 32}) {
+      context.gl.attribute_locations[1] = location;
+      command = {};
+      journal.Program(command, &program);
+      assert(command.error == "WebGL program attribute location is invalid");
+    }
+    context.gl.attribute_locations[1] = 7;
+
     context.gl.lose_on_block_query = true;
     command = {};
     journal.Program(command, &program);
@@ -154,7 +189,8 @@ int main() {
     journal.Program(command, &program);
     assert(command.error.empty() && context.gl.queries.size() == 1);
     assert(command.value.integers.at("value") == 0);
-    std::cout << "Program capture: initialized GLES destinations, attributes, "
+    std::cout << "Program capture: initialized GLES destinations, built-ins, "
+                 "attributes, "
                  "uniform blocks, lost-context outputs and bounds PASS\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
