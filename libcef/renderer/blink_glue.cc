@@ -1735,12 +1735,6 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
           context->ReleaseReachCanvasVideo();
           continue;
         }
-        if (!context->CheckpointReachCanvasVideo()) {
-          const auto* snapshot = context->GetReachCanvasVideo();
-          dependencies->error = snapshot ? snapshot->error()
-                                         : "Canvas video snapshot unavailable";
-          return std::nullopt;
-        }
         continue;
       }
       if (context && context->IsWebGL()) {
@@ -3672,6 +3666,38 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
     result.canvas_video.emplace();
   blink::ReachCanvasVideo::Inventory canvas_inventory;
   size_t canvas_bytes = 0;
+  if (canvas_video) {
+    blink::ReachCanvasVideo::Inventory planned;
+    for (blink::Frame* tree_frame = frame.Get(); tree_frame;
+         tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
+      if (!IsInlinePaintFrame(frame.Get(), tree_frame))
+        continue;
+      auto* tree_document =
+          blink::To<blink::LocalFrame>(tree_frame)->GetDocument();
+      if (!tree_document)
+        continue;
+      for (auto& node :
+           blink::FlatTreeTraversal::DescendantsOf(*tree_document)) {
+        auto* canvas = blink::DynamicTo<blink::HTMLCanvasElement>(node);
+        auto* context = canvas ? canvas->RenderingContext() : nullptr;
+        if (!context)
+          continue;
+        if (!dependencies.media_ids.contains(canvas->GetDomNodeId()) ||
+            context->isContextLost() || canvas->Size().IsEmpty()) {
+          context->ReleaseReachCanvasVideo();
+          continue;
+        }
+        const auto size = context->ReachCanvasVideoSize();
+        if (!planned.Add(size.width(), size.height())) {
+          result.error =
+              "Painted canvas video dimensions or aggregate budget exceeded";
+          return result;
+        }
+        // Replace the previous inventory atomically before any snapshot read.
+        context->PrepareReachCanvasVideoCapture();
+      }
+    }
+  }
   for (blink::Frame* tree_frame = frame.Get(); tree_frame;
        tree_frame = tree_frame->Tree().TraverseNext(frame.Get())) {
     if (!IsInlinePaintFrame(frame.Get(), tree_frame)) {
@@ -3687,6 +3713,8 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
          blink::FlatTreeTraversal::DescendantsOf(*media_document)) {
       if (auto* canvas = blink::DynamicTo<blink::HTMLCanvasElement>(node);
           canvas && canvas_video) {
+        if (!dependencies.media_ids.contains(canvas->GetDomNodeId()))
+          continue;
         if (canvas->IsOffscreenCanvasRegistered()) {
           result.error = "Worker OffscreenCanvas video is unsupported";
           return result;
@@ -3712,6 +3740,8 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
           return result;
         }
         canvas_bytes += snapshot.rgba().size();
+        if (context->IsWebGL())
+          context->MarkLayerComposited();
         result.canvas_video->push_back(
             {static_cast<uint32_t>(canvas->GetDomNodeId()),
              document->Token().ToString(),

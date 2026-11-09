@@ -44,6 +44,7 @@ struct LayoutObject {
 };
 struct HTMLCanvasElement {
   bool IsOffscreenCanvas() const { return false; }
+  bool isConnected() const { return true; }
   void NotifyGpuContextLost() {}
   LayoutObject* GetLayoutObject() { return &layout; }
   LayoutObject layout;

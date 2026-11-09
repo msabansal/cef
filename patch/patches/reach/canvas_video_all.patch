@@ -1,5 +1,5 @@
 diff --git third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
-index 085dad1..81b28fd 100644
+index 085dad1..50593d4 100644
 --- third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
 +++ third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
 @@ -80,12 +80,16 @@ void CanvasRenderingContext::SetReachCanvasVideoChangeCallback(
@@ -21,7 +21,7 @@ index 085dad1..81b28fd 100644
      // Replace any cached paint recorded while this context was lost.
      if (auto* layout = canvas->GetLayoutObject())
        layout->SetShouldDoFullPaintInvalidation();
-@@ -98,6 +102,10 @@ void CanvasRenderingContext::ReachCanvasVideoChanged(bool epoch) {
+@@ -98,6 +102,15 @@ void CanvasRenderingContext::ReachCanvasVideoChanged(bool epoch) {
      reach_canvas_video_change_callback(static_cast<HTMLCanvasElement*>(Host()));
  }
  
@@ -29,10 +29,15 @@ index 085dad1..81b28fd 100644
 +  return Host() ? Host()->Size() : gfx::Size();
 +}
 +
++void CanvasRenderingContext::PrepareReachCanvasVideoCapture() {
++  if (reach_canvas_video_)
++    reach_canvas_video_->ReleaseAdmission();
++}
++
  void CanvasRenderingContext::ReleaseReachCanvasVideo() {
    if (!reach_canvas_video_)
      return;
-@@ -113,7 +121,7 @@ void CanvasRenderingContext::ReleaseReachCanvasVideo() {
+@@ -113,7 +126,7 @@ void CanvasRenderingContext::ReleaseReachCanvasVideo() {
  }
  
  bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
@@ -41,7 +46,7 @@ index 085dad1..81b28fd 100644
      return true;
    if (!Host() || Host()->IsOffscreenCanvas())
      return false;
-@@ -127,11 +135,11 @@ bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
+@@ -127,11 +140,11 @@ bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
      ReachCanvasVideoChanged();
    auto& capture = *reach_canvas_video_;
    if (frame->LocalFrameRoot().Tree().Parent())
@@ -56,7 +61,7 @@ index 085dad1..81b28fd 100644
    using Budgets =
        std::map<LocalFrame*, std::weak_ptr<ReachCanvasVideo::Budget>>;
    static base::NoDestructor<Budgets> budgets;
-@@ -147,15 +155,17 @@ bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
+@@ -147,15 +160,17 @@ bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
    const auto size = ReachCanvasVideoSize();
    if (size != canvas->Size())
      return capture.Fail(
@@ -77,7 +82,7 @@ index 085dad1..81b28fd 100644
        return std::vector<uint8_t>();
      }
      const auto info =
-@@ -165,7 +175,7 @@ bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
+@@ -165,7 +180,7 @@ bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
      if (!canvas->isConnected() || canvas->RenderingContext() != this ||
          &canvas->GetDocument() != document || !frame->IsAttached() ||
          isContextLost() || ReachCanvasVideoSize() != size) {
@@ -87,12 +92,14 @@ index 085dad1..81b28fd 100644
      }
      return std::vector<uint8_t>(bytes.begin(), bytes.end());
 diff --git third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
-index 78d7ea7..7811c75 100644
+index 78d7ea7..e405371 100644
 --- third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
 +++ third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
-@@ -144,8 +144,8 @@ class CORE_EXPORT CanvasRenderingContext
+@@ -143,9 +143,10 @@ class CORE_EXPORT CanvasRenderingContext
+   }
    void ReachCanvasVideoChanged(bool epoch = false);
    void ReleaseReachCanvasVideo();
++  void PrepareReachCanvasVideoCapture();
    bool CheckpointReachCanvasVideo();
 -  virtual gfx::Size ReachCanvasVideoSize() const { return {}; }
 -  virtual bool ReachCanvasVideoIsSDR() const { return false; }
@@ -102,7 +109,7 @@ index 78d7ea7..7811c75 100644
  
    // ActiveScriptWrappable
 diff --git third_party/blink/renderer/core/html/canvas/html_canvas_element.cc third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-index 937b02c..ea967e4 100644
+index 937b02c..914b1ed 100644
 --- third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 +++ third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 @@ -690,6 +690,8 @@ void HTMLCanvasElement::DidDraw(const gfx::Rect& rect) {
@@ -114,25 +121,27 @@ index 937b02c..ea967e4 100644
  
    // To avoid issuing invalidations multiple times, we can check |dirty_rect_|
    // and only issue invalidations the first time it becomes non-empty.
-@@ -1337,9 +1339,9 @@ void HTMLCanvasElement::Paint(GraphicsContext& context,
+@@ -1337,10 +1339,10 @@ void HTMLCanvasElement::Paint(GraphicsContext& context,
  
  void HTMLCanvasElement::PaintInternal(GraphicsContext& context,
                                        const PhysicalRect& r) {
 -  if ((Canvas2DBitmapProvider::IsReachWebGLCommandMode() ||
 -       Canvas2DBitmapProvider::IsReachWebGLVideoMode()) &&
 -      IsReachMediaCapture() && IsWebGL()) {
+-    if (!RenderingContext()->CheckpointReachCanvasVideo())
 +  if (IsReachMediaCapture() && RenderingContext() &&
 +      ((Canvas2DBitmapProvider::IsReachWebGLCommandMode() && IsWebGL()) ||
 +       Canvas2DBitmapProvider::IsReachWebGLVideoMode())) {
-     if (!RenderingContext()->CheckpointReachCanvasVideo())
++    if (RenderingContext()->isContextLost() || Size().IsEmpty())
        return;
      auto* target = context.Canvas();
+     cc::PaintCanvasAutoRestore restore(target, true);
 @@ -1348,10 +1350,11 @@ void HTMLCanvasElement::PaintInternal(GraphicsContext& context,
      target->scale(r.Width(), r.Height());
      target->clipRect(SkRect::MakeWH(1, 1));
      target->recordCustomData(GetDomNodeId());
 -    RenderingContext()->MarkLayerComposited();
-+    if (IsWebGL())
++    if (IsWebGL() && !Canvas2DBitmapProvider::IsReachWebGLVideoMode())
 +      RenderingContext()->MarkLayerComposited();
      return;
    }
@@ -329,3 +338,15 @@ index 6ead245..b95e49b 100644
    void SetDelegate(CanvasResourceProviderDelegate* delegate) {
      delegate_ = delegate;
    }
+diff --git third_party/blink/renderer/platform/graphics/reach_canvas_video.h third_party/blink/renderer/platform/graphics/reach_canvas_video.h
+index 57d40d8..17f796c 100644
+--- third_party/blink/renderer/platform/graphics/reach_canvas_video.h
++++ third_party/blink/renderer/platform/graphics/reach_canvas_video.h
+@@ -66,6 +66,7 @@ class ReachCanvasVideo {
+       Epoch();
+     }
+   }
++  void ReleaseAdmission() { ReleaseBudget(); }
+   void Dirty() {
+     if (revision_ == std::numeric_limits<uint64_t>::max()) {
+       Fail("WebGL video content revision exhausted");

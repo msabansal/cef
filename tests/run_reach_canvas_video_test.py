@@ -27,6 +27,8 @@ def main():
     section = next(item for item in sections if f"+++ {name}\n" in item)
     header = "\n".join(line[1:] for line in section.splitlines()
                        if line.startswith("+") and not line.startswith("+++"))
+    if args.fixture:
+        header = (args.fixture / name).read_text()
     (output / "reach_canvas_video.h").write_text(header + "\n")
     def method_body(text, signature, result_type="void"):
         start = text.index(result_type + " " + signature + "(")
