@@ -9,13 +9,25 @@ int main() {
   const auto maps = blink::ReachCanvasVideo::Plan({{2816, 1792}});
   assert(maps && maps->size() == 1);
   assert(maps->front().first < 2816 && maps->front().second < 1792);
+  const auto maps_dpr2 = blink::ReachCanvasVideo::Plan({{3584, 2560}});
+  assert(maps_dpr2 && maps_dpr2->size() == 1);
+  assert(maps_dpr2->front().first > 1792 &&
+         maps_dpr2->front().second > 1280);
+  blink::ReachCanvasVideo::Inventory maps_inventory;
+  assert(maps_inventory.Add(maps_dpr2->front().first,
+                            maps_dpr2->front().second));
+  assert(maps_inventory.pixels <= 4194304);
   const auto many = blink::ReachCanvasVideo::Plan(
       {{3840, 2160}, {3840, 2160}, {3840, 2160}, {3840, 2160}});
   assert(many && many->size() == 4);
   blink::ReachCanvasVideo::Inventory inventory;
   for (const auto& [width, height] : *many)
     assert(inventory.Add(width, height));
-  assert(!blink::ReachCanvasVideo::Plan({{4096, 4096}}));
+  assert(blink::ReachCanvasVideo::Plan({{4096, 4096}}));
+  assert(!blink::ReachCanvasVideo::Plan({{4096, 4097}}));
+  assert(!blink::ReachCanvasVideo::Plan({{8193, 1}}));
+  assert(!blink::ReachCanvasVideo::Plan({{1, 8193}}));
+  assert(!blink::ReachCanvasVideo::Plan({{0, 1}}));
   const std::vector<std::pair<int, int>> weather(5, {32, 28});
   assert(blink::ReachCanvasVideo::Plan(weather) == weather);
   const std::vector<std::pair<int, int>> tiny(79, {8, 8});
