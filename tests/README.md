@@ -104,7 +104,8 @@ canvas stack, then verifies complete removal of retired source modifications
 and introduced files. The fixture is never changed or downloaded by the test.
 
 The portable C++ runner compiles the production ownership header, actual typed
-IPC packing, raster exclusion, dirty/compositor/early-export hooks, context-loss
+IPC packing, mutable DOM identity collection, raster exclusion,
+dirty/compositor/early-export hooks, context-loss
 lifecycle and mode-selection methods with substituted Chromium boundaries. It
 covers alpha,
 epochs, aggregate budgets, preflight, cached identities, retirement, stale

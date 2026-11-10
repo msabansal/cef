@@ -47,6 +47,16 @@ def main():
         (root / "libcef" / "renderer" / "blink_glue.cc").read_text(),
         "CheckRasterCanvasVisibility", "bool")
     (output / "reach_canvas_video_raster.inc").write_text(raster)
+    capture = method_body(
+        (root / "libcef" / "renderer" / "blink_glue.cc").read_text(),
+        "CaptureRequiredPaint", "std::optional<cc::PaintRecord>")
+    identities = re.search(
+        r"      (?:const )?auto\* element =\s*"
+        r"blink::DynamicTo<blink::HTMLCanvasElement>.*?"
+        r"canvas_ids\.insert\(element->GetDomNodeId\(\)\);\s*}",
+        capture, re.DOTALL)
+    assert identities, "Canvas identity collection is missing"
+    (output / "reach_canvas_video_ids.inc").write_text(identities[0])
     sources = ["reach_canvas_video_test", "reach_canvas_video_ipc_test",
                "reach_canvas_video_raster_test"]
     if "ReleaseAdmission()" in header:

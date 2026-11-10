@@ -1491,7 +1491,7 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
           frame_ids.insert(owner->GetDomNodeId());
         }
       }
-      const auto* element =
+      auto* element =
           blink::DynamicTo<blink::HTMLCanvasElement>(object->GetNode());
       if (!element) {
         continue;
