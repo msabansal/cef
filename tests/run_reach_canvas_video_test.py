@@ -43,7 +43,12 @@ def main():
         (root / "libcef" / "renderer" / "frame_impl.cc").read_text(),
         "AttachCanvasVideo")
     (output / "reach_canvas_video_ipc.inc").write_text(packing)
-    sources = ["reach_canvas_video_test", "reach_canvas_video_ipc_test"]
+    raster = method_body(
+        (root / "libcef" / "renderer" / "blink_glue.cc").read_text(),
+        "CheckRasterCanvasVisibility", "bool")
+    (output / "reach_canvas_video_raster.inc").write_text(raster)
+    sources = ["reach_canvas_video_test", "reach_canvas_video_ipc_test",
+               "reach_canvas_video_raster_test"]
     if "ReleaseAdmission()" in header:
         sources.append("reach_canvas_video_painted_test")
     if args.fixture:
@@ -88,8 +93,7 @@ def main():
         mode = (args.fixture / "third_party" / "blink" / "renderer"
                 / "platform" / "graphics" / "canvas_2d_bitmap_provider.cc")
         mode = mode.read_text()
-        names = ["IsReachCommandMode", "IsReachWebGLCommandMode",
-                 "IsReachWebGLVideoMode"]
+        names = ["IsReachCommandMode", "IsReachCanvasVideoMode"]
         (output / "reach_canvas_video_mode.inc").write_text("\n".join(
             method_body(mode, "Canvas2DBitmapProvider::" + name, "bool")
             for name in names))
@@ -109,19 +113,19 @@ def main():
         subprocess.run(command, cwd=root, check=True)
         if name == "reach_canvas_video_mode_test":
             cases = [
-                ["1", "0", "0", "1", "0", "1"],
-                ["1", "1", "1", "1", "1", "0"],
-                ["1", "1", "0", "1", "0", "1"],
-                ["1", "1", "true", "1", "0", "1"],
-                ["1", "0", "1", "1", "0", "1"],
-                ["0", "1", "1", "1", "0", "0"],
-                ["1", "1", "1", "0", "1", "0"],
-                ["1", "1", "0", "0", "0", "0"],
+                ["1", "0", "0", "1", "1"],
+                ["1", "1", "1", "1", "1"],
+                ["1", "1", "0", "1", "1"],
+                ["1", "1", "true", "1", "1"],
+                ["1", "0", "1", "1", "1"],
+                ["0", "1", "1", "1", "0"],
+                ["1", "1", "1", "0", "1"],
+                ["0", "1", "0", "0", "0"],
             ]
             for case in cases:
                 subprocess.run([str(executable), *case], cwd=root, check=True)
-            print("actual mode selection: commands/default, exact1, exclusive "
-                  "video and full-VIDEO isolation passed")
+            print("actual mode selection: canvas VIDEO is mandatory in "
+                  "COMMAND mode; legacy flags ignored; full-VIDEO isolated")
         else:
             subprocess.run([str(executable)], cwd=root, check=True)
 

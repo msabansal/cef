@@ -33,11 +33,6 @@ class WebView;
 
 namespace blink_glue {
 
-BLINK_EXPORT void SetWebGlTextureLimits(blink::WebView* view,
-                                       int texture,
-                                       int cube,
-                                       int renderbuffer);
-
 BLINK_EXPORT bool CanGoBack(blink::WebView* view);
 BLINK_EXPORT bool CanGoForward(blink::WebView* view);
 BLINK_EXPORT void GoBack(blink::WebView* view);
@@ -128,20 +123,12 @@ BLINK_EXPORT size_t MaxDrawingPaintBytes();
 // update, then again only after that root's next drawing-command capture.
 BLINK_EXPORT void SetDrawingFrameRequestCallback(
     std::function<void(blink::WebLocalFrame*)> callback);
-BLINK_EXPORT void SetWebGlChangeCallback(
+BLINK_EXPORT void SetDrawingAnimationCallback(
     std::function<void(blink::WebLocalFrame*)> callback);
-BLINK_EXPORT std::string WebGlRequest(
-    blink::WebLocalFrame* frame,
-    const std::string& operation,
-    const std::string& document,
-    const std::string& stream,
-    const std::string& generation,
-    const std::string& position,
-    const std::string& offset,
-    int max_bytes,
-    std::vector<uint8_t>* output,
-    std::map<std::string, std::vector<uint8_t>>* originals);
-
+// State permits an empty document; ticks require the current document token.
+BLINK_EXPORT std::string DrawingAnimationRequest(
+    blink::WebLocalFrame* frame, bool tick, const std::string& document,
+    std::vector<uint8_t>* output);
 // Resolves where input at (x, y) (or keyboard input) lands. When it lands in
 // |frame| itself and |apply| is set, |apply| dispatches the input in the same
 // task and the route reports "applied" (and "inputError" if it failed).

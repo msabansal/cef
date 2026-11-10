@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <deque>
 #include <map>
@@ -20,14 +19,11 @@
 #include "base/functional/bind.h"
 #include "base/functional/callback_helpers.h"
 #include "base/hash/hash.h"
-#include "base/json/json_reader.h"
 #include "base/json/json_writer.h"
-#include "base/location.h"
 #include "base/memory/scoped_refptr.h"
 #include "base/no_destructor.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
-#include "base/task/single_thread_task_runner.h"
 #include "base/time/time.h"
 #include "base/values.h"
 #include "build/build_config.h"
@@ -67,7 +63,6 @@
 #include "third_party/blink/renderer/core/events/pointer_event_factory.h"
 #include "third_party/blink/renderer/core/editing/serializers/serialization.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context.h"
-#include "third_party/blink/renderer/core/exported/web_view_impl.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_state_observer.h"
 #include "third_party/blink/renderer/core/frame/frame_owner.h"
 #include "third_party/blink/renderer/core/frame/local_dom_window.h"
@@ -79,6 +74,7 @@
 #include "third_party/blink/renderer/core/frame/settings.h"
 #include "third_party/blink/renderer/core/frame/web_frame_widget_impl.h"
 #include "third_party/blink/renderer/core/frame/web_local_frame_impl.h"
+#include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h"
 #include "third_party/blink/renderer/core/html/canvas/html_canvas_element.h"
 #include "third_party/blink/renderer/core/html/html_frame_owner_element.h"
 #include "third_party/blink/renderer/core/html/media/html_media_element.h"
@@ -105,7 +101,6 @@
 #include "third_party/blink/renderer/core/script/classic_script.h"
 #include "third_party/blink/renderer/core/scroll/scrollable_area.h"
 #include "third_party/blink/renderer/modules/encryptedmedia/html_media_element_encrypted_media.h"
-#include "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h"
 #include "third_party/blink/renderer/platform/bindings/script_forbidden_scope.h"
 #include "third_party/blink/renderer/platform/bindings/v8_binding.h"
 #include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
@@ -311,7 +306,10 @@ class PendingAnimation final : public blink::GarbageCollected<PendingAnimation>,
 
 const char PendingAnimation::kSupplementName[] = "ReachPendingAnimation";
 
-std::function<void(blink::WebLocalFrame*)>& WebGlChangeCallback();
+std::function<void(blink::WebLocalFrame*)>& AnimationCallback() {
+  static base::NoDestructor<std::function<void(blink::WebLocalFrame*)>> callback;
+  return *callback;
+}
 
 std::function<void(blink::WebLocalFrame*)>& FrameRequestCallback() {
   static base::NoDestructor<std::function<void(blink::WebLocalFrame*)>> callback;
@@ -322,13 +320,11 @@ void OnFrameRequested(blink::LocalFrame& root) {
   if (!root.GetDocument())
     return;
   auto& demand = PendingAnimation::From(*root.GetDocument());
-  if (blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode()) {
-    if (!demand.pending) {
-      demand.pending = true;
-      if (WebGlChangeCallback()) {
-        if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
-          WebGlChangeCallback()(web_frame);
-      }
+  if (!demand.pending) {
+    demand.pending = true;
+    if (AnimationCallback()) {
+      if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
+        AnimationCallback()(web_frame);
     }
   }
   if (!FrameRequestCallback() || demand.picture_pending)
@@ -378,163 +374,39 @@ void SetDrawingFrameRequestCallback(
   // MediaSource operations are journaled for client replay, and each one
   // requests a frame so the client learns the journal's new position.
   blink::ReachMediaJournal::Enable(&OnFrameRequested);
-}
-
-namespace {
-
-std::function<void(blink::WebLocalFrame*)>& WebGlChangeCallback() {
-  static base::NoDestructor<std::function<void(blink::WebLocalFrame*)>> callback;
-  return *callback;
-}
-
-void OnWebGlChanged(blink::HTMLCanvasElement* element) {
-  auto* frame = element ? element->GetDocument().GetFrame() : nullptr;
-  if (!frame || !frame->IsAttached())
-    return;
-  auto& root = frame->LocalFrameRoot();
-  if (blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode()) {
-    OnFrameRequested(root);
-    return;
-  }
-  if (WebGlChangeCallback()) {
-    if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
-      WebGlChangeCallback()(web_frame);
-  }
-}
-
-class WebGlRetirement final : public blink::GarbageCollected<WebGlRetirement>,
-                              public blink::Supplement<blink::Document> {
- public:
-  static const char kSupplementName[];
-
-  explicit WebGlRetirement(blink::Document& document)
-      : blink::Supplement<blink::Document>(document),
-        wake_(std::make_shared<Wake>(document)) {}
-
-  static std::function<void()> Notification(blink::Document& document) {
-    auto* retirement =
-        blink::Supplement<blink::Document>::From<WebGlRetirement>(document);
-    if (!retirement) {
-      retirement = blink::MakeGarbageCollected<WebGlRetirement>(document);
-      blink::Supplement<blink::Document>::ProvideTo(document, retirement);
-    }
-    return [wake = retirement->wake_] {
-      // Finalization must not inspect canvas, document, frame, or weak
-      // registry. One non-GC task state per document coalesces all collected
-      // journals.
-      if (wake->pending.exchange(true))
-        return;
-      wake->runner->PostTask(
-          FROM_HERE,
-          base::BindOnce(
-              [](std::shared_ptr<Wake> state) {
-                state->pending.store(false);
-                auto* current_document = state->document.Get();
-                auto* frame =
-                    current_document ? current_document->GetFrame() : nullptr;
-                if (!frame || !frame->IsAttached() ||
-                    frame->GetDocument() != current_document)
-                  return;
-                if (WebGlChangeCallback()) {
-                  if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(
-                          frame->LocalFrameRoot()))
-                    WebGlChangeCallback()(web_frame);
-                }
-              },
-              wake));
-    };
-  }
-
-  void Trace(blink::Visitor* visitor) const override {
-    blink::Supplement<blink::Document>::Trace(visitor);
-  }
-
- private:
-  struct Wake {
-    explicit Wake(blink::Document& owner)
-        : runner(base::SingleThreadTaskRunner::GetCurrentDefault()),
-          document(&owner) {}
-
-    scoped_refptr<base::SingleThreadTaskRunner> runner;
-    blink::WeakPersistent<blink::Document> document;
-    std::atomic_bool pending{false};
-  };
-
-  std::shared_ptr<Wake> wake_;
-};
-
-const char WebGlRetirement::kSupplementName[] = "ReachWebGlRetirement";
-
-std::function<void()> OnWebGlRetirement(blink::HTMLCanvasElement* element) {
-  return WebGlRetirement::Notification(element->GetDocument());
-}
-
-bool WebGlDecimal(const std::string& text, uint64_t* value) {
-  return !text.empty() && text.size() <= 20 &&
-         base::StringToUint64(text, value) &&
-         base::NumberToString(*value) == text;
-}
-
-}  // namespace
-
-void SetWebGlChangeCallback(
-    std::function<void(blink::WebLocalFrame*)> callback) {
-  if (!blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode() &&
-      !blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode())
-    return;
-  WebGlChangeCallback() = std::move(callback);
-  if (blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode()) {
-    blink::CanvasRenderingContext::SetReachCanvasVideoChangeCallback(
-        &OnWebGlChanged);
-    return;
-  }
-  blink::ReachWebGLJournal::SetChangeCallback(&OnWebGlChanged);
-  blink::ReachWebGLJournal::SetRetirementCallback(&OnWebGlRetirement);
-  blink::ReachWebGLJournal::SetOriginalHasher(
-      [](base::span<const uint8_t> bytes) {
-        return sk_reach::Hex(crypto::hash::Sha256(std::string_view(
-            reinterpret_cast<const char*>(bytes.data()), bytes.size())));
+  blink::CanvasRenderingContext::SetReachCanvasVideoChangeCallback(
+      [](blink::HTMLCanvasElement* element) {
+        auto* frame = element ? element->GetDocument().GetFrame() : nullptr;
+        if (frame && frame->IsAttached())
+          OnFrameRequested(frame->LocalFrameRoot());
       });
 }
 
-std::string WebGlRequest(
-    blink::WebLocalFrame* web_frame,
-    const std::string& operation,
-    const std::string& document,
-    const std::string& stream,
-    const std::string& generation,
-    const std::string& position,
-    const std::string& offset,
-    int max_bytes,
-    std::vector<uint8_t>* output,
-    std::map<std::string, std::vector<uint8_t>>* originals) {
+void SetDrawingAnimationCallback(
+    std::function<void(blink::WebLocalFrame*)> callback) {
+  if (!blink::Canvas2DBitmapProvider::IsReachCommandMode())
+    return;
+  AnimationCallback() = std::move(callback);
+}
+
+std::string DrawingAnimationRequest(
+    blink::WebLocalFrame* web_frame, bool tick, const std::string& document,
+    std::vector<uint8_t>* output) {
   auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
   if (!frame || !frame->IsAttached() || !frame->GetDocument() ||
-      !blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode()) {
-    return "WebGL request frame is detached or disabled";
-  }
-  if (operation != "Reach.WebGlStreams.v2" &&
-      operation != "Reach.WebGlTick.v2" &&
-      frame->GetDocument()->Token().ToString() != document) {
-    return "WebGL native document identity is stale";
-  }
-  auto owned = [frame](blink::ReachWebGLJournal* journal) {
-    auto* element = journal ? journal->element() : nullptr;
-    auto* owner = element ? element->GetDocument().GetFrame() : nullptr;
-    return owner && owner->IsAttached() &&
-           owner->GetDocument() == &element->GetDocument() &&
-           &owner->LocalFrameRoot() == frame;
-  };
-  // Command mode holds compositor begin frames. Service animation script
-  // explicitly without capturing a picture or enabling compositor raster.
+      !blink::Canvas2DBitmapProvider::IsReachCommandMode())
+    return "Animation request frame is detached or disabled";
+  if ((tick || !document.empty()) &&
+      frame->GetDocument()->Token().ToString() != document)
+    return "Animation request document identity is stale";
   blink::Persistent<blink::LocalFrame> retained_frame = frame;
-  if (operation == "Reach.WebGlTick.v2") {
-    blink::Persistent<blink::Document> retained_document = frame->GetDocument();
+  blink::Persistent<blink::Document> retained_document = frame->GetDocument();
+  if (tick) {
     blink::Persistent<blink::Page> page = frame->GetPage();
     if (!page || !frame->View())
-      return "WebGL animation frame is unavailable";
-    // Clear before entering script/lifecycle. A request made by that work
-    // rearms demand and emits a new wakeup, even without a WebGL journal.
+      return "Animation frame is unavailable";
+    // Clear before script: nested RAF/CSS scheduling must rearm demand even
+    // while a coalesced picture notification is still outstanding.
     PendingAnimation::From(*retained_document).pending = false;
     static_cast<blink::scheduler::MainThreadSchedulerImpl&>(
         blink::scheduler::WebThreadScheduler::MainThreadScheduler())
@@ -542,130 +414,20 @@ std::string WebGlRequest(
     page->Animator().ServiceScriptedAnimations(base::TimeTicks::Now());
     if (!frame->IsAttached() || frame->GetDocument() != retained_document.Get() ||
         frame->GetPage() != page.Get() || !frame->View())
-      return "WebGL animation document changed";
+      return "Animation document changed";
     page->Animator().UpdateAllLifecyclePhasesExceptPaint(
         *frame, blink::DocumentUpdateReason::kInspector);
     if (!frame->IsAttached() || frame->GetDocument() != retained_document.Get() ||
         frame->GetPage() != page.Get() || !frame->View())
-      return "WebGL animation document changed";
+      return "Animation document changed";
   }
-  if (operation == "Reach.WebGlStreams.v2" ||
-      operation == "Reach.WebGlTick.v2") {
-    const char* pending = PendingAnimation::From(*frame->GetDocument()).pending
-                              ? "true"
-                              : "false";
-    std::string json = "{\"document\":\"" +
-                       frame->GetDocument()->Token().ToString() +
-                       "\",\"animationPending\":" + pending + ",\"streams\":[";
-    bool first = true;
-    for (auto* journal : blink::ReachWebGLJournal::Current()) {
-      if (!owned(journal))
-        continue;
-      journal->ClearChangeNotification();
-      const auto state = journal->State();
-      if (state.empty())
-        return "WebGL stream is unavailable: " + journal->error();
-      if (!first)
-        json += ',';
-      first = false;
-      json += "{\"state\":" + state + ",\"retired\":\"" +
-              base::NumberToString(journal->retired()) + "\"}";
-    }
-    json += "]}";
-    output->assign(json.begin(), json.end());
-    return {};
-  }
-  uint64_t id = 0, context_generation = 0, cursor = 0;
-  if (!WebGlDecimal(stream, &id) ||
-      !WebGlDecimal(generation, &context_generation) ||
-      !WebGlDecimal(position, &cursor)) {
-    return "Invalid WebGL stream identity or sequence";
-  }
-  auto* journal = blink::ReachWebGLJournal::Find(id);
-  if (!owned(journal) || journal->generation() != context_generation)
-    return "WebGL stream unavailable or generation stale";
-  if (operation == "Reach.WebGlApplied.v2" ||
-      operation == "Reach.WebGlSent.v2") {
-    const auto error = operation == "Reach.WebGlApplied.v2"
-                           ? journal->Applied(context_generation, cursor)
-                           : journal->Sent(context_generation, cursor);
-    if (!error.empty())
-      return error;
-    const std::string json = "{\"stream\":\"" + stream +
-                             "\",\"generation\":\"" + generation +
-                             "\",\"through\":\"" + position + "\"}";
-    output->assign(json.begin(), json.end());
-    return {};
-  }
-  auto with_sources = [&](bool slice, bool discover_sources) -> std::string {
-    auto value = base::JSONReader::Read(
-        std::string(output->begin(), output->end()),
-        base::JSON_PARSE_CHROMIUM_EXTENSIONS);
-    if (!value || !value->is_dict())
-      return "WebGL original metadata is invalid";
-    base::DictValue sources;
-    const auto* image = slice ? value->GetDict().FindString("image") : nullptr;
-    if (discover_sources &&
-        ((!slice && !originals->empty()) ||
-         (slice && image && !image->empty()))) {
-      std::set<std::string> requested;
-      if (slice) {
-        requested.insert("image:" + *image);
-      } else {
-        for (const auto& [key, data] : *originals)
-          requested.insert(key);
-      }
-      const auto discovered = GetDrawingResourceSources(web_frame, &requested);
-      if (!discovered.error.empty())
-        return discovered.error;
-      for (const auto& [key, source] : discovered.sources) {
-        if (slice ? key == "image:" + *image : originals->contains(key))
-          sources.Set(key, source);
-      }
-    }
-    base::DictValue envelope;
-    if (slice) {
-      envelope = std::move(value->GetDict());
-    } else {
-      envelope.Set("batch", std::move(*value));
-    }
-    envelope.Set("sources", std::move(sources));
-    const auto json = base::WriteJson(envelope);
-    if (!json)
-      return "WebGL original metadata serialization failed";
-    size_t bytes = json->size();
-    if (!slice) {
-      for (const auto& [key, data] : *originals)
-        bytes += data.size();
-    }
-    if (bytes > (slice ? 10 * 1024 : static_cast<size_t>(max_bytes)))
-      return "WebGL original metadata exceeds read budget";
-    output->assign(json->begin(), json->end());
-    return {};
-  };
-  if (operation == "Reach.WebGlCommandSlice.v2" ||
-      operation == "Reach.WebGlOriginalSlice.v2") {
-    uint64_t start = 0;
-    if (!WebGlDecimal(offset, &start) || start > 256 * 1024 * 1024 ||
-        max_bytes <= 0 ||
-        max_bytes > static_cast<int>(blink::ReachWebGLPending::kMaxSlice))
-      return "Invalid WebGL byte slice offset or budget";
-    const auto error = journal->ReadSlice(
-        cursor, static_cast<size_t>(start), static_cast<size_t>(max_bytes),
-        operation == "Reach.WebGlOriginalSlice.v2", output, originals);
-    if (!error.empty())
-      return error;
-    return with_sources(
-        true, operation == "Reach.WebGlCommandSlice.v2" && start == 0);
-  }
-  if (operation != "Reach.WebGlRead.v2" || max_bytes <= 256 ||
-      max_bytes > 8 * 1024 * 1024)
-    return "Invalid WebGL read budget";
-  const auto error =
-      journal->Read(cursor, static_cast<size_t>(max_bytes), output, originals);
-  if (!error.empty())
-    return error;
-  return with_sources(false, true);
+  const std::string json =
+      "{\"document\":\"" + frame->GetDocument()->Token().ToString() +
+      "\",\"animationPending\":" +
+      (PendingAnimation::From(*retained_document).pending ? "true" : "false") +
+      "}";
+  output->assign(json.begin(), json.end());
+  return {};
 }
 
 std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
@@ -682,9 +444,6 @@ std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
   if (!base::StringToUint64(journal_id, &id) ||
       !base::StringToUint64(cursor_text, &cursor) || max_bytes <= 0) {
     return "Invalid media journal request";
-  }
-  if (id & (uint64_t{1} << 63)) {
-    return "WebGL streams require the distinct v2 live API";
   }
   auto* journal = blink::ReachMediaJournal::Find(id);
   auto* element = journal ? journal->element() : nullptr;
@@ -1670,6 +1429,28 @@ cc::PaintRecord ConvertCommandPaint(
       blink::PropertyTreeState::Root(), &cull, content);
 }
 
+std::optional<std::set<uint32_t>> VisiblePaintMarkers(
+    const cc::PaintRecord& recording, const gfx::Rect& bounds,
+    const std::set<uint32_t>& ids);
+
+bool CheckRasterCanvasVisibility(const cc::PaintRecord& recording,
+                                const gfx::Rect& bounds,
+                                const std::set<uint32_t>& canvas_ids,
+                                std::string& error) {
+  PaintSerialization safety;
+  safety.raster = true;
+  if (!CheckPaintRecord(&safety, recording, 0)) {
+    error = safety.error;
+    return false;
+  }
+  const auto visible = VisiblePaintMarkers(recording, bounds, canvas_ids);
+  if (!visible || !visible->empty()) {
+    error = "Canvas VIDEO regions cannot use page raster fallback";
+    return false;
+  }
+  return true;
+}
+
 std::optional<cc::PaintRecord> CaptureRequiredPaint(
     blink::WebLocalFrame* web_frame, const gfx::Rect& bounds,
     PaintSerialization* dependencies) {
@@ -1684,7 +1465,7 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
     // Painted inline by its local root; it has no separate picture.
     return cc::PaintRecord();
   }
-  if (!dependencies->raster && !EnsurePaintClean(frame)) {
+  if (!EnsurePaintClean(frame)) {
     dependencies->error = "Frame lifecycle did not reach paint-clean";
     return std::nullopt;
   }
@@ -1693,7 +1474,7 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
     return std::nullopt;
   }
   std::set<uint32_t> frame_ids;
-  uint64_t webgl_pixels = 0;
+  std::set<uint32_t> canvas_ids;
   for (blink::Frame* tree_frame = frame; tree_frame;
        tree_frame = tree_frame->Tree().TraverseNext(frame)) {
     if (!IsInlinePaintFrame(frame, tree_frame)) {
@@ -1716,14 +1497,11 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
         continue;
       }
       auto* context = element->RenderingContext();
-      if (!dependencies->raster &&
-          blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode() &&
-          element->IsOffscreenCanvasRegistered()) {
+      if (element->IsOffscreenCanvasRegistered()) {
         dependencies->error = "Worker OffscreenCanvas video is unsupported";
         return std::nullopt;
       }
-      if (context && !dependencies->raster &&
-          blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode()) {
+      if (context) {
         if (web_frame->Parent()) {
           dependencies->error = "Out-of-process canvas video is unsupported";
           return std::nullopt;
@@ -1732,68 +1510,24 @@ std::optional<cc::PaintRecord> CaptureRequiredPaint(
           context->ReleaseReachCanvasVideo();
           continue;
         }
-        continue;
-      }
-      if (context && context->IsWebGL()) {
-        const auto size = element->Size();
-        const uint64_t pixels =
-            uint64_t(std::max(0, size.width())) * std::max(0, size.height());
-        // Blink's ordinary canvas paint makes an unaccelerated snapshot.
-        // Bound its source allocation before recording that raster paint.
-        if (!pixels || size.width() > 4096 || size.height() > 4096 ||
-            pixels > kMaxDecodedImagePixels - webgl_pixels) {
-          dependencies->error = "WebGL canvas pixel budget exceeded";
-          return std::nullopt;
-        }
-        webgl_pixels += pixels;
-        if (context->isContextLost()) {
-          dependencies->error = "WebGL canvas context is lost";
-          return std::nullopt;
-        }
-        if (!dependencies->raster &&
-            blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode()) {
-          if (web_frame->Parent()) {
-            dependencies->error =
-                "Out-of-process WebGL canvas requires owned journal routing";
-            return std::nullopt;
-          }
-          auto* journal = context->GetReachWebGLJournal();
-          if (!journal || !journal->usable()) {
-            dependencies->error =
-                journal ? "WebGL command transport: " + journal->error()
-                        : "WebGL canvas has no command transport";
-            return std::nullopt;
-          }
-          continue;
-        }
-      }
-      if (element->IsOffscreenCanvasRegistered() ||
-          (context && !context->IsRenderingContext2D() &&
-           !(dependencies->raster && context->IsWebGL()))) {
-        dependencies->error =
-            "GPU, bitmap or offscreen canvas requires command transport";
-        return std::nullopt;
-      }
-      if (dependencies->raster) {
-        continue;
-      }
-      if (context) {
-        if (!blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
-          dependencies->error = "Canvas2D requires a command-only runtime";
-          return std::nullopt;
-        }
-        context->FlushCanvas(blink::FlushReason::kPrinting);
-        if (context->IsPaintable() && !context->GetLastRecording()) {
-          dependencies->error =
-              "Canvas2D readback, raw pixels or command budget requires "
-              "support";
-          return std::nullopt;
-        }
+        canvas_ids.insert(element->GetDomNodeId());
       }
     }
   }
   cc::PaintRecord recording;
   if (dependencies->raster) {
+    if (!canvas_ids.empty()) {
+      // Compatibility raster must never turn a canvas VIDEO region into
+      // embedded page pixels. Reuse the command path's conservative visibility
+      // proof so an unrelated hidden/off-viewport source does not block HTML.
+      const auto probe = ConvertCommandPaint(
+          frame, CommandPaintCull(bounds),
+          [](const blink::PaintChunk&, cc::PaintRecord items) { return items; });
+      if (!CheckRasterCanvasVisibility(probe, bounds, canvas_ids,
+                                       dependencies->error)) {
+        return std::nullopt;
+      }
+    }
     // Server raster fallback paints software video frames, so it records a
     // separate out-of-lifecycle paint without command-mode media markers.
     cc::PaintRecorder recorder;
@@ -1874,15 +1608,6 @@ blink::ExecutionContext* GetExecutionContext(v8::Local<v8::Context> context) {
 }
 
 }  // namespace
-
-void SetWebGlTextureLimits(blink::WebView* view,
-                          int texture,
-                          int cube,
-                          int renderbuffer) {
-  blink::SetReachWebGLTextureLimits(
-      *static_cast<blink::WebViewImpl*>(view)->GetPage(), texture, cube,
-      renderbuffer);
-}
 
 bool CanGoBack(blink::WebView* view) {
   if (!view) {
@@ -2319,6 +2044,8 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame,
       blink::kIncludeScrollbars);
   base::DictValue info;
   info.Set("document", frame->GetDocument()->Token().ToString());
+  info.Set("animationPending",
+           PendingAnimation::From(*frame->GetDocument()).pending);
   info.Set("embedding", DrawingFrameIdentity(frame));
   info.Set("width", bounds.width());
   info.Set("height", bounds.height());
@@ -3706,7 +3433,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   }
   std::map<uint32_t, sk_sp<SkData>> media_states;
   const bool canvas_video =
-      blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode();
+      blink::Canvas2DBitmapProvider::IsReachCanvasVideoMode();
   if (canvas_video)
     result.canvas_video.emplace();
   blink::ReachCanvasVideo::Inventory canvas_inventory;
@@ -3830,7 +3557,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
         if (dependencies.media_ids.contains(canvas->GetDomNodeId())) {
           base::DictValue state;
           state.Set("id", canvas->GetDomNodeId());
-          state.Set("kind", "webgl-video");
+          state.Set("kind", "canvas-video");
           state.Set("stream", base::NumberToString(snapshot.stream()));
           state.Set("generation", base::NumberToString(snapshot.generation()));
           state.Set("width", snapshot.width());
@@ -3843,24 +3570,6 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
           media_states.emplace(
               canvas->GetDomNodeId(),
               SkData::MakeWithCopy(json->data(), json->size()));
-        }
-        continue;
-      }
-      if (auto* canvas = blink::DynamicTo<blink::HTMLCanvasElement>(node);
-          canvas &&
-          blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode() &&
-          dependencies.media_ids.contains(canvas->GetDomNodeId())) {
-        auto* context = canvas->RenderingContext();
-        if (context && context->IsWebGL()) {
-          auto* journal = context->GetReachWebGLJournal();
-          const auto json = journal ? journal->State() : std::string();
-          if (json.empty() || json.size() > 4096) {
-            result.error = "WebGL command state unavailable or exceeds budget";
-            return result;
-          }
-          media_states.emplace(
-              canvas->GetDomNodeId(),
-              SkData::MakeWithCopy(json.data(), json.size()));
         }
         continue;
       }

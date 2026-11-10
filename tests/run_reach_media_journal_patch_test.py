@@ -7,7 +7,7 @@ import shutil
 import uuid
 
 from run_reach_canvas_video_patch_test import paths
-from run_reach_webgl_patch_test import (
+from reach_patch_test_support import (
     check_baseline,
     check_patch_blobs,
     digest,

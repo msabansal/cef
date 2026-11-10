@@ -35,16 +35,14 @@ Chromium's original path. This patch targets Chromium `156.0.8078.0`.
 | `root_scrollbars.patch` | Main-frame viewport scrollbar suppression without disabling native root input. |
 | `scrollbar_input.patch` | Native scrollbar input for command capture without compositor commits. |
 | `device_pixel_content_box.patch` | Keep `ResizeObserver` device-pixel boxes coherent with target-local emulated DPR in both capture modes. Apply the inspector density override before snapping size and paint offset; preserve native/page/CSS zoom, CSS boxes and ordinary non-Reach rendering. |
-| `canvas_frames.patch` | Canvas2D records and bounded local/out-of-process child-frame composition. |
+| `canvas_frames.patch` | Ordinary paint-record/image drawing and bounded local/out-of-process child-frame composition; no Canvas2D retention. |
 | `video_commands.patch` | Video paint-order markers without embedding source-decoded frames. |
 | `paint_chunks.patch` | Incremental drawing-command paint chunks. |
 | `frame_requests.patch` | On-demand command-capture visual update notifications, also waking document-scoped animation demand in Blink glue before any WebGL context exists. |
 | `command_presentation.patch` | Successful command-capture presentation/timing completion. |
 | `capture_throttling.patch` | Capture-scoped painting of required cross-site frames outside the viewport; background throttling, loading, display locks and view transitions remain intact. |
 | `media_journal.patch` | Ordered same-thread MediaSource operations with bounded local and renderer-wide retention. |
-| `webgl_commands.patch` | Converted WebGL commands, resources, retirement and client composition. |
-| `canvas_video.patch` | Explicit opt-in per-canvas owned RGBA snapshots and paint markers. |
-| `canvas_video_all.patch` | Apply that transport selection to painted Canvas2D as well as WebGL, restoring native raster providers only for canvas video. Preflight the complete painted inventory before snapshots; hidden source buffers stay native without streams. Sources use the decoded-image ceiling (8192 per edge, 16M pixels); a temporary source readback can use up to 64 MiB. Uniformly downsample into the unchanged aggregate 4M-pixel/16MiB owned sample and codec budgets; keep native canvas dimensions and page semantics unchanged. HTML remains command replay; unsupported source dimensions or snapshots fail explicitly. |
+| `canvas_video.patch` | Mandatory per-canvas VIDEO for painted Canvas2D/WebGL regions inside command-rendered HTML. Complete-inventory preflight, owned RGBA snapshots and paint markers; native raster providers preserve page pixel/readback/texture semantics. Hidden sources stay native without streams. Sources use the decoded-image ceiling (8192 per edge, 16M pixels); temporary readback stays within 64 MiB. Uniform downsampling fits the aggregate 4M-pixel/16MiB sample and codec budgets without changing native dimensions. Unsupported sources fail explicitly, never reverting to canvas commands or page-raster pixels. |
 | `display_lock_unlock.patch` | Reach-maintained backport of upstream `491571b360` (crbug.com/40063752), not original Reach authorship. |
 | `simplified_layout_lock.patch` | Preserve descendant state across display-locked simplified layout. |
 | `canvaskit_picture_images.patch` | Skia/CanvasKit original-image resources and ordered media substitution. |
@@ -80,13 +78,20 @@ The updated agent rejects old original events explicitly: rebuild and qualify
 the matched native artifact before using this adapter, rather than relabeling
 an existing binary.
 
-WebGL whole reads also carry a required `sources` map alongside their command
-batch; sliced reads carry it in the first command header and an empty map in
-later headers. The same source resolver matches only journal-admitted originals,
-including loaded raw fetch buffers when available. The agent verifies the
-original bytes before admitting source/document context and publishing the
-optional URL to the client. Rebuild this glue and use the matched agent/protocol
-client together; old WebGL envelopes are rejected, not assumed source-free.
+Canvas/WebGL command journaling, replay-original retention, replay texture-limit
+negotiation and Canvas2D record retention are removed, not disabled. The former
+`webgl_commands` and `canvas_video_all` registrations are gone; the consolidated
+`canvas_video` patch applies directly after the remaining configured
+predecessors. `--reach-drawing-commands` always selects canvas VIDEO. Legacy
+canvas-selection environment variables/switches do not restore other paths.
+Full-page VIDEO is unaffected.
+
+Incremental build reset also consumes `retired_canvas_files.json`. It restores
+formerly patched upstream files and removes formerly introduced Reach files,
+including binding hooks and journal sources. Without this cleanup, simply
+removing a registration leaves stale native code in reused Chromium checkouts.
+The portable patch regression checks migration from the old stack as well as
+clean application and exact reverse/reapplication.
 
 ## Retired CEF-root overlays
 
@@ -152,16 +157,21 @@ CanvasKit bytes and independently qualified native identities stay unchanged.
 New native source revisions require their own build/qualification; never relabel
 an existing binary as built from a new documentation/provenance commit.
 
-Animation delivery now arms a refresh deadline only while discovery reports
-`animationPending`. This required native discovery field is not compatible with
-older artifacts. The registered `frame_requests.patch` hook also wakes animation
-delivery independently of picture-notification coalescing. Discovery does not
-consume demand; servicing clears it before script so nested RAF/CSS scheduling
-is retained. Drawing capture services the same demand without enabling raster
-or compositor begin frames. Supplement ownership isolates replacement documents.
-Picture-notification coalescing uses the same document lifetime, independently
-of animation demand; capture clears the local root document's picture flag
-before servicing script. No retired frame addresses remain in a global set.
+Animation-only state/tick IPC replaces the retired `Reach.WebGl*.v2` interfaces.
+`Reach.DrawingAnimationState.v1` and `Reach.DrawingAnimationTick.v1` accept
+`[requestId, document]`; state permits an empty document, tick requires its exact
+current token. `Reach.DrawingAnimationResult.v1` returns
+`[requestId, error, binaryJsonOrNull]`, with only `{document, animationPending}`
+on success. No originals, streams, slices or acknowledgements remain.
+`Reach.DrawingAnimationChanged.v1` wakes animation delivery independently of
+the coalesced `Reach.FrameRequested.v1` picture/canvas notification.
+
+Discovery does not consume demand. Servicing clears demand before script so
+nested RAF/CSS scheduling rearms it. Drawing capture services the same demand
+without enabling raster or compositor begin frames. Callers must preserve
+target-lock exclusion between ticks and captures. Supplement ownership isolates
+replacement documents; capture clears the local root's picture flag before
+script. No retired frame addresses remain in a global set.
 
 The incremental chunk cache enforces its serialized-byte and entry limits at
 insertion, including when a later capture step fails. Successful-capture aging
@@ -174,16 +184,11 @@ If protected content alone exceeds a journal or renderer-wide budget, that
 journal reports unsupported and releases its retention instead of exceeding
 the bound. Native page playback is unchanged.
 
-Idle discovery also wakes on WebGL journal collection. While its canvas is live,
-each journal obtains a retirement notifier shared by its document. Finalization
-touches only non-GC notification state, never the canvas, document, frame, or weak
-registry. One deferred renderer task coalesces collected journals per document;
-only that task resolves the weak document and checks current attached ownership
-before waking authoritative stream discovery. This does not arm animation demand
-or polling. Retired/replaced documents cannot notify replacement targets.
-Mutation/discovery rebinds an adopted canvas to its current document and wakes the
-old owner to remove its stale inventory, without retaining either document.
-Live rebinding pins the context, canvas, and document across supplement allocation;
-the deferred retirement task keeps only a weak document identity.
-The updated `webgl_commands.patch` and Blink glue must be built together; existing
-artifact images are not evidence of this retirement behavior.
+Canvas mutations and retirement notify through the drawing frame-request path,
+not a WebGL journal callback or GC retirement task. Typed canvas snapshot IPC
+remains at argument 9, including an authoritative empty inventory. The media
+marker kind is `canvas-video`. Compatibility page raster rejects
+viewport-affecting canvas markers rather than embedding their pixels; the
+ordinary visibility walk avoids blocking unrelated hidden sources. Rebuild
+this glue with the matched agent/client; old artifacts do not implement this
+contract.

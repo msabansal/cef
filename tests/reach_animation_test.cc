@@ -111,19 +111,8 @@ T* To(WebLocalFrame* value) {
   return static_cast<T*>(value);
 }
 struct Canvas2DBitmapProvider {
-  static bool IsReachWebGLCommandMode() { return true; }
-};
-struct HTMLCanvasElement {
-  Document& GetDocument() const { return *document; }
-  Document* document = nullptr;
-};
-struct ReachWebGLJournal {
-  HTMLCanvasElement* element() const { return nullptr; }
-  static std::vector<ReachWebGLJournal*> Current() { return {}; }
-  void ClearChangeNotification() {}
-  std::string State() const { return {}; }
-  std::string error() const { return {}; }
-  uint64_t retired() const { return 0; }
+  static bool IsReachCommandMode() { return enabled; }
+  static inline bool enabled = true;
 };
 enum class DocumentUpdateReason { kInspector };
 namespace scheduler {
@@ -141,10 +130,9 @@ struct WebThreadScheduler {
 
 // NATIVE_DEMAND_NOTIFICATIONS
 
-// NATIVE_WEBGL_REQUEST_PREFIX
+// NATIVE_ANIMATION_REQUEST
 
 int main() {
-#ifdef REACH_TEST_DEMAND
   {
     blink::Document document;
     blink::Document replacement;
@@ -159,17 +147,14 @@ int main() {
     int pictures = 0;
     int wakes = 0;
     FrameRequestCallback() = [&](blink::WebLocalFrame*) { ++pictures; };
-    WebGlChangeCallback() = [&](blink::WebLocalFrame*) { ++wakes; };
+    AnimationCallback() = [&](blink::WebLocalFrame*) { ++wakes; };
     auto inventory = [&] {
       std::vector<uint8_t> bytes;
-      std::map<std::string, std::vector<uint8_t>> originals;
-      assert(WebGlRequest(&web, "Reach.WebGlStreams.v2", "", "", "", "", "", 0,
-                          &bytes, &originals)
-                 .empty());
+      assert(DrawingAnimationRequest(&web, false, "", &bytes).empty());
       return std::string(bytes.begin(), bytes.end());
     };
     const auto idle = inventory();
-    // A fully idle page, with no WebGL contexts, asks for its first RAF.
+    // A fully idle ordinary page, with no canvas contexts, asks for its first RAF.
     OnFrameRequested(frame);
     assert(wakes == 1 && pictures == 1);
     assert(idle.find("\"animationPending\":false") != std::string::npos);
@@ -187,10 +172,7 @@ int main() {
     page.driver.lifecycle = [] {};
     auto tick = [&] {
       std::vector<uint8_t> bytes;
-      std::map<std::string, std::vector<uint8_t>> originals;
-      assert(WebGlRequest(&web, "Reach.WebGlTick.v2", "", "", "", "", "", 0,
-                          &bytes, &originals)
-                 .empty());
+      assert(DrawingAnimationRequest(&web, true, "same-token", &bytes).empty());
     };
     tick();
     assert(wakes == 2 && scripts == 1 && pictures == 1);
@@ -219,7 +201,8 @@ int main() {
     // Drawing notification coalescing cannot swallow a new animation wake.
     assert(pictures == 2);
   }
-#endif
+  AnimationCallback() = {};
+  FrameRequestCallback() = {};
   // Both documents deliberately report the same token; address identity
   // matters.
   for (int changed_at = 0; changed_at < 3; ++changed_at) {
@@ -252,16 +235,23 @@ int main() {
         frame.current_document = &replacement;
     };
     std::vector<uint8_t> output;
-    std::map<std::string, std::vector<uint8_t>> originals;
     const std::string token = "same-token";
-    const auto result = WebGlRequest(&web, "Reach.WebGlTick.v2", token, "", "",
-                                     "", "", 0, &output, &originals);
-    assert(result == (changed_at ? "WebGL animation document changed" : ""));
+    const auto result = DrawingAnimationRequest(&web, true, token, &output);
+    assert(result == (changed_at ? "Animation document changed" : ""));
     assert(scripts == 1 && lifecycles == (changed_at == 1 ? 0 : 1));
     assert(original.pins == 0 && replacement.pins == 0);
     assert(page.pins == 0 && frame.pins == 0 && token == "same-token");
-    assert(WebGlRequest(&web, "Reach.WebGlRead.v2", "stale-token", "", "", "",
-                        "", 0, &output, &originals) ==
-           "WebGL native document identity is stale");
+    const auto before = scripts;
+    for (const bool tick : {false, true}) {
+      assert(DrawingAnimationRequest(&web, tick, "stale-token", &output) ==
+             "Animation request document identity is stale");
+    }
+    assert(DrawingAnimationRequest(&web, true, "", &output) ==
+           "Animation request document identity is stale");
+    assert(scripts == before);
+    blink::Canvas2DBitmapProvider::enabled = false;
+    assert(DrawingAnimationRequest(&web, false, "", &output) ==
+           "Animation request frame is detached or disabled");
+    blink::Canvas2DBitmapProvider::enabled = true;
   }
 }

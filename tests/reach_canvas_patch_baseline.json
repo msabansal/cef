@@ -4,7 +4,7 @@
   "patches": [
     "reach/canvas_frames",
     "reach/video_commands",
-    "reach/webgl_commands"
+    "reach/canvas_video"
   ],
   "files": {
     "cc/paint/paint_image.h": "7e818da05699f025fcc91b2a4788de54f828a078498c8e22380cc1189b2fa5a4",
@@ -12,6 +12,8 @@
     "third_party/blink/renderer/bindings/scripts/bind_gen/interface.py": "b33175a4aac263038a4a781238a3207989ce2f4963215115d9313bfea9776ce8",
     "third_party/blink/renderer/bindings/scripts/bind_gen/reach_webgl_test.py": null,
     "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h": "367d2dee24900243a071a6a405ff26565185a467a77e17dc6dfcd390107fbba5",
+    "third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc": "61b5037c3338e7357d3da59106287193dff69f8e4786c33ef3c62d136f710016",
+    "third_party/blink/renderer/platform/graphics/reach_canvas_video.h": null,
     "third_party/blink/renderer/core/html/canvas/html_canvas_element.cc": "32d08cf9c9fb5ef2574507578d445bb940d1b2d14ae9b1e55a97c04e8fbd94f0",
     "third_party/blink/renderer/core/imagebitmap/image_bitmap.cc": "a829a0dd78d91b32df433704b2199120832f6980965a83a7ad78f99f475dfffd",
     "third_party/blink/renderer/core/imagebitmap/image_bitmap.h": "794b4fafe1caa01cd5063307a7e76a26a5c7e0833f52f4df417191b60460b4b2",

@@ -50,7 +50,7 @@ struct HTMLCanvasElement {
   LayoutObject layout;
 };
 struct Canvas2DBitmapProvider {
-  static bool IsReachWebGLVideoMode() { return true; }
+  static bool IsReachCanvasVideoMode() { return true; }
 };
 void (*reach_canvas_video_change_callback)(HTMLCanvasElement*) = nullptr;
 

@@ -55,6 +55,19 @@ if mode == 'reset':
                 continue
             state[path] = (digest(path), os.stat(path).st_mtime_ns) if os.path.isfile(path) else None
             repos.setdefault(repo, []).append(name)
+    # Removed patches must also be undone on an existing build checkout.
+    # Otherwise stale binding hooks, retained records and journal sources
+    # survive indefinitely because no current patch names their paths.
+    retired = os.path.join(src, 'cef', 'patch', 'retired_canvas_files.json')
+    if os.path.isfile(retired):
+        with open(retired, encoding='utf-8') as file:
+            for name in json.load(file):
+                path = os.path.join(src, name)
+                if path in state:
+                    continue
+                state[path] = ((digest(path), os.stat(path).st_mtime_ns)
+                               if os.path.isfile(path) else None)
+                repos.setdefault(src, []).append(name)
     # Per-file git calls reload Chromium's large index each time; batch them
     # so resetting hundreds of patched files costs one checkout per repository.
     for repo, names in repos.items():

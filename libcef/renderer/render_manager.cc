@@ -324,15 +324,6 @@ CefRefPtr<CefBrowserImpl> CefRenderManager::MaybeCreateBrowser(
       web_view, params->browser_id, params->config->is_popup, *config);
   browsers_.insert(std::make_pair(web_view, browser));
 
-  if (params->extra_info && params->extra_info->FindInt("reachMaxTextureSize")) {
-    const auto texture = params->extra_info->FindInt("reachMaxTextureSize");
-    const auto cube = params->extra_info->FindInt("reachMaxCubeMapTextureSize");
-    const auto renderbuffer =
-        params->extra_info->FindInt("reachMaxRenderbufferSize");
-    CHECK(texture && cube && renderbuffer);
-    blink_glue::SetWebGlTextureLimits(web_view, *texture, *cube, *renderbuffer);
-  }
-
   // Notify the render process handler.
   CefRefPtr<CefApp> application = CefAppManager::Get()->GetApplication();
   if (application.get()) {

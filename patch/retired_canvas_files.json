@@ -1,0 +1,18 @@
+[
+  "third_party/blink/renderer/bindings/scripts/bind_gen/interface.py",
+  "third_party/blink/renderer/bindings/scripts/bind_gen/reach_webgl_test.py",
+  "third_party/blink/renderer/core/imagebitmap/image_bitmap.cc",
+  "third_party/blink/renderer/core/imagebitmap/image_bitmap.h",
+  "third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.h",
+  "third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d_test.cc",
+  "third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.cc",
+  "third_party/blink/renderer/modules/canvas/imagebitmap/image_bitmap_factories.h",
+  "third_party/blink/renderer/modules/webgl/BUILD.gn",
+  "third_party/blink/renderer/modules/webgl/reach_webgl_call.h",
+  "third_party/blink/renderer/modules/webgl/reach_webgl_journal.cc",
+  "third_party/blink/renderer/modules/webgl/reach_webgl_journal.h",
+  "third_party/blink/renderer/modules/webgl/reach_webgl_pending.h",
+  "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider_test.cc",
+  "third_party/blink/renderer/platform/graphics/reach_image_bitmap_original.h",
+  "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
+]

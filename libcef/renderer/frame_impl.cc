@@ -124,12 +124,13 @@ CefFrameImpl::CefFrameImpl(CefBrowserImpl* browser, blink::WebLocalFrame* frame)
             PID_BROWSER, CefProcessMessage::Create("Reach.FrameRequested.v1"));
       }
     });
-    blink_glue::SetWebGlChangeCallback([](blink::WebLocalFrame* root) {
+    blink_glue::SetDrawingAnimationCallback([](blink::WebLocalFrame* root) {
       auto browser = CefBrowserImpl::GetBrowserForMainFrame(root->Top());
       if (!browser) return;
       if (auto impl = browser->GetWebFrameImpl(root)) {
         impl->SendProcessMessage(
-            PID_BROWSER, CefProcessMessage::Create("Reach.WebGlChanged.v2"));
+            PID_BROWSER,
+            CefProcessMessage::Create("Reach.DrawingAnimationChanged.v1"));
       }
     });
     return true;
@@ -994,49 +995,29 @@ void CefFrameImpl::SendMessage(const std::string& name,
     SendProcessMessage(PID_BROWSER, response);
     return;
   }
-  if (name == "Reach.WebGlStreams.v2" || name == "Reach.WebGlTick.v2" ||
-      name == "Reach.WebGlRead.v2" || name == "Reach.WebGlCommandSlice.v2" ||
-      name == "Reach.WebGlOriginalSlice.v2" ||
-      name == "Reach.WebGlApplied.v2" || name == "Reach.WebGlSent.v2") {
+  if (name == "Reach.DrawingAnimationState.v1" ||
+      name == "Reach.DrawingAnimationTick.v1") {
     CefRefPtr<CefFrameImpl> retain(this);
-    const bool slice = name == "Reach.WebGlCommandSlice.v2" ||
-                       name == "Reach.WebGlOriginalSlice.v2";
-    auto response = CefProcessMessage::Create(
-        slice ? "Reach.WebGlSliceResult.v2" : "Reach.WebGlResult.v2");
+    auto response =
+        CefProcessMessage::Create("Reach.DrawingAnimationResult.v1");
     auto values = response->GetArgumentList();
     const bool valid =
-        arguments.size() == (slice ? 7u : 6u) &&
-        (!slice ||
-         (arguments[6].is_string() && arguments[6].GetString().size() <= 20)) &&
-        arguments[0].is_int() && arguments[0].GetInt() > 0 &&
-        arguments[1].is_string() && arguments[1].GetString().size() <= 128 &&
-        arguments[2].is_string() && arguments[2].GetString().size() <= 20 &&
-        arguments[3].is_string() && arguments[3].GetString().size() <= 20 &&
-        arguments[4].is_string() && arguments[4].GetString().size() <= 20 &&
-        arguments[5].is_int();
+        arguments.size() == 2 && arguments[0].is_int() &&
+        arguments[0].GetInt() > 0 && arguments[1].is_string() &&
+        arguments[1].GetString().size() <= 128;
     values->SetInt(0, valid ? arguments[0].GetInt() : 0);
     std::vector<uint8_t> bytes;
-    std::map<std::string, std::vector<uint8_t>> originals;
     const std::string error =
         !valid || !frame_
-            ? "Invalid or detached WebGL request"
-            : blink_glue::WebGlRequest(
-                  frame_, name, arguments[1].GetString(),
-                  arguments[2].GetString(), arguments[3].GetString(),
-                  arguments[4].GetString(),
-                  slice ? arguments[6].GetString() : "", arguments[5].GetInt(),
-                  &bytes, &originals);
+            ? "Invalid or detached animation request"
+            : blink_glue::DrawingAnimationRequest(
+                  frame_, name == "Reach.DrawingAnimationTick.v1",
+                  arguments[1].GetString(), &bytes);
     values->SetString(1, error);
-    if (error.empty()) {
+    if (error.empty())
       values->SetBinary(2, CefBinaryValue::Create(bytes.data(), bytes.size()));
-      auto resources = CefDictionaryValue::Create();
-      for (const auto& [key, data] : originals)
-        resources->SetBinary(key, CefBinaryValue::Create(data.data(), data.size()));
-      values->SetDictionary(3, resources);
-    } else {
+    else
       values->SetNull(2);
-      values->SetNull(3);
-    }
     SendProcessMessage(PID_BROWSER, response);
     return;
   }

@@ -1,4 +1,4 @@
-"""Compile actual demand notification and animation/discovery code with stubs."""
+"""Compile actual demand notifications and animation-only IPC glue with stubs."""
 import argparse
 from pathlib import Path
 import subprocess
@@ -16,36 +16,32 @@ def main():
     ) if args.baseline else (
         root / "libcef" / "renderer" / "blink_glue.cc"
     ).read_text()
-    callback_start = source.index(
-        "std::function<void(blink::WebLocalFrame*)>& WebGlChangeCallback() {")
-    callback = source[callback_start:source.index(
-        "void OnWebGlChanged", callback_start)]
-    notifications = callback + source[source.index("// Local roots"):source.index(
+    notifications = source[source.index("// Local roots"):source.index(
         "// Media playback state")]
-    start = source.index("std::string WebGlRequest(")
-    end = source.index("  uint64_t id = 0, context_generation", start)
-    request = source[start:end] + """
-  static_cast<void>(std::tie(stream, generation, position, offset, max_bytes,
-                           output, originals));
-  return {};
-}
-"""
-    harness = (root / "tests" / "reach_webgl_tick_test.cc").read_text()
+    start = source.index("std::string DrawingAnimationRequest(")
+    end = source.index("std::string ReadDrawingMediaJournal(", start)
+    request = source[start:end]
+    harness = (root / "tests" / "reach_animation_test.cc").read_text()
     harness = harness.replace("// NATIVE_DEMAND_NOTIFICATIONS", notifications)
-    harness = harness.replace("// NATIVE_WEBGL_REQUEST_PREFIX", request)
+    harness = harness.replace("// NATIVE_ANIMATION_REQUEST", request)
     output = root / ".artifacts" / "reach-animation-test"
     output.mkdir(parents=True, exist_ok=True)
     unit = output / "animation-test.cc"
     unit.write_text(harness)
     executable = output / "animation-test.exe"
-    subprocess.run([
-        args.compiler, "/nologo", "/EHsc", "/std:c++20", "/W4", "/WX",
-        "/DREACH_TEST_DEMAND", str(unit), "/Fe:" + str(executable),
-        "/Fo:" + str(output / "animation-test.obj"),
-    ], cwd=root, check=True)
+    if Path(args.compiler).stem.lower() == "cl":
+        command = [
+            args.compiler, "/nologo", "/EHsc", "/std:c++20", "/W4", "/WX",
+            str(unit), "/Fe:" + str(executable),
+            "/Fo:" + str(output / "animation-test.obj"),
+        ]
+    else:
+        command = [args.compiler, "-std=c++20", "-Wall", "-Wextra", "-Werror",
+                   "-Wshadow", str(unit), "-o", str(executable)]
+    subprocess.run(command, cwd=root, check=True)
     subprocess.run([str(executable)], cwd=root, check=True)
-    print("Actual notification/tick/discovery: idle, first RAF, rearm, "
-          "coalescing, cancellation, navigation isolation PASS")
+    print("Animation-only notifications/state/tick: idle, first RAF, rearm, "
+          "coalescing, cancellation, pinned ownership, navigation isolation PASS")
 
 
 if __name__ == "__main__":

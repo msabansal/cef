@@ -28,14 +28,13 @@ struct CommandLine {
 namespace blink {
 struct Canvas2DBitmapProvider {
   static bool IsReachCommandMode();
-  static bool IsReachWebGLCommandMode();
-  static bool IsReachWebGLVideoMode();
+  static bool IsReachCanvasVideoMode();
 };
 #include "reach_canvas_video_mode.inc"
 }  // namespace blink
 
 int main(int argc, char** argv) {
-  assert(argc == 7);
+  assert(argc == 6);
   auto* line = base::CommandLine::ForCurrentProcess();
   if (std::string(argv[1]) == "1")
     line->switches.insert("reach-drawing-commands");
@@ -43,8 +42,8 @@ int main(int argc, char** argv) {
     line->switches.insert("reach-webgl-video");
   base::Environment::values["REACH_WEBGL_VIDEO"] = argv[3];
   base::Environment::values["REACH_WEBGL_COMMAND_REPLAY"] = argv[4];
-  assert(blink::Canvas2DBitmapProvider::IsReachWebGLVideoMode() ==
+  assert(blink::Canvas2DBitmapProvider::IsReachCanvasVideoMode() ==
          (std::string(argv[5]) == "1"));
-  assert(blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode() ==
-         (std::string(argv[6]) == "1"));
+  assert(blink::Canvas2DBitmapProvider::IsReachCommandMode() ==
+         (std::string(argv[1]) == "1"));
 }
