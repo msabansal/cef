@@ -260,6 +260,36 @@ Clang runs with fatal `-Wshadow` diagnostics before compiling/executing the
 portable harness. `--baseline 01af7fa1f` reproduces the local-document shadow.
 This does not build CEF or qualify actual Blink GC/native browser behavior.
 
+`python tests\run_reach_animation_test.py` also checks notification coalescing
+and animation demand independently, including a replacement document sharing
+the same frame address. `--baseline 5fd152cc36f06594a50b0c6dc835eafdd49a49cc`
+reproduces the missing first picture notification after replacement.
+
+## Reach bounded capture retention
+
+From a Visual Studio developer shell:
+
+```powershell
+python tests\run_reach_chunk_cache_test.py
+python tests\run_reach_media_journal_test.py
+python tests\run_reach_media_journal_patch_test.py --fixture <unmodified-chromium>
+```
+
+The first two compile actual cache/journal code with substituted Chromium
+boundaries. The cache regression checks byte and entry limits without ever
+finishing a capture, then verifies ordinary successful-capture aging. The
+journal regression checks renderer-wide admission with protected initialization
+segments, repeated type changes, initialization retention, cursor resets, and
+large-append compaction. It prints compaction time without a flaky timing gate.
+Their `--baseline 5fd152cc36f06594a50b0c6dc835eafdd49a49cc` options reproduce
+the old failures; journal `--case global`, `init`, or `compact` selects one case.
+
+The patch runner verifies immutable Chromium inputs against
+`reach_media_journal_patch_baseline.json`, applies configured predecessors, and
+checks exact final blobs plus strict forward/reverse/reapplication. It never
+changes its input fixture or downloads source. These are portable regressions,
+not native browser qualification.
+
 ## Reach program metadata capture
 
 ```powershell
