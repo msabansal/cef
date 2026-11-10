@@ -1,0 +1,57 @@
+diff --git third_party/blink/renderer/core/resize_observer/resize_observer_utilities.cc third_party/blink/renderer/core/resize_observer/resize_observer_utilities.cc
+--- third_party/blink/renderer/core/resize_observer/resize_observer_utilities.cc
++++ third_party/blink/renderer/core/resize_observer/resize_observer_utilities.cc
+@@ -4,11 +4,14 @@
+ 
+ #include "third_party/blink/renderer/core/resize_observer/resize_observer_utilities.h"
+ 
++#include "base/command_line.h"
++#include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/geometry/dom_rect_read_only.h"
+ #include "third_party/blink/renderer/core/layout/adjust_for_absolute_zoom.h"
+ #include "third_party/blink/renderer/core/layout/geometry/logical_offset.h"
+ #include "third_party/blink/renderer/core/layout/layout_box.h"
+ #include "third_party/blink/renderer/core/layout/layout_object.h"
++#include "third_party/blink/renderer/core/page/page.h"
+ #include "third_party/blink/renderer/core/resize_observer/resize_observer_box_options.h"
+ #include "third_party/blink/renderer/core/style/computed_style.h"
+ #include "third_party/blink/renderer/platform/geometry/layout_unit.h"
+@@ -18,6 +21,16 @@
+ 
+ namespace {
+ 
++float DevicePixelContentBoxScale(const LayoutObject& layout_object) {
++  const auto* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line->HasSwitch("reach-drawing-commands") &&
++      !command_line->HasSwitch("reach-video-sink")) {
++    return 1.0f;
++  }
++  const auto* page = layout_object.GetDocument().GetPage();
++  return page ? page->InspectorDeviceScaleFactorOverride() : 1.0f;
++}
++
+ // Compute the logical paint offset for a layout object.
+ LogicalOffset ComputePaintOffset(const LayoutObject& layout_object,
+                                  const ComputedStyle& style) {
+@@ -65,10 +78,19 @@
+     LogicalSize box_size,
+     const LayoutObject& layout_object,
+     const ComputedStyle& style) {
++  // Layout already includes native device scale and page/CSS zoom, but not
++  // the inspector override used by Reach's target-local source density.
++  // Apply that same override as LocalFrame::DevicePixelRatio before snapping
++  // both edges, including fractional offsets.
++  const float scale = DevicePixelContentBoxScale(layout_object);
+   LogicalOffset paint_offset = ComputePaintOffset(layout_object, style);
+   return gfx::Size(
+-      SnapSizeToPixel(box_size.inline_size, paint_offset.inline_offset),
+-      SnapSizeToPixel(box_size.block_size, paint_offset.block_offset));
++      SnapSizeToPixel(
++          LayoutUnit::FromFloatRound(box_size.inline_size * scale),
++          LayoutUnit::FromFloatRound(paint_offset.inline_offset * scale)),
++      SnapSizeToPixel(
++          LayoutUnit::FromFloatRound(box_size.block_size * scale),
++          LayoutUnit::FromFloatRound(paint_offset.block_offset * scale)));
+ }
+ 
+ // static

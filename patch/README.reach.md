@@ -34,6 +34,7 @@ Chromium's original path. This patch targets Chromium `156.0.8078.0`.
 | `wire_media.patch` | Browser-context original encoded responses, image/font destination and CSP, headers, cookies and cancellation. |
 | `root_scrollbars.patch` | Main-frame viewport scrollbar suppression without disabling native root input. |
 | `scrollbar_input.patch` | Native scrollbar input for command capture without compositor commits. |
+| `device_pixel_content_box.patch` | Keep `ResizeObserver` device-pixel boxes coherent with target-local emulated DPR in both capture modes. Apply the inspector density override before snapping size and paint offset; preserve native/page/CSS zoom, CSS boxes and ordinary non-Reach rendering. |
 | `canvas_frames.patch` | Canvas2D records and bounded local/out-of-process child-frame composition. |
 | `video_commands.patch` | Video paint-order markers without embedding source-decoded frames. |
 | `paint_chunks.patch` | Incremental drawing-command paint chunks. |
