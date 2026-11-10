@@ -33,7 +33,7 @@ diff --git third_party/blink/renderer/core/resize_observer/resize_observer_utili
  // Compute the logical paint offset for a layout object.
  LogicalOffset ComputePaintOffset(const LayoutObject& layout_object,
                                   const ComputedStyle& style) {
-@@ -65,10 +78,17 @@
+@@ -65,10 +78,19 @@
      LogicalSize box_size,
      const LayoutObject& layout_object,
      const ComputedStyle& style) {
@@ -46,10 +46,12 @@ diff --git third_party/blink/renderer/core/resize_observer/resize_observer_utili
    return gfx::Size(
 -      SnapSizeToPixel(box_size.inline_size, paint_offset.inline_offset),
 -      SnapSizeToPixel(box_size.block_size, paint_offset.block_offset));
-+      SnapSizeToPixel(box_size.inline_size * scale,
-+                      paint_offset.inline_offset * scale),
-+      SnapSizeToPixel(box_size.block_size * scale,
-+                      paint_offset.block_offset * scale));
++      SnapSizeToPixel(
++          LayoutUnit::FromFloatRound(box_size.inline_size * scale),
++          LayoutUnit::FromFloatRound(paint_offset.inline_offset * scale)),
++      SnapSizeToPixel(
++          LayoutUnit::FromFloatRound(box_size.block_size * scale),
++          LayoutUnit::FromFloatRound(paint_offset.block_offset * scale)));
  }
  
  // static
