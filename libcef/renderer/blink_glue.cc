@@ -279,8 +279,7 @@ CefDrawingResourceSources GetDrawingResourceSources(
 
 namespace {
 
-// Local roots already reported as needing a visual update since their last
-// drawing-command capture. Pointers are only compared, never dereferenced.
+// Local roots coalesce visual update notifications within their documents.
 // Animation demand is separate: discovery must not consume it, and picture
 // notification coalescing must not swallow a first RAF on an otherwise idle
 // page. A document supplement retires with its document, not a reused pointer.
@@ -307,16 +306,12 @@ class PendingAnimation final : public blink::GarbageCollected<PendingAnimation>,
   }
 
   bool pending = false;
+  bool picture_pending = false;
 };
 
 const char PendingAnimation::kSupplementName[] = "ReachPendingAnimation";
 
 std::function<void(blink::WebLocalFrame*)>& WebGlChangeCallback();
-
-std::set<const blink::LocalFrame*>& RequestedFrameRoots() {
-  static base::NoDestructor<std::set<const blink::LocalFrame*>> roots;
-  return *roots;
-}
 
 std::function<void(blink::WebLocalFrame*)>& FrameRequestCallback() {
   static base::NoDestructor<std::function<void(blink::WebLocalFrame*)>> callback;
@@ -324,9 +319,10 @@ std::function<void(blink::WebLocalFrame*)>& FrameRequestCallback() {
 }
 
 void OnFrameRequested(blink::LocalFrame& root) {
-  if (blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode() &&
-      root.GetDocument()) {
-    auto& demand = PendingAnimation::From(*root.GetDocument());
+  if (!root.GetDocument())
+    return;
+  auto& demand = PendingAnimation::From(*root.GetDocument());
+  if (blink::Canvas2DBitmapProvider::IsReachWebGLCommandMode()) {
     if (!demand.pending) {
       demand.pending = true;
       if (WebGlChangeCallback()) {
@@ -335,8 +331,9 @@ void OnFrameRequested(blink::LocalFrame& root) {
       }
     }
   }
-  if (!FrameRequestCallback() || !RequestedFrameRoots().insert(&root).second)
+  if (!FrameRequestCallback() || demand.picture_pending)
     return;
+  demand.picture_pending = true;
   if (auto* web_frame = blink::WebLocalFrameImpl::FromFrame(root))
     FrameRequestCallback()(web_frame);
 }
@@ -2523,6 +2520,11 @@ class ChunkSerializationCache {
       entries_.erase(found);
     }
     if (entry.bytes.size() > kMaxBytes / 4) return;
+    if (bytes_ + entry.bytes.size() > kMaxBytes ||
+        entries_.size() >= kMaxChunkRefs * 2) {
+      entries_.clear();
+      bytes_ = 0;
+    }
     bytes_ += entry.bytes.size();
     entries_.emplace(key, std::move(entry));
   }
@@ -3576,7 +3578,8 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   }
   // Visual update requests made from here on (including by this capture's own
   // animation and lifecycle steps) are reported again for the next capture.
-  RequestedFrameRoots().erase(&frame->LocalFrameRoot());
+  if (auto* root_document = frame->LocalFrameRoot().GetDocument())
+    PendingAnimation::From(*root_document).picture_pending = false;
   PendingAnimation::From(*document).pending = false;
   CaptureTimer::Get().Start();
   // Held begin frames also suppress the compositor's idle-period signal.

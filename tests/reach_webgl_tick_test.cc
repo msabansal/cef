@@ -213,10 +213,11 @@ int main() {
     assert(inventory().find("\"animationPending\":false") != std::string::npos);
     OnFrameRequested(frame);
     assert(wakes == 5);
+    assert(pictures == 2);
     frame.current_document = &document;
     assert(inventory().find("\"animationPending\":true") != std::string::npos);
     // Drawing notification coalescing cannot swallow a new animation wake.
-    assert(pictures == 1);
+    assert(pictures == 2);
   }
 #endif
   // Both documents deliberately report the same token; address identity

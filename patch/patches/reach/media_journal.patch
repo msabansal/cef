@@ -13,10 +13,10 @@ index 1d7cd61..1d0f316 100644
    "media/remote_playback_observer.h",
 diff --git third_party/blink/renderer/core/html/media/reach_media_journal.cc third_party/blink/renderer/core/html/media/reach_media_journal.cc
 new file mode 100644
-index 0000000..fb91a17
+index 0000000..e2b4e6c
 --- /dev/null
 +++ third_party/blink/renderer/core/html/media/reach_media_journal.cc
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,305 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -167,7 +167,9 @@ index 0000000..fb91a17
 +    return;
 +  }
 +  if (kind == Kind::kAddBuffer || kind == Kind::kChangeType) {
-+    expects_init_.push_back(buffer);
++    expects_init_.insert(buffer);
++  } else if (kind == Kind::kRemoveBuffer) {
++    expects_init_.erase(buffer);
 +  }
 +  Push({0, kind, buffer, a, b, std::string(text), {}, false});
 +}
@@ -181,11 +183,8 @@ index 0000000..fb91a17
 +    return;
 +  }
 +  bool init = IsInitializationSegment(data);
-+  const auto expected =
-+      std::find(expects_init_.begin(), expects_init_.end(), buffer);
-+  if (expected != expects_init_.end()) {
++  if (expects_init_.erase(buffer)) {
 +    init = true;
-+    expects_init_.erase(expected);
 +  }
 +  Push({0, Kind::kAppend, buffer, 0, 0, std::string(),
 +        std::vector<uint8_t>(data.begin(), data.end()), init});
@@ -199,6 +198,7 @@ index 0000000..fb91a17
 +  g_total_bytes -= bytes_;
 +  bytes_ = 0;
 +  entries_.clear();
++  expects_init_.clear();
 +  Changed();
 +}
 +
@@ -210,6 +210,7 @@ index 0000000..fb91a17
 +  g_total_bytes -= bytes_;
 +  bytes_ = 0;
 +  entries_.clear();
++  expects_init_.clear();
 +  Journals().erase(id_);
 +}
 +
@@ -224,34 +225,37 @@ index 0000000..fb91a17
 +}
 +
 +void ReachMediaJournal::Compact() {
-+  while (bytes_ > kMaxJournalBytes || entries_.size() > kMaxEntries ||
-+         g_total_bytes > kMaxTotalBytes) {
-+    std::map<int, uint64_t> latest_init;
-+    for (const auto& entry : entries_) {
-+      if (entry.kind == Kind::kAppend && entry.init) {
-+        latest_init[entry.buffer] = entry.seq;
-+      }
++  size_t retained = entries_.size();
++  const auto over_budget = [&] {
++    return bytes_ > kMaxJournalBytes || retained > kMaxEntries ||
++           g_total_bytes > kMaxTotalBytes;
++  };
++  if (!over_budget()) {
++    return;
++  }
++  std::map<int, uint64_t> latest_init;
++  for (const auto& entry : entries_) {
++    if (entry.kind == Kind::kAppend && entry.init) {
++      latest_init[entry.buffer] = entry.seq;
 +    }
-+    auto victim = std::find_if(
-+        entries_.begin(), entries_.end(), [&](const Entry& entry) {
-+          if (entry.kind != Kind::kAppend) {
-+            return false;
-+          }
-+          const auto init = latest_init.find(entry.buffer);
-+          return init == latest_init.end() || init->second != entry.seq;
-+        });
-+    if (victim == entries_.end()) {
-+      if (bytes_ > kMaxJournalBytes || entries_.size() > kMaxEntries) {
-+        Unsupported();
-+      }
-+      return;
++  }
++  std::erase_if(entries_, [&](const Entry& entry) {
++    if (!over_budget() || entry.kind != Kind::kAppend) {
++      return false;
 +    }
-+    const size_t size =
-+        victim->data.size() + victim->text.size() + kEntryOverhead;
++    const auto init = latest_init.find(entry.buffer);
++    if (init != latest_init.end() && init->second == entry.seq) {
++      return false;
++    }
++    const size_t size = entry.data.size() + entry.text.size() + kEntryOverhead;
 +    bytes_ -= size;
 +    g_total_bytes -= size;
-+    dropped_ = std::max(dropped_, victim->seq);
-+    entries_.erase(victim);
++    --retained;
++    dropped_ = std::max(dropped_, entry.seq);
++    return true;
++  });
++  if (over_budget()) {
++    Unsupported();
 +  }
 +}
 +
@@ -320,10 +324,10 @@ index 0000000..fb91a17
 +}  // namespace blink
 diff --git third_party/blink/renderer/core/html/media/reach_media_journal.h third_party/blink/renderer/core/html/media/reach_media_journal.h
 new file mode 100644
-index 0000000..a3e3900
+index 0000000..febe2c5
 --- /dev/null
 +++ third_party/blink/renderer/core/html/media/reach_media_journal.h
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,124 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -333,6 +337,7 @@ index 0000000..a3e3900
 +
 +#include <cstdint>
 +#include <deque>
++#include <set>
 +#include <string>
 +#include <string_view>
 +#include <vector>
@@ -434,7 +439,7 @@ index 0000000..a3e3900
 +  const uint64_t id_;
 +  WeakPersistent<HTMLMediaElement> element_;
 +  std::deque<Entry> entries_;
-+  std::vector<int> expects_init_;
++  std::set<int> expects_init_;
 +  uint64_t next_ = 1;
 +  // Highest sequence number removed by compaction.
 +  uint64_t dropped_ = 0;

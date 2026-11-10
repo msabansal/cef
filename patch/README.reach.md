@@ -40,7 +40,7 @@ Chromium's original path. This patch targets Chromium `156.0.8078.0`.
 | `frame_requests.patch` | On-demand command-capture visual update notifications, also waking document-scoped animation demand in Blink glue before any WebGL context exists. |
 | `command_presentation.patch` | Successful command-capture presentation/timing completion. |
 | `capture_throttling.patch` | Capture-scoped painting of required cross-site frames outside the viewport; background throttling, loading, display locks and view transitions remain intact. |
-| `media_journal.patch` | Ordered same-thread MediaSource operations. |
+| `media_journal.patch` | Ordered same-thread MediaSource operations with bounded local and renderer-wide retention. |
 | `webgl_commands.patch` | Converted WebGL commands, resources, retirement and client composition. |
 | `canvas_video.patch` | Explicit opt-in per-canvas owned RGBA snapshots and paint markers. |
 | `canvas_video_all.patch` | Apply that transport selection to painted Canvas2D as well as WebGL, restoring native raster providers only for canvas video. Preflight the complete painted inventory before snapshots; hidden source buffers stay native without streams. Uniformly downsample oversized painted inventories within the unchanged transport pixel, snapshot and codec budgets; keep native canvas dimensions and page semantics unchanged. HTML remains command replay; unsupported source dimensions or snapshots fail explicitly. |
@@ -156,6 +156,20 @@ delivery independently of picture-notification coalescing. Discovery does not
 consume demand; servicing clears it before script so nested RAF/CSS scheduling
 is retained. Drawing capture services the same demand without enabling raster
 or compositor begin frames. Supplement ownership isolates replacement documents.
+Picture-notification coalescing uses the same document lifetime, independently
+of animation demand; capture clears the local root document's picture flag
+before servicing script. No retired frame addresses remain in a global set.
+
+The incremental chunk cache enforces its serialized-byte and entry limits at
+insertion, including when a later capture step fails. Successful-capture aging
+is not required to keep retained entries within those limits.
+
+Media journals compact eligible old appends in one pass, preserving control
+operations and each buffer's latest initialization segment. Repeated type
+changes arm one initialization expectation per buffer, not a queue of them.
+If protected content alone exceeds a journal or renderer-wide budget, that
+journal reports unsupported and releases its retention instead of exceeding
+the bound. Native page playback is unchanged.
 
 Idle discovery also wakes on WebGL journal collection. While its canvas is live,
 each journal obtains a retirement notifier shared by its document. Finalization

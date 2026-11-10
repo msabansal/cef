@@ -1,0 +1,12 @@
+{
+  "chromium_commit": "9ce0cc67aed57702fcfc011b9e49b0b02d7d5e3a",
+  "files": {
+    "third_party/blink/renderer/core/html/build.gni": "17f1829b88eb284a036a1f8c9b10880331fbc1583da7a08cc64d006592236550",
+    "third_party/blink/renderer/core/html/media/reach_media_journal.cc": null,
+    "third_party/blink/renderer/core/html/media/reach_media_journal.h": null,
+    "third_party/blink/renderer/modules/mediasource/media_source.cc": "1c19beeb3716d1d4106142f178fb85a426ef211162dde1fd5c33fb61439a5244",
+    "third_party/blink/renderer/modules/mediasource/media_source.h": "9f0a36eca613b77f5b51e3749c5f44b1a4a9095c22e9e94db640781b227ed5e3",
+    "third_party/blink/renderer/modules/mediasource/source_buffer.cc": "c860b87b640708a8b53fe4c747e4803e3742c442df4a5ed628a6e61771feba5f",
+    "third_party/blink/renderer/modules/mediasource/source_buffer.h": "f371f8c4f76cf8131bb60672ae04d884c5c537035c0559b8d65380654f76641e"
+  }
+}
