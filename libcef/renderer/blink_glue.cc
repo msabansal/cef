@@ -677,11 +677,15 @@ OriginalDigest ImageDigest(SkImage* image, const SkData& encoded) {
 
 SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
   auto* state = static_cast<PaintSerialization*>(context);
-  if (state->error.empty() &&
-      (image->isTextureBacked() || image->width() <= 0 ||
-       image->height() <= 0 || image->width() > 4096 ||
-       image->height() > 4096)) {
-    state->error = "Texture-backed or oversized image requires command support";
+  if (state->error.empty()) {
+    if (image->width() <= 0 || image->height() <= 0) {
+      state->error = "Invalid original image dimensions";
+    } else if (image->width() > 16384 || image->height() > 16384) {
+      // Match the client's canvas/texture edge limit, independently of pixels.
+      state->error = "Original image exceeds client replay dimensions";
+    } else if (image->isTextureBacked()) {
+      state->error = "Texture-backed or deferred image requires command support";
+    }
   }
   const uint64_t pixels =
       static_cast<uint64_t>(image->width()) * image->height();
@@ -3409,10 +3413,12 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
           return result;
         }
         const auto found = children.find(DrawingFrameIdentity(child));
-        if (found == children.end() ||
-            (child_bytes += found->second.size()) > MaxDrawingPaintBytes()) {
-          result.error =
-              "Missing child frame picture or composition byte budget exceeded";
+        if (found == children.end()) {
+          result.error = "Missing child frame command picture";
+          return result;
+        }
+        if ((child_bytes += found->second.size()) > MaxDrawingPaintBytes()) {
+          result.error = "Child frame composition byte budget exceeded";
           return result;
         }
         SkDeserialProcs procs;
