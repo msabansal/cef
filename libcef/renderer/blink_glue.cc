@@ -482,6 +482,7 @@ constexpr size_t kMaxFilterVisits = 1 << 16;
 constexpr size_t kMaxRecordDepth = 32;
 constexpr uint64_t kMaxViewportPixels = 4 * 1024 * 1024;
 constexpr uint64_t kMaxDecodedImagePixels = 16 * 1024 * 1024;
+constexpr int kMaxReplayImageEdge = 16384;
 
 class BoundedPaintStream final : public SkWStream {
  public:
@@ -680,7 +681,8 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
   if (state->error.empty()) {
     if (image->width() <= 0 || image->height() <= 0) {
       state->error = "Invalid original image dimensions";
-    } else if (image->width() > 16384 || image->height() > 16384) {
+    } else if (image->width() > kMaxReplayImageEdge ||
+               image->height() > kMaxReplayImageEdge) {
       // Match the client's canvas/texture edge limit, independently of pixels.
       state->error = "Original image exceeds client replay dimensions";
     } else if (image->isTextureBacked()) {
@@ -895,7 +897,8 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
       DeferUnsupportedPaint(
           state, "Raster fallback cannot read texture-backed or deferred paint");
     }
-    if (!pixels || image.width() > 4096 || image.height() > 4096 ||
+    if (!pixels || image.width() > kMaxReplayImageEdge ||
+        image.height() > kMaxReplayImageEdge ||
         pixels > kMaxDecodedImagePixels - state->image_pixels) {
       state->error = "Raster fallback decoded image pixel budget exceeded";
       return false;
@@ -962,8 +965,13 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
   if (state->budget_only) {
     const uint64_t pixels = uint64_t(std::max(0, image.width())) *
                             std::max(0, image.height());
-    if (!pixels || image.width() > 4096 || image.height() > 4096) {
+    if (!pixels) {
       state->error = "Decoded image pixel budget exceeded";
+      return false;
+    }
+    if (image.width() > kMaxReplayImageEdge ||
+        image.height() > kMaxReplayImageEdge) {
+      state->error = "Original image exceeds client replay dimensions";
       return false;
     }
     if (image.IsTextureBacked() || image.IsDeferredPaintRecord() ||
