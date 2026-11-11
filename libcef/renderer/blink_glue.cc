@@ -245,7 +245,7 @@ CefDrawingResourceSources GetDrawingResourceSources(
       // Fonts may discard their wire buffer after sanitizing/decompressing it.
       // Never associate a publisher WOFF hash with a different SkTypeface stream.
       const auto buffer = resource->ResourceBuffer();
-      if (!buffer || !buffer->size() || buffer->size() > 32 * 1024 * 1024)
+      if (!buffer || !buffer->size() || buffer->size() > MaxDrawingPaintBytes())
         continue;
       const auto key =
           (resource->GetType() == blink::ResourceType::kFont ? "font:" : "image:") +
