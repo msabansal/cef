@@ -16,6 +16,7 @@
 #include <string_view>
 #include <tuple>
 
+#include "base/command_line.h"
 #include "base/functional/bind.h"
 #include "base/functional/callback_helpers.h"
 #include "base/hash/hash.h"
@@ -489,7 +490,7 @@ bool SetDrawingMediaReady(blink::WebLocalFrame* web_frame,
       if (media && media->GetDomNodeId() == id) {
         const bool applied = media->SetReachReplayReady(replay, ready);
         if (applied)
-          OnFrameRequested(frame);
+          OnFrameRequested(*frame);
         return applied;
       }
     }
