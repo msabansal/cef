@@ -1021,6 +1021,27 @@ void CefFrameImpl::SendMessage(const std::string& name,
     SendProcessMessage(PID_BROWSER, response);
     return;
   }
+  if (name == "Reach.DrawingMediaReady.v1") {
+    CefRefPtr<CefFrameImpl> retain(this);
+    auto response =
+        CefProcessMessage::Create("Reach.DrawingMediaReadyResult.v1");
+    auto values = response->GetArgumentList();
+    const bool valid =
+        arguments.size() == 5 && arguments[0].is_int() &&
+        arguments[0].GetInt() > 0 && arguments[1].is_string() &&
+        arguments[1].GetString().size() == 32 && arguments[2].is_int() &&
+        arguments[2].GetInt() > 0 && arguments[3].is_string() &&
+        arguments[3].GetString().size() == 32 && arguments[4].is_bool();
+    values->SetInt(0, valid ? arguments[0].GetInt() : 0);
+    values->SetString(1, valid ? "" : "Invalid media readiness request");
+    values->SetBool(
+        2, valid && frame_ &&
+               blink_glue::SetDrawingMediaReady(
+                   frame_, arguments[1].GetString(), arguments[2].GetInt(),
+                   arguments[3].GetString(), arguments[4].GetBool()));
+    SendProcessMessage(PID_BROWSER, response);
+    return;
+  }
   if (name == "Reach.DrawingMedia.v2") {
     // [request, journal, cursor, max bytes, document]
     // -> Reach.DrawingMediaJournal.v2

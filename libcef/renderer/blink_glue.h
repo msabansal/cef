@@ -147,6 +147,13 @@ BLINK_EXPORT std::string ReadDrawingMediaJournal(blink::WebLocalFrame* frame,
                                                  const std::string& cursor,
                                                  int max_bytes,
                                                  std::vector<uint8_t>* out);
+
+// Returns false for a retired document, element or replay incarnation.
+bool SetDrawingMediaReady(blink::WebLocalFrame* frame,
+                          const std::string& document,
+                          int id,
+                          const std::string& replay,
+                          bool ready);
 BLINK_EXPORT bool IsDrawingDocument(blink::WebLocalFrame* frame,
                                     const std::string& document);
 

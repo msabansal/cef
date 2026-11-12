@@ -355,6 +355,9 @@ void ObserveMediaState(blink::LocalDOMWindow* window) {
   for (const auto* type :
        {&blink::event_type_names::kPlay, &blink::event_type_names::kPause,
         &blink::event_type_names::kPlaying, &blink::event_type_names::kSeeked,
+        &blink::event_type_names::kWaiting, &blink::event_type_names::kSeeking,
+        &blink::event_type_names::kCanplay,
+        &blink::event_type_names::kLoadeddata,
         &blink::event_type_names::kRatechange,
         &blink::event_type_names::kVolumechange,
         &blink::event_type_names::kEnded, &blink::event_type_names::kEmptied,
@@ -461,6 +464,37 @@ std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
   }
   *out = journal->Read(cursor, static_cast<size_t>(max_bytes));
   return {};
+}
+
+bool SetDrawingMediaReady(blink::WebLocalFrame* web_frame,
+                          const std::string& document,
+                          int id,
+                          const std::string& replay,
+                          bool ready) {
+  auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
+  if (!frame || !frame->IsAttached() || !frame->GetDocument() ||
+      frame->GetDocument()->Token().ToString() != document ||
+      !base::CommandLine::ForCurrentProcess()->HasSwitch(
+          "reach-media-replay")) {
+    return false;
+  }
+  for (blink::Frame* child = frame; child;
+       child = child->Tree().TraverseNext(frame)) {
+    auto* local = blink::DynamicTo<blink::LocalFrame>(child);
+    if (!local || &local->LocalFrameRoot() != frame || !local->GetDocument())
+      continue;
+    for (auto& node :
+         blink::FlatTreeTraversal::DescendantsOf(*local->GetDocument())) {
+      auto* media = blink::DynamicTo<blink::HTMLMediaElement>(node);
+      if (media && media->GetDomNodeId() == id) {
+        const bool applied = media->SetReachReplayReady(replay, ready);
+        if (applied)
+          OnFrameRequested(frame);
+        return applied;
+      }
+    }
+  }
+  return false;
 }
 
 // One aggregate bounds each capture's serialized paint, including any single
@@ -3611,6 +3645,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       // Audio has no marker and always does.
       if (media->IsHTMLVideoElement() &&
           !dependencies.media_ids.contains(media->GetDomNodeId())) {
+        media->DisableReachReplay();
         continue;
       }
       const auto& url = media->currentSrc();
@@ -3663,6 +3698,17 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
         resource = base::HexEncode(crypto::hash::Sha256(url.GetString().Utf8()));
       }
       state.Set("resource", resource);
+      if (!resource.empty() &&
+          base::CommandLine::ForCurrentProcess()->HasSwitch(
+              "reach-media-replay")) {
+        media->EnableReachReplay();
+        state.Set("replay", media->ReachReplayToken().ToString());
+        state.Set("mediaFrame", frame_identifier);
+        state.Set("sourceReady",
+                  static_cast<int>(media->ReachSourceReadyState()));
+      } else {
+        media->DisableReachReplay();
+      }
       state.Set("time", media->currentTime());
       state.Set("paused", media->paused());
       state.Set("ended", media->ended());
