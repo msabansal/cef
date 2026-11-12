@@ -14,6 +14,15 @@ order. Paths inside each patch are relative to Chromium `src`, except
 CEF adapter changes live directly in `include/`, `libcef/` and `libcef_dll/`;
 they are not an extra patch to apply to an already integrated fork.
 
+MediaSource journals are replayable from painted local roots, including
+out-of-process child frames. `Reach.DrawingMedia.v2` reads are bound to the
+exporting frame and its exact current document; journals of other roots or
+detached documents remain inaccessible. Media paint markers include the local
+root's document identity, and MSE resource hashes also include that identity,
+so renderer-local DOM and journal integers cannot collide during composition.
+Worker MediaSource, encrypted media and child-frame original URLs remain
+unsupported; this does not add a raster or encoded-video fallback.
+
 Reach's drawing/video root-scrollbar patch suppresses only main-frame viewport
 scrollbar creation and reserved space. It does not change scrollbar modes:
 `LocalFrameView::SetCanHaveScrollbars(false)` also disables native root wheel

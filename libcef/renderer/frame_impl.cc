@@ -1021,25 +1021,30 @@ void CefFrameImpl::SendMessage(const std::string& name,
     SendProcessMessage(PID_BROWSER, response);
     return;
   }
-  if (name == "Reach.DrawingMedia.v1") {
-    // [request, journal, cursor, max bytes] -> Reach.DrawingMediaJournal.v1
+  if (name == "Reach.DrawingMedia.v2") {
+    // [request, journal, cursor, max bytes, document]
+    // -> Reach.DrawingMediaJournal.v2
     // [request, error, operations].
     CefRefPtr<CefFrameImpl> retain(this);
-    auto response = CefProcessMessage::Create("Reach.DrawingMediaJournal.v1");
+    auto response = CefProcessMessage::Create("Reach.DrawingMediaJournal.v2");
     auto values = response->GetArgumentList();
-    const bool valid = arguments.size() == 4 && arguments[0].is_int() &&
+    const bool valid = arguments.size() == 5 && arguments[0].is_int() &&
                        arguments[0].GetInt() > 0 && arguments[1].is_string() &&
                        arguments[1].GetString().size() <= 20 &&
                        arguments[2].is_string() &&
                        arguments[2].GetString().size() <= 20 &&
                        arguments[3].is_int() && arguments[3].GetInt() > 0 &&
-                       arguments[3].GetInt() <= 32 * 1024 * 1024;
+                       arguments[3].GetInt() <= 32 * 1024 * 1024 &&
+                       arguments[4].is_string() &&
+                       !arguments[4].GetString().empty() &&
+                       arguments[4].GetString().size() <= 128;
     values->SetInt(0, valid ? arguments[0].GetInt() : 0);
     std::vector<uint8_t> operations;
     std::string error = !valid || !frame_
         ? "Invalid or detached media journal request"
         : blink_glue::ReadDrawingMediaJournal(
-              frame_, arguments[1].GetString(), arguments[2].GetString(),
+              frame_, arguments[4].GetString(), arguments[1].GetString(),
+              arguments[2].GetString(),
               arguments[3].GetInt(), &operations);
     values->SetString(1, error);
     if (error.empty()) {
@@ -1170,13 +1175,15 @@ void CefFrameImpl::SendMessage(const std::string& name,
           } else if (incremental) {
             static const std::vector<uint8_t> kNoKnownChunks;
             capture = blink_glue::CaptureIncrementalDrawingCommands(
-                frame_, arguments[2].GetString(), children, resources,
+                frame_, GetIdentifier().ToString(), arguments[2].GetString(),
+                children, resources,
                 arguments[6].is_blob() ? arguments[6].GetBlob()
                                        : kNoKnownChunks,
                 sink, &known_originals);
           } else {
             capture = blink_glue::CaptureDrawingCommands(
-                frame_, arguments[2].GetString(), children, resources, sink);
+                frame_, GetIdentifier().ToString(), arguments[2].GetString(),
+                children, resources, sink);
           }
           if (sources && !sources->error.empty())
             capture.error = sources->error;
@@ -1301,7 +1308,8 @@ void CefFrameImpl::SendMessage(const std::string& name,
             arguments[7].GetInt());
       }
       if (capture.error.empty() && arguments.size() == 1) {
-        capture = blink_glue::CaptureDrawingCommands(frame_);
+        capture = blink_glue::CaptureDrawingCommands(
+            frame_, GetIdentifier().ToString());
       }
     }
     values->SetString(1, capture.error);

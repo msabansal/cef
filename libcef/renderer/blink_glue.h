@@ -91,6 +91,7 @@ BLINK_EXPORT CefDrawingResourceSources GetDrawingResourceSources(
 BLINK_EXPORT CefDrawingCommands
 CaptureDrawingCommands(
     blink::WebLocalFrame* frame,
+    const std::string& frame_identifier,
     const std::string& document = {},
     const std::map<std::string, std::vector<uint8_t>>& children = {},
     const std::map<std::string, std::vector<uint8_t>>& resources = {},
@@ -100,6 +101,7 @@ CaptureDrawingCommands(
 // [key 16][hash 32] entries; an empty set requests a keyframe.
 BLINK_EXPORT CefDrawingCommands CaptureIncrementalDrawingCommands(
     blink::WebLocalFrame* frame,
+    const std::string& frame_identifier,
     const std::string& document,
     const std::map<std::string, std::vector<uint8_t>>& children,
     const std::map<std::string, std::vector<uint8_t>>& resources,
@@ -137,8 +139,10 @@ GetDrawingInputRoute(blink::WebLocalFrame* frame, bool keyboard, int x, int y,
                      const std::function<std::string()>& apply = nullptr);
 // Command mode only: serialized MediaSource operations of journal |journal|
 // from |cursor|, at most |max_bytes|. The journaled element must belong to
-// |frame|'s local root. Returns an error, or empty and fills |out|.
+// |frame|'s local root and its current |document|. Returns an error, or empty
+// and fills |out|.
 BLINK_EXPORT std::string ReadDrawingMediaJournal(blink::WebLocalFrame* frame,
+                                                 const std::string& document,
                                                  const std::string& journal,
                                                  const std::string& cursor,
                                                  int max_bytes,

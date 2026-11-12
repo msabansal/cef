@@ -431,6 +431,7 @@ std::string DrawingAnimationRequest(
 }
 
 std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
+                                    const std::string& document,
                                     const std::string& journal_id,
                                     const std::string& cursor_text,
                                     int max_bytes,
@@ -438,6 +439,10 @@ std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
   auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
   if (!frame || !frame->IsAttached()) {
     return "Media journal frame is detached";
+  }
+  if (!frame->GetDocument() ||
+      frame->GetDocument()->Token().ToString() != document) {
+    return "Media journal document changed";
   }
   uint64_t id = 0;
   uint64_t cursor = 0;
@@ -449,7 +454,9 @@ std::string ReadDrawingMediaJournal(blink::WebLocalFrame* web_frame,
   auto* element = journal ? journal->element() : nullptr;
   auto* element_frame = element ? element->GetDocument().GetFrame() : nullptr;
   // Journals of other tabs sharing this renderer are not readable.
-  if (!element_frame || &element_frame->LocalFrameRoot() != frame) {
+  if (!element_frame || !element_frame->IsAttached() ||
+      element_frame->GetDocument() != &element->GetDocument() ||
+      &element_frame->LocalFrameRoot() != frame) {
     return "Media journal unavailable";
   }
   *out = journal->Read(cursor, static_cast<size_t>(max_bytes));
@@ -2919,6 +2926,11 @@ sk_sp<SkPicture> FinishViewportPicture(SkPictureRecorder* recorder,
   return picture;
 }
 
+struct CapturedMediaState {
+  sk_sp<SkData> data;
+  sk_sp<SkData> marker;
+};
+
 // The skeleton is the normal lifecycle conversion of the local root's paint
 // artifact, with each kept chunk's drawings replaced by a placeholder picture
 // that serializes as its 16-byte key. Chunks are culled as a whole against the
@@ -2926,7 +2938,7 @@ sk_sp<SkPicture> FinishViewportPicture(SkPictureRecorder* recorder,
 CefDrawingCommands CaptureIncrementalPicture(
     blink::LocalFrame* frame, const gfx::Rect& bounds,
     const std::map<uint32_t, sk_sp<SkPicture>>& frame_pictures,
-    const std::map<uint32_t, sk_sp<SkData>>& media_states,
+    const std::map<uint32_t, CapturedMediaState>& media_states,
     const std::set<uint32_t>& culled_canvas_ids,
     const std::vector<uint8_t>& known_bytes,
     const std::function<void(const std::string&, const void*, size_t)>& sink,
@@ -3084,7 +3096,7 @@ CefDrawingCommands CaptureIncrementalPicture(
       return std::nullopt;
     for (const auto& [id, data] : media_states) {
       media_canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.MediaState.v1",
-                                   data.get());
+                                   data.data.get());
     }
     if (with_damage) {
       for (const auto& text : damage) {
@@ -3124,7 +3136,7 @@ CefDrawingCommands CaptureIncrementalPicture(
   // picture, including complete child/media content in prefetched chunks.
   cc::PlaybackCallbacks chunk_callbacks;
   chunk_callbacks.custom_callback = base::BindRepeating(
-      [](const std::map<uint32_t, sk_sp<SkData>>* states,
+      [](const std::map<uint32_t, CapturedMediaState>* states,
          const std::map<uint32_t, sk_sp<SkPicture>>* frames,
          PaintSerialization* state, SkCanvas* canvas, uint32_t id) {
         ++state->markers;
@@ -3138,14 +3150,13 @@ CefDrawingCommands CaptureIncrementalPicture(
           child->second->playback(canvas);
           return;
         }
-        if (!states->contains(id)) {
+        const auto media = states->find(id);
+        if (media == states->end()) {
           state->error = "Unknown media paint identity";
           return;
         }
-        const auto text = base::NumberToString(id);
-        auto data = SkData::MakeWithCopy(text.data(), text.size());
         canvas->drawAnnotation(SkRect::MakeWH(1, 1), "Reach.Video.v1",
-                               data.get());
+                               media->second.marker.get());
       }, base::Unretained(&media_states), base::Unretained(&frame_pictures),
       base::Unretained(&state));
   SkSerialProcs chunk_procs;
@@ -3290,7 +3301,8 @@ CefDrawingCommands CaptureIncrementalPicture(
 }
 
 CefDrawingCommands CaptureDrawingCommandsImpl(
-    blink::WebLocalFrame* web_frame, const std::string& expected_document,
+    blink::WebLocalFrame* web_frame, const std::string& frame_identifier,
+    const std::string& expected_document,
     const std::map<std::string, std::vector<uint8_t>>& children,
     const std::map<std::string, std::vector<uint8_t>>& resources,
     const std::function<void(const std::string&, const void*, size_t)>& sink,
@@ -3445,7 +3457,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       }
     }
   }
-  std::map<uint32_t, sk_sp<SkData>> media_states;
+  std::map<uint32_t, CapturedMediaState> media_states;
   const bool canvas_video =
       blink::Canvas2DBitmapProvider::IsReachCanvasVideoMode();
   if (canvas_video)
@@ -3581,9 +3593,12 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
             result.error = "Canvas video state serialization failed";
             return result;
           }
+          const auto marker = base::NumberToString(canvas->GetDomNodeId());
           media_states.emplace(
               canvas->GetDomNodeId(),
-              SkData::MakeWithCopy(json->data(), json->size()));
+              CapturedMediaState{
+                  SkData::MakeWithCopy(json->data(), json->size()),
+                  SkData::MakeWithCopy(marker.data(), marker.size())});
         }
         continue;
       }
@@ -3600,8 +3615,8 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       }
       const auto& url = media->currentSrc();
       // Replayable media is a same-frame http(s)/data URL, or a same-thread
-      // MediaSource whose operations are journaled. Anything else (encrypted
-      // media, MediaStream, MediaSource in workers or out-of-process frames,
+      // MediaSource whose operations are journaled in its owning local root.
+      // Anything else (encrypted media, MediaStream, MediaSource in workers,
       // other URL schemes, child-frame URLs) paints as an empty video
       // rather than blocking the page.
       const bool inline_frame = !web_frame->Parent() && tree_frame == frame.Get();
@@ -3613,7 +3628,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
         blank = true;
       } else if (media->HasMediaSource()) {
         journal = blink::ReachMediaJournal::ForElement(*media);
-        blank = !journal || !journal->usable() || web_frame->Parent();
+        blank = !journal || !journal->usable();
       } else if (!url.IsEmpty() &&
                  ((!url.ProtocolIs("http") && !url.ProtocolIs("https") &&
                    !url.ProtocolIsData()) ||
@@ -3637,11 +3652,13 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       }
       base::DictValue state;
       state.Set("id", media->GetDomNodeId());
+      state.Set("document", document->Token().ToString());
       state.Set("kind", media->IsHTMLVideoElement() ? "video" : "audio");
       std::string resource;
       if (journal) {
         resource = base::HexEncode(crypto::hash::Sha256(
-            "mse:" + base::NumberToString(journal->id())));
+            "mse:" + document->Token().ToString() + ":" +
+            base::NumberToString(journal->id())));
       } else if (!blank && !url.IsEmpty()) {
         resource = base::HexEncode(crypto::hash::Sha256(url.GetString().Utf8()));
       }
@@ -3658,6 +3675,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
         // this position.
         state.Set("mse", base::NumberToString(journal->id()));
         state.Set("mseSeq", base::NumberToString(journal->next()));
+        state.Set("mseFrame", frame_identifier);
       } else if (!blank && url.ProtocolIs("https") &&
                  !url.HasFragmentIdentifier() && url.User().empty() &&
                  url.Pass().empty() && url.GetString().length() <= 512) {
@@ -3670,8 +3688,15 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
         result.error = "Media state serialization failed";
         return result;
       }
-      media_states.emplace(media->GetDomNodeId(),
-                           SkData::MakeWithCopy(json->data(), json->size()));
+      // Keep paint identity stable across source changes, and distinct between
+      // renderer-local DOM integers in composed out-of-process frames.
+      const auto marker = "media:" + document->Token().ToString() + ":" +
+                          base::NumberToString(media->GetDomNodeId());
+      media_states.emplace(
+          media->GetDomNodeId(),
+          CapturedMediaState{
+              SkData::MakeWithCopy(json->data(), json->size()),
+              SkData::MakeWithCopy(marker.data(), marker.size())});
     }
   }
   CaptureTimer::Get().Mark("collect");
@@ -3701,7 +3726,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   }
   cc::PlaybackCallbacks callbacks;
   callbacks.custom_callback = base::BindRepeating(
-      [](const std::map<uint32_t, sk_sp<SkData>>* states,
+      [](const std::map<uint32_t, CapturedMediaState>* states,
          const std::map<uint32_t, sk_sp<SkPicture>>* frames,
          PaintSerialization* state, SkCanvas* canvas, uint32_t id) {
         if (state->culled_paint_ids.contains(id)) {
@@ -3717,14 +3742,13 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
           child->second->playback(canvas);
           return;
         }
-        if (!states->contains(id)) {
+        const auto media = states->find(id);
+        if (media == states->end()) {
           state->error = "Unknown media paint identity";
           return;
         }
-        const auto text = base::NumberToString(id);
-        auto data = SkData::MakeWithCopy(text.data(), text.size());
         canvas->drawAnnotation(SkRect::MakeWH(1, 1), "Reach.Video.v1",
-                               data.get());
+                               media->second.marker.get());
       }, base::Unretained(&media_states), base::Unretained(&frame_pictures),
       base::Unretained(&state));
   auto picture = recording.ToSkPicture(
@@ -3743,7 +3767,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   }
   for (const auto& [id, data] : media_states) {
     media_canvas->drawAnnotation(SkRect::MakeEmpty(), "Reach.MediaState.v1",
-                                 data.get());
+                                 data.data.get());
   }
   picture->playback(media_canvas);
   picture = FinishViewportPicture(&media_recorder, viewport);
@@ -3799,18 +3823,21 @@ void CompleteDrawingCapture(blink::WebLocalFrame* web_frame,
 }  // namespace
 
 CefDrawingCommands CaptureDrawingCommands(
-    blink::WebLocalFrame* web_frame, const std::string& expected_document,
+    blink::WebLocalFrame* web_frame, const std::string& frame_identifier,
+    const std::string& expected_document,
     const std::map<std::string, std::vector<uint8_t>>& children,
     const std::map<std::string, std::vector<uint8_t>>& resources,
     const std::function<void(const std::string&, const void*, size_t)>& sink) {
   auto result = CaptureDrawingCommandsImpl(
-      web_frame, expected_document, children, resources, sink, nullptr);
+      web_frame, frame_identifier, expected_document, children, resources,
+      sink, nullptr);
   CompleteDrawingCapture(web_frame, expected_document, result);
   return result;
 }
 
 CefDrawingCommands CaptureIncrementalDrawingCommands(
-    blink::WebLocalFrame* web_frame, const std::string& expected_document,
+    blink::WebLocalFrame* web_frame, const std::string& frame_identifier,
+    const std::string& expected_document,
     const std::map<std::string, std::vector<uint8_t>>& children,
     const std::map<std::string, std::vector<uint8_t>>& resources,
     const std::vector<uint8_t>& known,
@@ -3822,8 +3849,8 @@ CefDrawingCommands CaptureIncrementalDrawingCommands(
     return result;
   }
   auto result = CaptureDrawingCommandsImpl(
-      web_frame, expected_document, children, resources, sink, &known,
-      known_originals);
+      web_frame, frame_identifier, expected_document, children, resources,
+      sink, &known, known_originals);
   CompleteDrawingCapture(web_frame, expected_document, result);
   return result;
 }
