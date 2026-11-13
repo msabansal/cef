@@ -523,7 +523,6 @@ constexpr size_t kMaxFilterDepth = 32;
 constexpr size_t kMaxFilterVisits = 1 << 16;
 constexpr size_t kMaxRecordDepth = 32;
 constexpr uint64_t kMaxViewportPixels = 4 * 1024 * 1024;
-constexpr uint64_t kMaxDecodedImagePixels = 16 * 1024 * 1024;
 constexpr int kMaxReplayImageEdge = 16384;
 
 class BoundedPaintStream final : public SkWStream {
@@ -575,7 +574,6 @@ struct PaintSerialization {
   size_t identity_bytes = 0;
   size_t resources = 0;
   size_t bytes = 0;
-  uint64_t image_pixels = 0;
   size_t filter_visits = 0;
   size_t record_bytes = 0;
   std::set<uint32_t> media_ids;
@@ -592,31 +590,24 @@ struct PaintSerialization {
     uint8_t kind;
     sk_reach::Hash hash;
     size_t size;
-    uint64_t pixels;
   };
   std::vector<Exported>* exports = nullptr;
 
   bool Export(uint8_t kind,
               const sk_reach::Hash& hash,
               size_t size,
-              const std::function<sk_sp<const SkData>()>& load,
-              uint64_t pixels = 0) {
+              const std::function<sk_sp<const SkData>()>& load) {
     if (!size)
       return false;
     if (exports)
-      exports->push_back({kind, hash, size, pixels});
+      exports->push_back({kind, hash, size});
     const std::string key =
         (kind == sk_reach::kImage ? "image:" : "font:") + sk_reach::Hex(hash);
     if (original_ids.contains(key))
       return true;
     if (kind == sk_reach::kImage) {
-      if (pixels > kMaxDecodedImagePixels - image_pixels) {
-        error = "Decoded image pixel budget exceeded";
-        return false;
-      }
       if (!AddResource(size))
         return false;
-      image_pixels += pixels;
     } else {
       if (size > sk_reach::kFontBytes - font_bytes) {
         error = "Original font resource byte budget exceeded";
@@ -731,8 +722,6 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
       state->error = "Texture-backed or deferred image requires command support";
     }
   }
-  const uint64_t pixels =
-      static_cast<uint64_t>(image->width()) * image->height();
   if (state->error.empty()) {
     auto encoded = image->refEncodedData();
     if (encoded && encoded->size()) {
@@ -743,7 +732,7 @@ SkSerialReturnType SerializeOriginalImage(SkImage* image, void* context) {
       const auto digest = ImageDigest(image, *encoded);
       if (state->Export(
               sk_reach::kImage, digest.hash, digest.size,
-              [&] { return sk_sp<const SkData>(encoded); }, pixels)) {
+              [&] { return sk_sp<const SkData>(encoded); })) {
         if (state->budget_only)
           return SkData::MakeEmpty();
         // A null reference would make Skia inline the encoded original.
@@ -933,19 +922,16 @@ void DeferUnsupportedPaint(PaintSerialization* state, std::string error) {
 
 bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
   if (state->raster) {
-    const uint64_t pixels = uint64_t(std::max(0, image.width())) *
-                            std::max(0, image.height());
     if (image.IsTextureBacked() || image.IsDeferredPaintRecord()) {
       DeferUnsupportedPaint(
           state, "Raster fallback cannot read texture-backed or deferred paint");
     }
-    if (!pixels || image.width() > kMaxReplayImageEdge ||
-        image.height() > kMaxReplayImageEdge ||
-        pixels > kMaxDecodedImagePixels - state->image_pixels) {
-      state->error = "Raster fallback decoded image pixel budget exceeded";
+    if (image.width() <= 0 || image.height() <= 0 ||
+        image.width() > kMaxReplayImageEdge ||
+        image.height() > kMaxReplayImageEdge) {
+      state->error = "Raster fallback image exceeds replay dimensions";
       return false;
     }
-    state->image_pixels += pixels;
     return true;
   }
   if (image.IsTextureBacked() || image.IsDeferredPaintRecord()) {
@@ -1005,10 +991,8 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
     }
   }
   if (state->budget_only) {
-    const uint64_t pixels = uint64_t(std::max(0, image.width())) *
-                            std::max(0, image.height());
-    if (!pixels) {
-      state->error = "Decoded image pixel budget exceeded";
+    if (image.width() <= 0 || image.height() <= 0) {
+      state->error = "Invalid drawing image dimensions";
       return false;
     }
     if (image.width() > kMaxReplayImageEdge ||
@@ -1020,11 +1004,6 @@ bool CheckPaintImage(PaintSerialization* state, const cc::PaintImage& image) {
         image.animation_type() == cc::PaintImage::AnimationType::kVideo) {
       // These remain rejected; do not invoke GetSwSkImage's GPU readback path.
       state->uninspectable_originals = true;
-      if (pixels > kMaxDecodedImagePixels - state->image_pixels) {
-        state->error = "Decoded image pixel budget exceeded";
-        return false;
-      }
-      state->image_pixels += pixels;
       return true;
     }
     // For a verified non-texture image this returns the cached SkImage, without
@@ -2352,7 +2331,7 @@ bool ReplayChunkExports(PaintSerialization* state,
   for (const auto& exported : entry.exports) {
     if (!state->Export(
             exported.kind, exported.hash, exported.size,
-            [] { return sk_sp<const SkData>(); }, exported.pixels)) {
+            [] { return sk_sp<const SkData>(); })) {
       if (state->error.empty())
         state->error = "Cached chunk original export failed";
       return true;
@@ -3930,7 +3909,6 @@ CefDrawingCommands CaptureRasterFallback(
   }
   std::map<uint32_t, sk_sp<SkImage>> images;
   size_t child_bytes = 0;
-  uint64_t child_pixels = dependencies.image_pixels;
   for (auto* child = frame->Tree().TraverseNext(frame); child;
        child = child->Tree().TraverseNext(frame)) {
     if (!IsComposedChildFrame(frame, child)) {
@@ -3953,10 +3931,9 @@ CefDrawingCommands CaptureRasterFallback(
     auto data = SkData::MakeWithCopy(found->second.data(), found->second.size());
     auto image = SkImages::DeferredFromEncodedData(std::move(data));
     if (!image || image->width() <= 0 || image->height() <= 0 ||
-        image->width() > 4096 || image->height() > 4096 ||
-        (child_pixels += uint64_t(image->width()) * image->height()) >
-            kMaxDecodedImagePixels) {
-      result.error = "Raster fallback child image exceeds decoded pixel budget";
+        image->width() > kMaxReplayImageEdge ||
+        image->height() > kMaxReplayImageEdge) {
+      result.error = "Raster fallback child image exceeds replay dimensions";
       return result;
     }
     images.emplace(element->GetDomNodeId(), std::move(image));
