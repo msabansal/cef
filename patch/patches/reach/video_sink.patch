@@ -213,11 +213,16 @@ diff --git components/viz/service/display_embedder/reach_video_output_device_uni
 new file mode 100644
 --- /dev/null
 +++ components/viz/service/display_embedder/reach_video_output_device_unittest.cc
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,220 @@
 +#include "components/viz/service/display_embedder/reach_video_output_device.h"
 +
++#include <utility>
++
++#include "base/functional/callback.h"
 +#include "base/memory/read_only_shared_memory_region.h"
++#include "base/test/bind.h"
 +#include "base/test/task_environment.h"
++#include "base/threading/simple_thread.h"
 +#include "mojo/public/cpp/bindings/receiver.h"
 +#include "testing/gtest/include/gtest/gtest.h"
 +#include "third_party/skia/include/core/SkCanvas.h"
@@ -226,6 +231,23 @@ new file mode 100644
 +namespace {
 +
 +constexpr auto kCaptureInterval = base::Milliseconds(31);
++
++class CaptureTestThread : public base::SimpleThread {
++ public:
++  explicit CaptureTestThread(base::OnceClosure test)
++      : SimpleThread("ReachCaptureTest"), test_(std::move(test)) {}
++
++ private:
++  void Run() override { std::move(test_).Run(); }
++  base::OnceClosure test_;
++};
++
++void RunCaptureTest(base::OnceClosure test) {
++  // VizTestSuite already owns the main thread's task environment.
++  CaptureTestThread thread(std::move(test));
++  thread.Start();
++  thread.Join();
++}
 +
 +class Consumer : public mojom::ReachVideoSink {
 + public:
@@ -266,138 +288,148 @@ new file mode 100644
 +};
 +
 +TEST(ReachVideoOutputDeviceTest, OwnsPixelsAndCoalescesSlowConsumerToLatest) {
-+  base::test::SingleThreadTaskEnvironment tasks(
-+      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
-+  Consumer consumer;
-+  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
-+                                kCaptureInterval);
-+  device.Resize(gfx::Size(2, 2), 1.0f);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 1);
-+  ASSERT_TRUE(consumer.mapping_.IsValid());
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
-+  const auto sequence = consumer.sequence_;
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
-+  device.EndPaint();
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorBLUE);
-+  const auto latest_paint = base::TimeTicks::Now();
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  EXPECT_EQ(consumer.deliveries_, 1);
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
-+  tasks.FastForwardBy(base::Seconds(2));
-+  consumer.mapping_ = {};
-+  std::move(consumer.released_).Run();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 2);
-+  EXPECT_GT(consumer.sequence_, sequence);
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorBLUE);
-+  EXPECT_EQ(consumer.timestamp_, latest_paint);
++  RunCaptureTest(base::BindLambdaForTesting([] {
++    base::test::SingleThreadTaskEnvironment tasks(
++        base::test::TaskEnvironment::TimeSource::MOCK_TIME);
++    Consumer consumer;
++    ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
++                                  kCaptureInterval);
++    device.Resize(gfx::Size(2, 2), 1.0f);
++    device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++    device.EndPaint();
++    tasks.RunUntilIdle();
++    ASSERT_EQ(consumer.deliveries_, 1);
++    ASSERT_TRUE(consumer.mapping_.IsValid());
++    EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
++    const auto sequence = consumer.sequence_;
++    device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
++    device.EndPaint();
++    device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorBLUE);
++    const auto latest_paint = base::TimeTicks::Now();
++    device.EndPaint();
++    tasks.RunUntilIdle();
++    EXPECT_EQ(consumer.deliveries_, 1);
++    EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
++    tasks.FastForwardBy(base::Seconds(2));
++    consumer.mapping_ = {};
++    std::move(consumer.released_).Run();
++    tasks.RunUntilIdle();
++    ASSERT_EQ(consumer.deliveries_, 2);
++    EXPECT_GT(consumer.sequence_, sequence);
++    EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorBLUE);
++    EXPECT_EQ(consumer.timestamp_, latest_paint);
++  }));
 +}
 +
 +TEST(ReachVideoOutputDeviceTest, ResizeDoesNotInvalidateAnOutstandingFrame) {
-+  base::test::SingleThreadTaskEnvironment tasks(
-+      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
-+  Consumer consumer;
-+  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
-+                                kCaptureInterval);
-+  device.Resize(gfx::Size(2, 2), 1.0f);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  const auto generation = consumer.generation_;
-+  device.Resize(gfx::Size(3, 2), 1.0f);
-+  device.BeginPaint(gfx::Rect(3, 2))->clear(SK_ColorGREEN);
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  EXPECT_EQ(consumer.size_, gfx::Size(2, 2));
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
-+  consumer.mapping_ = {};
-+  std::move(consumer.released_).Run();
-+  tasks.FastForwardBy(kCaptureInterval);
-+  EXPECT_EQ(consumer.size_, gfx::Size(3, 2));
-+  EXPECT_EQ(consumer.stride_, 12u);
-+  EXPECT_GT(consumer.generation_, generation);
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorGREEN);
++  RunCaptureTest(base::BindLambdaForTesting([] {
++    base::test::SingleThreadTaskEnvironment tasks(
++        base::test::TaskEnvironment::TimeSource::MOCK_TIME);
++    Consumer consumer;
++    ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
++                                  kCaptureInterval);
++    device.Resize(gfx::Size(2, 2), 1.0f);
++    device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++    device.EndPaint();
++    tasks.RunUntilIdle();
++    const auto generation = consumer.generation_;
++    device.Resize(gfx::Size(3, 2), 1.0f);
++    device.BeginPaint(gfx::Rect(3, 2))->clear(SK_ColorGREEN);
++    device.EndPaint();
++    tasks.RunUntilIdle();
++    EXPECT_EQ(consumer.size_, gfx::Size(2, 2));
++    EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
++    consumer.mapping_ = {};
++    std::move(consumer.released_).Run();
++    tasks.FastForwardBy(kCaptureInterval);
++    EXPECT_EQ(consumer.size_, gfx::Size(3, 2));
++    EXPECT_EQ(consumer.stride_, 12u);
++    EXPECT_GT(consumer.generation_, generation);
++    EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorGREEN);
++  }));
 +}
 +
 +TEST(ReachVideoOutputDeviceTest, CoalescesFastPaintsUntilConfiguredInterval) {
-+  base::test::SingleThreadTaskEnvironment tasks(
-+      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
-+  Consumer consumer;
-+  const auto interval = base::Milliseconds(47);
-+  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
-+                                interval);
-+  device.Resize(gfx::Size(2, 2), 1.0f);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 1);
-+  consumer.mapping_ = {};
-+  std::move(consumer.released_).Run();
-+  tasks.RunUntilIdle();
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
-+  device.EndPaint();
-+  tasks.FastForwardBy(base::Milliseconds(46));
-+  EXPECT_EQ(consumer.deliveries_, 1);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorBLUE);
-+  const auto latest_paint = base::TimeTicks::Now();
-+  device.EndPaint();
-+  tasks.FastForwardBy(base::Microseconds(999));
-+  EXPECT_EQ(consumer.deliveries_, 1);
-+  tasks.FastForwardBy(base::Microseconds(1));
-+  ASSERT_EQ(consumer.deliveries_, 2);
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0],
-+            SK_ColorBLUE);
-+  EXPECT_EQ(consumer.timestamp_, latest_paint);
++  RunCaptureTest(base::BindLambdaForTesting([] {
++    base::test::SingleThreadTaskEnvironment tasks(
++        base::test::TaskEnvironment::TimeSource::MOCK_TIME);
++    Consumer consumer;
++    const auto interval = base::Milliseconds(47);
++    ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
++                                  interval);
++    device.Resize(gfx::Size(2, 2), 1.0f);
++    device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++    device.EndPaint();
++    tasks.RunUntilIdle();
++    ASSERT_EQ(consumer.deliveries_, 1);
++    consumer.mapping_ = {};
++    std::move(consumer.released_).Run();
++    tasks.RunUntilIdle();
++    device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
++    device.EndPaint();
++    tasks.FastForwardBy(base::Milliseconds(46));
++    EXPECT_EQ(consumer.deliveries_, 1);
++    device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorBLUE);
++    const auto latest_paint = base::TimeTicks::Now();
++    device.EndPaint();
++    tasks.FastForwardBy(base::Microseconds(999));
++    EXPECT_EQ(consumer.deliveries_, 1);
++    tasks.FastForwardBy(base::Microseconds(1));
++    ASSERT_EQ(consumer.deliveries_, 2);
++    EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0],
++              SK_ColorBLUE);
++    EXPECT_EQ(consumer.timestamp_, latest_paint);
++  }));
 +}
 +
 +TEST(ReachVideoOutputDeviceTest, DoesNotCaptureWithoutNewDamage) {
-+  base::test::SingleThreadTaskEnvironment tasks(
-+      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
-+  Consumer consumer;
-+  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
-+                                kCaptureInterval);
-+  device.Resize(gfx::Size(2, 2), 1.0f);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 1);
-+  consumer.mapping_ = {};
-+  std::move(consumer.released_).Run();
-+  tasks.FastForwardBy(base::Seconds(1));
-+  EXPECT_EQ(consumer.deliveries_, 1);
-+  device.BeginPaint(gfx::Rect());
-+  device.EndPaint();
-+  tasks.FastForwardBy(base::Seconds(1));
-+  EXPECT_EQ(consumer.deliveries_, 1);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 2);
-+  consumer.mapping_ = {};
-+  std::move(consumer.released_).Run();
-+  tasks.FastForwardBy(base::Seconds(1));
-+  EXPECT_EQ(consumer.deliveries_, 2);
++  RunCaptureTest(base::BindLambdaForTesting([] {
++    base::test::SingleThreadTaskEnvironment tasks(
++        base::test::TaskEnvironment::TimeSource::MOCK_TIME);
++    Consumer consumer;
++    ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
++                                  kCaptureInterval);
++    device.Resize(gfx::Size(2, 2), 1.0f);
++    device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++    device.EndPaint();
++    tasks.RunUntilIdle();
++    ASSERT_EQ(consumer.deliveries_, 1);
++    consumer.mapping_ = {};
++    std::move(consumer.released_).Run();
++    tasks.FastForwardBy(base::Seconds(1));
++    EXPECT_EQ(consumer.deliveries_, 1);
++    device.BeginPaint(gfx::Rect());
++    device.EndPaint();
++    tasks.FastForwardBy(base::Seconds(1));
++    EXPECT_EQ(consumer.deliveries_, 1);
++    device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
++    device.EndPaint();
++    tasks.RunUntilIdle();
++    ASSERT_EQ(consumer.deliveries_, 2);
++    consumer.mapping_ = {};
++    std::move(consumer.released_).Run();
++    tasks.FastForwardBy(base::Seconds(1));
++    EXPECT_EQ(consumer.deliveries_, 2);
++  }));
 +}
 +
 +TEST(ReachVideoOutputDeviceTest, SnapshotAndLateReplySurviveProducerTeardown) {
-+  base::test::SingleThreadTaskEnvironment tasks;
-+  Consumer consumer;
-+  auto device = std::make_unique<ReachVideoOutputDevice>(
-+      consumer.receiver_.BindNewPipeAndPassRemote(), kCaptureInterval);
-+  device->Resize(gfx::Size(2, 2), 1.0f);
-+  device->BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
-+  device->EndPaint();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 1);
-+  device.reset();
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
-+  std::move(consumer.released_).Run();
-+  tasks.RunUntilIdle();
-+  EXPECT_EQ(consumer.deliveries_, 1);
++  RunCaptureTest(base::BindLambdaForTesting([] {
++    base::test::SingleThreadTaskEnvironment tasks;
++    Consumer consumer;
++    auto device = std::make_unique<ReachVideoOutputDevice>(
++        consumer.receiver_.BindNewPipeAndPassRemote(), kCaptureInterval);
++    device->Resize(gfx::Size(2, 2), 1.0f);
++    device->BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++    device->EndPaint();
++    tasks.RunUntilIdle();
++    ASSERT_EQ(consumer.deliveries_, 1);
++    device.reset();
++    EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
++    std::move(consumer.released_).Run();
++    tasks.RunUntilIdle();
++    EXPECT_EQ(consumer.deliveries_, 1);
++  }));
 +}
 +
 +}  // namespace
