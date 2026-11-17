@@ -49,7 +49,7 @@ diff --git components/viz/service/display_embedder/reach_video_output_device.cc 
 new file mode 100644
 --- /dev/null
 +++ components/viz/service/display_embedder/reach_video_output_device.cc
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,107 @@
 +#include "components/viz/service/display_embedder/reach_video_output_device.h"
 +
 +#include "base/functional/bind.h"
@@ -61,8 +61,11 @@ new file mode 100644
 +namespace viz {
 +
 +ReachVideoOutputDevice::ReachVideoOutputDevice(
-+    mojo::PendingRemote<mojom::ReachVideoSink> sink)
-+    : sink_(std::move(sink)) {
++    mojo::PendingRemote<mojom::ReachVideoSink> sink,
++    base::TimeDelta capture_interval)
++    : sink_(std::move(sink)), capture_interval_(capture_interval) {
++  CHECK_GE(capture_interval_, base::Milliseconds(1));
++  CHECK_LE(capture_interval_, base::Seconds(1));
 +  sink_.set_disconnect_handler(base::BindOnce(
 +      &ReachVideoOutputDevice::Fail, weak_factory_.GetWeakPtr(),
 +      "Reach video consumer disconnected"));
@@ -88,7 +91,7 @@ new file mode 100644
 +
 +void ReachVideoOutputDevice::EndPaint() {
 +  TRACE_EVENT0("viz", "ReachVideoOutputDevice::EndPaint");
-+  if (failed_ || !surface_)
++  if (failed_ || !surface_ || damage_rect_.IsEmpty())
 +    return;
 +  pending_ = true;
 +  pending_timestamp_ = base::TimeTicks::Now();
@@ -130,7 +133,7 @@ new file mode 100644
 +  }
 +  pending_ = false;
 +  in_flight_ = true;
-+  next_capture_ = base::TimeTicks::Now() + base::Microseconds(33334);
++  next_capture_ = base::TimeTicks::Now() + capture_interval_;
 +  sink_->FrameReady(
 +      std::move(region), viewport_pixel_size_, stride, generation_, ++sequence_,
 +      pending_timestamp_,
@@ -158,12 +161,13 @@ diff --git components/viz/service/display_embedder/reach_video_output_device.h c
 new file mode 100644
 --- /dev/null
 +++ components/viz/service/display_embedder/reach_video_output_device.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,47 @@
 +#ifndef COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_REACH_VIDEO_OUTPUT_DEVICE_H_
 +#define COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_REACH_VIDEO_OUTPUT_DEVICE_H_
 +
 +#include "base/memory/read_only_shared_memory_region.h"
 +#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
 +#include "base/timer/timer.h"
 +#include "components/viz/service/display/software_output_device.h"
 +#include "components/viz/service/viz_service_export.h"
@@ -177,7 +181,8 @@ new file mode 100644
 +class VIZ_SERVICE_EXPORT ReachVideoOutputDevice : public SoftwareOutputDevice {
 + public:
 +  explicit ReachVideoOutputDevice(
-+      mojo::PendingRemote<mojom::ReachVideoSink> sink);
++      mojo::PendingRemote<mojom::ReachVideoSink> sink,
++      base::TimeDelta capture_interval);
 +  ~ReachVideoOutputDevice() override;
 +
 +  void Resize(const gfx::Size& size, float scale_factor) override;
@@ -195,6 +200,7 @@ new file mode 100644
 +  bool pending_ = false;
 +  base::TimeTicks pending_timestamp_;
 +  base::TimeTicks next_capture_;
++  const base::TimeDelta capture_interval_;
 +  base::OneShotTimer capture_timer_;
 +  bool in_flight_ = false;
 +  bool failed_ = false;
@@ -207,7 +213,7 @@ diff --git components/viz/service/display_embedder/reach_video_output_device_uni
 new file mode 100644
 --- /dev/null
 +++ components/viz/service/display_embedder/reach_video_output_device_unittest.cc
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,188 @@
 +#include "components/viz/service/display_embedder/reach_video_output_device.h"
 +
 +#include "base/memory/read_only_shared_memory_region.h"
@@ -218,6 +224,8 @@ new file mode 100644
 +
 +namespace viz {
 +namespace {
++
++constexpr auto kCaptureInterval = base::Milliseconds(31);
 +
 +class Consumer : public mojom::ReachVideoSink {
 + public:
@@ -261,7 +269,8 @@ new file mode 100644
 +  base::test::SingleThreadTaskEnvironment tasks(
 +      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
 +  Consumer consumer;
-+  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote());
++  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
++                                kCaptureInterval);
 +  device.Resize(gfx::Size(2, 2), 1.0f);
 +  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
 +  device.EndPaint();
@@ -292,7 +301,8 @@ new file mode 100644
 +  base::test::SingleThreadTaskEnvironment tasks(
 +      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
 +  Consumer consumer;
-+  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote());
++  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
++                                kCaptureInterval);
 +  device.Resize(gfx::Size(2, 2), 1.0f);
 +  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
 +  device.EndPaint();
@@ -306,18 +316,20 @@ new file mode 100644
 +  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
 +  consumer.mapping_ = {};
 +  std::move(consumer.released_).Run();
-+  tasks.FastForwardBy(base::Microseconds(33334));
++  tasks.FastForwardBy(kCaptureInterval);
 +  EXPECT_EQ(consumer.size_, gfx::Size(3, 2));
 +  EXPECT_EQ(consumer.stride_, 12u);
 +  EXPECT_GT(consumer.generation_, generation);
 +  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorGREEN);
 +}
 +
-+TEST(ReachVideoOutputDeviceTest, CoalescesFastPaintsBeforeSnapshotAtThirtyFps) {
++TEST(ReachVideoOutputDeviceTest, CoalescesFastPaintsUntilConfiguredInterval) {
 +  base::test::SingleThreadTaskEnvironment tasks(
 +      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
 +  Consumer consumer;
-+  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote());
++  const auto interval = base::Milliseconds(47);
++  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
++                                interval);
 +  device.Resize(gfx::Size(2, 2), 1.0f);
 +  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
 +  device.EndPaint();
@@ -328,12 +340,12 @@ new file mode 100644
 +  tasks.RunUntilIdle();
 +  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
 +  device.EndPaint();
-+  tasks.FastForwardBy(base::Milliseconds(31));
++  tasks.FastForwardBy(base::Milliseconds(46));
 +  EXPECT_EQ(consumer.deliveries_, 1);
 +  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorBLUE);
 +  const auto latest_paint = base::TimeTicks::Now();
 +  device.EndPaint();
-+  tasks.FastForwardBy(base::Microseconds(2333));
++  tasks.FastForwardBy(base::Microseconds(999));
 +  EXPECT_EQ(consumer.deliveries_, 1);
 +  tasks.FastForwardBy(base::Microseconds(1));
 +  ASSERT_EQ(consumer.deliveries_, 2);
@@ -342,11 +354,40 @@ new file mode 100644
 +  EXPECT_EQ(consumer.timestamp_, latest_paint);
 +}
 +
++TEST(ReachVideoOutputDeviceTest, DoesNotCaptureWithoutNewDamage) {
++  base::test::SingleThreadTaskEnvironment tasks(
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
++  Consumer consumer;
++  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
++                                kCaptureInterval);
++  device.Resize(gfx::Size(2, 2), 1.0f);
++  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++  device.EndPaint();
++  tasks.RunUntilIdle();
++  ASSERT_EQ(consumer.deliveries_, 1);
++  consumer.mapping_ = {};
++  std::move(consumer.released_).Run();
++  tasks.FastForwardBy(base::Seconds(1));
++  EXPECT_EQ(consumer.deliveries_, 1);
++  device.BeginPaint(gfx::Rect());
++  device.EndPaint();
++  tasks.FastForwardBy(base::Seconds(1));
++  EXPECT_EQ(consumer.deliveries_, 1);
++  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
++  device.EndPaint();
++  tasks.RunUntilIdle();
++  ASSERT_EQ(consumer.deliveries_, 2);
++  consumer.mapping_ = {};
++  std::move(consumer.released_).Run();
++  tasks.FastForwardBy(base::Seconds(1));
++  EXPECT_EQ(consumer.deliveries_, 2);
++}
++
 +TEST(ReachVideoOutputDeviceTest, SnapshotAndLateReplySurviveProducerTeardown) {
 +  base::test::SingleThreadTaskEnvironment tasks;
 +  Consumer consumer;
 +  auto device = std::make_unique<ReachVideoOutputDevice>(
-+      consumer.receiver_.BindNewPipeAndPassRemote());
++      consumer.receiver_.BindNewPipeAndPassRemote(), kCaptureInterval);
 +  device->Resize(gfx::Size(2, 2), 1.0f);
 +  device->BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
 +  device->EndPaint();
@@ -364,17 +405,18 @@ new file mode 100644
 diff --git components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
 --- components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
 +++ components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
-@@ -3,6 +3,9 @@
+@@ -3,6 +3,10 @@
  // found in the LICENSE file.
  
  #include "components/viz/service/frame_sinks/root_compositor_frame_sink_impl.h"
 +#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
 +#include "components/viz/service/display_embedder/reach_video_output_device.h"
 +#include "components/viz/service/display_embedder/software_output_surface.h"
  
  #include <algorithm>
  #include <utility>
-@@ -129,10 +132,27 @@
+@@ -129,10 +133,35 @@
        std::move(params->display_client));
    auto display_controller = output_surface_provider->CreateGpuDependency(
        params->gpu_compositing, params->widget);
@@ -392,11 +434,19 @@ diff --git components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
 +    // GPU output requires a qualified shared-image encoder import backend.
 +    // Do not quietly use display presentation if the requested mode differs.
 +    CHECK(!params->gpu_compositing);
++    int interval_ms = 0;
++    CHECK(base::StringToInt(
++        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++            "reach-video-capture-interval-ms"),
++        &interval_ms));
++    CHECK_GE(interval_ms, 1);
++    CHECK_LE(interval_ms, 1000);
 +    mojo::PendingRemote<mojom::ReachVideoSink> sink;
 +    display_client->CreateReachVideoSink(
 +        sink.InitWithNewPipeAndPassReceiver());
 +    output_surface = std::make_unique<SoftwareOutputSurface>(
-+        std::make_unique<ReachVideoOutputDevice>(std::move(sink)));
++        std::make_unique<ReachVideoOutputDevice>(
++            std::move(sink), base::Milliseconds(interval_ms)));
 +  } else {
 +    output_surface = output_surface_provider->CreateOutputSurface(
 +        params->widget, params->gpu_compositing, display_client.get(),
