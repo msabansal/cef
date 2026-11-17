@@ -49,7 +49,7 @@ diff --git components/viz/service/display_embedder/reach_video_output_device.cc 
 new file mode 100644
 --- /dev/null
 +++ components/viz/service/display_embedder/reach_video_output_device.cc
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,104 @@
 +#include "components/viz/service/display_embedder/reach_video_output_device.h"
 +
 +#include "base/functional/bind.h"
@@ -98,6 +98,16 @@ new file mode 100644
 +void ReachVideoOutputDevice::DeliverLatest() {
 +  if (failed_ || in_flight_ || !pending_)
 +    return;
++  const auto now = base::TimeTicks::Now();
++  if (now < next_capture_) {
++    if (!capture_timer_.IsRunning()) {
++      capture_timer_.Start(
++          FROM_HERE, next_capture_ - now,
++          base::BindOnce(&ReachVideoOutputDevice::DeliverLatest,
++                         weak_factory_.GetWeakPtr()));
++    }
++    return;
++  }
 +  const uint32_t stride = viewport_pixel_size_.width() * 4;
 +  const size_t bytes = static_cast<size_t>(stride) * viewport_pixel_size_.height();
 +  if (!snapshot_.mapping.IsValid() || snapshot_.mapping.size() != bytes)
@@ -120,6 +130,7 @@ new file mode 100644
 +  }
 +  pending_ = false;
 +  in_flight_ = true;
++  next_capture_ = base::TimeTicks::Now() + base::Microseconds(33334);
 +  sink_->FrameReady(
 +      std::move(region), viewport_pixel_size_, stride, generation_, ++sequence_,
 +      pending_timestamp_,
@@ -147,12 +158,13 @@ diff --git components/viz/service/display_embedder/reach_video_output_device.h c
 new file mode 100644
 --- /dev/null
 +++ components/viz/service/display_embedder/reach_video_output_device.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,44 @@
 +#ifndef COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_REACH_VIDEO_OUTPUT_DEVICE_H_
 +#define COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_REACH_VIDEO_OUTPUT_DEVICE_H_
 +
 +#include "base/memory/read_only_shared_memory_region.h"
 +#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
 +#include "components/viz/service/display/software_output_device.h"
 +#include "components/viz/service/viz_service_export.h"
 +#include "mojo/public/cpp/bindings/remote.h"
@@ -182,6 +194,8 @@ new file mode 100644
 +  uint64_t sequence_ = 0;
 +  bool pending_ = false;
 +  base::TimeTicks pending_timestamp_;
++  base::TimeTicks next_capture_;
++  base::OneShotTimer capture_timer_;
 +  bool in_flight_ = false;
 +  bool failed_ = false;
 +  base::WeakPtrFactory<ReachVideoOutputDevice> weak_factory_{this};
@@ -193,7 +207,7 @@ diff --git components/viz/service/display_embedder/reach_video_output_device_uni
 new file mode 100644
 --- /dev/null
 +++ components/viz/service/display_embedder/reach_video_output_device_unittest.cc
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,153 @@
 +#include "components/viz/service/display_embedder/reach_video_output_device.h"
 +
 +#include "base/memory/read_only_shared_memory_region.h"
@@ -275,7 +289,8 @@ new file mode 100644
 +}
 +
 +TEST(ReachVideoOutputDeviceTest, ResizeDoesNotInvalidateAnOutstandingFrame) {
-+  base::test::SingleThreadTaskEnvironment tasks;
++  base::test::SingleThreadTaskEnvironment tasks(
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
 +  Consumer consumer;
 +  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote());
 +  device.Resize(gfx::Size(2, 2), 1.0f);
@@ -291,11 +306,40 @@ new file mode 100644
 +  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
 +  consumer.mapping_ = {};
 +  std::move(consumer.released_).Run();
-+  tasks.RunUntilIdle();
++  tasks.FastForwardBy(base::Microseconds(33334));
 +  EXPECT_EQ(consumer.size_, gfx::Size(3, 2));
 +  EXPECT_EQ(consumer.stride_, 12u);
 +  EXPECT_GT(consumer.generation_, generation);
 +  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorGREEN);
++}
++
++TEST(ReachVideoOutputDeviceTest, CoalescesFastPaintsBeforeSnapshotAtThirtyFps) {
++  base::test::SingleThreadTaskEnvironment tasks(
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
++  Consumer consumer;
++  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote());
++  device.Resize(gfx::Size(2, 2), 1.0f);
++  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++  device.EndPaint();
++  tasks.RunUntilIdle();
++  ASSERT_EQ(consumer.deliveries_, 1);
++  consumer.mapping_ = {};
++  std::move(consumer.released_).Run();
++  tasks.RunUntilIdle();
++  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
++  device.EndPaint();
++  tasks.FastForwardBy(base::Milliseconds(31));
++  EXPECT_EQ(consumer.deliveries_, 1);
++  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorBLUE);
++  const auto latest_paint = base::TimeTicks::Now();
++  device.EndPaint();
++  tasks.FastForwardBy(base::Microseconds(2333));
++  EXPECT_EQ(consumer.deliveries_, 1);
++  tasks.FastForwardBy(base::Microseconds(1));
++  ASSERT_EQ(consumer.deliveries_, 2);
++  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0],
++            SK_ColorBLUE);
++  EXPECT_EQ(consumer.timestamp_, latest_paint);
 +}
 +
 +TEST(ReachVideoOutputDeviceTest, SnapshotAndLateReplySurviveProducerTeardown) {
