@@ -1,5 +1,5 @@
 diff --git third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
-index 9ef16aa..efce4b4 100644
+index bdac352129b1eb7378344577c0e898c9420f9791..e46465abb998a04c00b814aefcd4fcd6b5ecae4f 100644
 --- third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
 +++ third_party/blink/renderer/core/html/canvas/canvas_rendering_context.cc
 @@ -26,6 +26,7 @@
@@ -10,24 +10,24 @@ index 9ef16aa..efce4b4 100644
  #include "base/strings/stringprintf.h"
  #include "services/metrics/public/cpp/ukm_builders.h"
  #include "third_party/blink/public/common/features.h"
-@@ -33,6 +34,7 @@
- #include "third_party/blink/renderer/bindings/core/v8/v8_union_element_elementimage.h"
+@@ -34,6 +35,7 @@
  #include "third_party/blink/renderer/core/animation_frame/worker_animation_frame_provider.h"
+ #include "third_party/blink/renderer/core/dom/dom_node_ids.h"
  #include "third_party/blink/renderer/core/frame/local_dom_window.h"
 +#include "third_party/blink/renderer/core/frame/local_frame.h"
  #include "third_party/blink/renderer/core/html/canvas/canvas_context_creation_attributes_core.h"
  #include "third_party/blink/renderer/core/html/canvas/canvas_image_source.h"
  #include "third_party/blink/renderer/core/html/canvas/element_image.h"
-@@ -46,6 +48,7 @@
+@@ -47,6 +49,7 @@
  #include "third_party/blink/renderer/core/paint/paint_layer_painter.h"
  #include "third_party/blink/renderer/core/workers/worker_global_scope.h"
  #include "third_party/blink/renderer/platform/graphics/accelerated_static_bitmap_image.h"
-+#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
- #include "third_party/blink/renderer/platform/graphics/canvas_non_2d_resource_provider.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h"
  #include "third_party/blink/renderer/platform/graphics/gpu/shared_gpu_context.h"
  #include "third_party/blink/renderer/platform/graphics/paint/paint_canvas.h"
-@@ -55,6 +58,10 @@
- #include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/paint_record_builder.h"
+@@ -57,12 +60,18 @@
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_functional.h"
  #include "third_party/blink/renderer/platform/wtf/functional.h"
  #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
 +#include "third_party/skia/include/core/SkColorSpace.h"
@@ -37,20 +37,25 @@ index 9ef16aa..efce4b4 100644
  #include "ui/accessibility/accessibility_features.h"
  #include "ui/gfx/geometry/rect_conversions.h"
  #include "ui/gfx/geometry/size_conversions.h"
-@@ -67,6 +74,143 @@ BASE_FEATURE(kAllowAcceleratedTexElement, base::FEATURE_ENABLED_BY_DEFAULT);
- // element to update its accessibility related information. This value is chosen
- // arbitrarily and can be subject to optimization.
- constexpr base::TimeDelta kAccessibilityUkmRecordingDelay = base::Seconds(5);
+ 
+ namespace blink {
+ namespace {
 +void (*reach_canvas_video_change_callback)(HTMLCanvasElement*) = nullptr;
-+}  // namespace
 +
+ BASE_FEATURE(kAllowAcceleratedTexElement, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+ void RecordAccessibilityUKMForCanvasElement(
+@@ -130,6 +139,142 @@ void RecordPlaceholderCanvasUKMOnMainThread(
+ 
+ }  // namespace
+ 
 +void CanvasRenderingContext::SetReachCanvasVideoChangeCallback(
 +    void (*callback)(HTMLCanvasElement*)) {
 +  reach_canvas_video_change_callback = callback;
 +}
 +
 +void CanvasRenderingContext::ReachCanvasVideoChanged(bool epoch) {
-+  if (!Canvas2DBitmapProvider::IsReachCanvasVideoMode() ||
++  if (!Canvas2DResourceProvider::IsReachCanvasVideoMode() ||
 +      !Host() || Host()->IsOffscreenCanvas())
 +    return;
 +  auto* canvas = static_cast<HTMLCanvasElement*>(Host());
@@ -100,7 +105,7 @@ index 9ef16aa..efce4b4 100644
 +}
 +
 +bool CanvasRenderingContext::CheckpointReachCanvasVideo() {
-+  if (!Canvas2DBitmapProvider::IsReachCanvasVideoMode())
++  if (!Canvas2DResourceProvider::IsReachCanvasVideoMode())
 +    return true;
 +  // Only a preflighted painted inventory may read or admit new pixels.
 +  if (!reach_canvas_video_capture_prepared_)
@@ -127,7 +132,7 @@ index 9ef16aa..efce4b4 100644
 +      std::map<LocalFrame*, std::weak_ptr<ReachCanvasVideo::Budget>>;
 +  static base::NoDestructor<Budgets> budgets;
 +  std::erase_if(*budgets,
-+                [](const auto& entry) { return entry.second.expired(); });
++               [](const auto& entry) { return entry.second.expired(); });
 +  auto& weak = (*budgets)[&frame->LocalFrameRoot()];
 +  auto budget = weak.lock();
 +  if (!budget) {
@@ -154,8 +159,8 @@ index 9ef16aa..efce4b4 100644
 +    }
 +    const auto info =
 +        SkImageInfo::Make(output_size.width(), output_size.height(),
-+                          kRGBA_8888_SkColorType,
-+                          kUnpremul_SkAlphaType, SkColorSpace::MakeSRGB());
++                         kRGBA_8888_SkColorType,
++                         kUnpremul_SkAlphaType, SkColorSpace::MakeSRGB());
 +    std::vector<uint8_t> bytes;
 +    if (output_size == size) {
 +      const auto original = snapshot->CopyImageData(info, false);
@@ -165,7 +170,7 @@ index 9ef16aa..efce4b4 100644
 +      const auto image = snapshot->PaintImageForCurrentFrame().GetSwSkImage();
 +      if (!image ||
 +          !image->scalePixels(SkPixmap(info, bytes.data(), info.minRowBytes()),
-+                              SkSamplingOptions(SkFilterMode::kLinear))) {
++                             SkSamplingOptions(SkFilterMode::kLinear))) {
 +        capture.Fail("Canvas video bounded resampling failed");
 +        return std::vector<uint8_t>();
 +      }
@@ -178,10 +183,12 @@ index 9ef16aa..efce4b4 100644
 +    }
 +    return bytes;
 +  });
- }
- 
++}
++
  CanvasRenderingContext::CanvasRenderingContext(
-@@ -90,6 +234,7 @@ CanvasRenderingContext::CanvasRenderingContext(
+     CanvasRenderingContextHost* host,
+     const CanvasContextCreationAttributesCore& attrs,
+@@ -151,6 +296,7 @@ CanvasRenderingContext::CanvasRenderingContext(
  }
  
  void CanvasRenderingContext::Dispose() {
@@ -190,18 +197,18 @@ index 9ef16aa..efce4b4 100644
  
    if (did_schedule_accessibility_ukm_recording_) {
 diff --git third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
-index 5d240af..abfddc0 100644
+index ef273796db057b89af2c9b6ade389153f86309a8..64b62e62226261cd0c533d834df17928bc7486f7 100644
 --- third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
 +++ third_party/blink/renderer/core/html/canvas/canvas_rendering_context.h
-@@ -39,6 +39,7 @@
- #include "third_party/blink/renderer/core/html/canvas/canvas_performance_monitor.h"
+@@ -41,6 +41,7 @@
  #include "third_party/blink/renderer/core/html/canvas/canvas_rendering_context_host.h"
+ #include "third_party/blink/renderer/platform/graphics/exported_canvas_resource.h"
  #include "third_party/blink/renderer/platform/graphics/graphics_types_3d.h"
 +#include "third_party/blink/renderer/platform/graphics/reach_canvas_video.h"
  #include "third_party/blink/renderer/platform/heap/member.h"
  #include "third_party/blink/renderer/platform/heap/prefinalizer.h"
  #include "third_party/blink/renderer/platform/heap/visitor.h"
-@@ -74,6 +75,7 @@ class Element;
+@@ -76,6 +77,7 @@ class Element;
  class ExceptionState;
  class ExecutionContext;
  class ImageBitmap;
@@ -209,7 +216,7 @@ index 5d240af..abfddc0 100644
  class ScriptState;
  class StaticBitmapImage;
  class V8RenderingContext;
-@@ -134,6 +136,16 @@ class CORE_EXPORT CanvasRenderingContext
+@@ -141,6 +143,16 @@ class CORE_EXPORT CanvasRenderingContext
    bool IsWebGPU() const {
      return canvas_rendering_type_ == CanvasRenderingAPI::kWebgpu;
    }
@@ -226,7 +233,7 @@ index 5d240af..abfddc0 100644
  
    // ActiveScriptWrappable
    // As this class inherits from ActiveScriptWrappable, as long as
-@@ -323,7 +335,10 @@ class CORE_EXPORT CanvasRenderingContext
+@@ -322,7 +334,10 @@ class CORE_EXPORT CanvasRenderingContext
  
    void DidMoveToNewDocument(Document*);
  
@@ -238,7 +245,7 @@ index 5d240af..abfddc0 100644
  
    const CanvasContextCreationAttributesCore& CreationAttributes() const {
      return creation_attributes_;
-@@ -360,6 +375,9 @@ class CORE_EXPORT CanvasRenderingContext
+@@ -365,6 +380,9 @@ class CORE_EXPORT CanvasRenderingContext
    std::optional<cc::PaintRecord> empty_recording_;
  
   private:
@@ -249,18 +256,10 @@ index 5d240af..abfddc0 100644
    CanvasContextCreationAttributesCore creation_attributes_;
  
 diff --git third_party/blink/renderer/core/html/canvas/html_canvas_element.cc third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-index 2a5404e..a8c99d4 100644
+index 5d9d963d79a9457b85372bfa38701b5c75b6eda6..4ae1f831b975e2933eada01953dbffa93ae052f4 100644
 --- third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 +++ third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-@@ -34,6 +34,7 @@
- #include <utility>
- 
- #include "base/auto_reset.h"
-+#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
- #include "base/feature_list.h"
- #include "base/functional/callback_helpers.h"
- #include "base/location.h"
-@@ -109,6 +110,7 @@
+@@ -108,9 +108,11 @@
  #include "third_party/blink/renderer/core/page/page_animator.h"
  #include "third_party/blink/renderer/core/paint/paint_auto_dark_mode.h"
  #include "third_party/blink/renderer/core/paint/paint_layer.h"
@@ -268,7 +267,11 @@ index 2a5404e..a8c99d4 100644
  #include "third_party/blink/renderer/core/probe/core_probes.h"
  #include "third_party/blink/renderer/core/resize_observer/resize_observer_utilities.h"
  #include "third_party/blink/renderer/platform/bindings/exception_state.h"
-@@ -688,6 +690,8 @@ void HTMLCanvasElement::DidDraw(const gfx::Rect& rect) {
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h"
+ #include "third_party/blink/renderer/platform/fonts/plain_text_painter.h"
+ #include "third_party/blink/renderer/platform/graphics/canvas_resource.h"
+ #include "third_party/blink/renderer/platform/graphics/canvas_resource_dispatcher.h"
+@@ -680,6 +682,8 @@ void HTMLCanvasElement::DidDraw(const gfx::Rect& rect) {
    if (rect.IsEmpty()) {
      return;
    }
@@ -277,7 +280,7 @@ index 2a5404e..a8c99d4 100644
  
    // To avoid issuing invalidations multiple times, we can check |dirty_rect_|
    // and only issue invalidations the first time it becomes non-empty.
-@@ -716,6 +720,8 @@ void HTMLCanvasElement::InitializeLayerWithCSSProperties(cc::Layer* layer) {
+@@ -708,6 +712,8 @@ void HTMLCanvasElement::InitializeLayerWithCSSProperties(cc::Layer* layer) {
  }
  
  void HTMLCanvasElement::PostFinalizeFrame(FlushReason reason) {
@@ -286,7 +289,7 @@ index 2a5404e..a8c99d4 100644
    RecordCanvasSizeToUMA();
  
    if (IsWebGL()) {
-@@ -1174,6 +1180,8 @@ bool HTMLCanvasElement::PaintsIntoCanvasBuffer() const {
+@@ -1150,6 +1156,8 @@ bool HTMLCanvasElement::PaintsIntoCanvasBuffer() const {
  }
  
  void HTMLCanvasElement::NotifyListenersCanvasChanged() {
@@ -295,12 +298,12 @@ index 2a5404e..a8c99d4 100644
    if (listeners_.size() == 0)
      return;
  
-@@ -1331,6 +1339,18 @@ void HTMLCanvasElement::Paint(GraphicsContext& context,
+@@ -1307,6 +1315,18 @@ void HTMLCanvasElement::Paint(GraphicsContext& context,
  
  void HTMLCanvasElement::PaintInternal(GraphicsContext& context,
                                        const PhysicalRect& r) {
 +  if (IsReachMediaCapture() && RenderingContext() &&
-+      Canvas2DBitmapProvider::IsReachCanvasVideoMode()) {
++      Canvas2DResourceProvider::IsReachCanvasVideoMode()) {
 +    if (RenderingContext()->isContextLost() || Size().IsEmpty())
 +      return;
 +    auto* target = context.Canvas();
@@ -314,7 +317,7 @@ index 2a5404e..a8c99d4 100644
    // For 2D Canvas, there are two ways of render Canvas for printing:
    // display list or image snapshot. Display list allows better PDF printing
    // and we prefer this method.
-@@ -1880,8 +1900,10 @@ void HTMLCanvasElement::ContextDestroyed() {
+@@ -1866,8 +1886,10 @@ void HTMLCanvasElement::ContextDestroyed() {
      // skipped.
      accessibility_manager_->FlushUmaIfNeeded();
    }
@@ -326,7 +329,7 @@ index 2a5404e..a8c99d4 100644
  }
  
  bool HTMLCanvasElement::StyleChangeNeedsDidDraw(
-@@ -1943,6 +1965,8 @@ void HTMLCanvasElement::LangAttributeChanged() {
+@@ -1929,6 +1951,8 @@ void HTMLCanvasElement::LangAttributeChanged() {
  }
  
  void HTMLCanvasElement::DidMoveToNewDocument(Document& old_document) {
@@ -334,8 +337,8 @@ index 2a5404e..a8c99d4 100644
 +    context_->ReachCanvasVideoChanged(true);
    SetExecutionContext(GetExecutionContext());
    SetPage(GetDocument().GetPage());
-   HTMLElement::DidMoveToNewDocument(old_document);
-@@ -1954,6 +1978,8 @@ void HTMLCanvasElement::DidRecalcStyle(const StyleRecalcChange change) {
+   last_ax_ignored_state_ = std::nullopt;
+@@ -1941,6 +1965,8 @@ void HTMLCanvasElement::DidRecalcStyle(const StyleRecalcChange change) {
  }
  
  void HTMLCanvasElement::RemovedFrom(ContainerNode& insertion_point) {
@@ -345,7 +348,7 @@ index 2a5404e..a8c99d4 100644
    ColorSchemeMayHaveChanged();
  }
 diff --git third_party/blink/renderer/core/paint/html_canvas_painter.cc third_party/blink/renderer/core/paint/html_canvas_painter.cc
-index 8f02ea1..d7619b3 100644
+index aa1ed5af27250b6d9dd40cd5780696f83acdc2be..c3de0e3076fc862523a33e44c774bb3b6f7f9ff9 100644
 --- third_party/blink/renderer/core/paint/html_canvas_painter.cc
 +++ third_party/blink/renderer/core/paint/html_canvas_painter.cc
 @@ -11,6 +11,8 @@
@@ -353,7 +356,7 @@ index 8f02ea1..d7619b3 100644
  #include "third_party/blink/renderer/core/paint/paint_info.h"
  #include "third_party/blink/renderer/core/paint/timing/paint_timing.h"
 +#include "third_party/blink/renderer/core/paint/video_painter.h"
-+#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h"
  #include "third_party/blink/renderer/platform/graphics/paint/drawing_recorder.h"
  #include "third_party/blink/renderer/platform/graphics/paint/foreign_layer_display_item.h"
  #include "third_party/blink/renderer/platform/graphics/scoped_image_rendering_settings.h"
@@ -362,7 +365,7 @@ index 8f02ea1..d7619b3 100644
    }
  
 +  const bool reach_canvas_video =
-+      IsReachMediaCapture() && Canvas2DBitmapProvider::IsReachCanvasVideoMode();
++      IsReachMediaCapture() && Canvas2DResourceProvider::IsReachCanvasVideoMode();
    if (auto* layer = canvas->ContentsCcLayer()) {
      // TODO(crbug.com/705019): For a texture layer canvas, setting the layer
      // background color to an opaque color will cause the layer to be treated as
@@ -378,8 +381,8 @@ index 8f02ea1..d7619b3 100644
        layer->SetIsDrawable(true);
 @@ -101,7 +106,8 @@ void HTMLCanvasPainter::PaintReplaced(const PaintInfo& paint_info,
    ScopedImageRenderingSettings image_rendering_settings_scope(
-       context, InterpolationQualityForCanvas(layout_html_canvas_.StyleRef()),
-       layout_html_canvas_.StyleRef().GetDynamicRangeLimit());
+       context, InterpolationQualityForCanvas(layout_html_canvas_.Style()),
+       layout_html_canvas_.Style().GetDynamicRangeLimit());
 -  canvas->Paint(context, paint_rect, paint_info.ShouldOmitCompositingInfo());
 +  canvas->Paint(context, paint_rect,
 +                reach_canvas_video || paint_info.ShouldOmitCompositingInfo());
@@ -387,7 +390,7 @@ index 8f02ea1..d7619b3 100644
  
  }  // namespace blink
 diff --git third_party/blink/renderer/core/paint/video_painter.cc third_party/blink/renderer/core/paint/video_painter.cc
-index 0121229..633acb5 100644
+index 767effb7aa23a52b91777395392190f9f9fad9ba..fd6c3a093a006171bcab55d0ade7da055a20f75c 100644
 --- third_party/blink/renderer/core/paint/video_painter.cc
 +++ third_party/blink/renderer/core/paint/video_painter.cc
 @@ -30,6 +30,10 @@ bool SetReachMediaCapture(bool enabled) {
@@ -402,7 +405,7 @@ index 0121229..633acb5 100644
                                   const PhysicalOffset& paint_offset) {
    if (paint_info.phase != PaintPhase::kForeground &&
 diff --git third_party/blink/renderer/core/paint/video_painter.h third_party/blink/renderer/core/paint/video_painter.h
-index db92058..c703baa 100644
+index db920580029bf4d7a2944bf7392557cd59fef46e..c703baaf2987b3f03bcac1ff9ef9630a59f9bec8 100644
 --- third_party/blink/renderer/core/paint/video_painter.h
 +++ third_party/blink/renderer/core/paint/video_painter.h
 @@ -12,6 +12,7 @@
@@ -414,10 +417,10 @@ index db92058..c703baa 100644
  class LayoutVideo;
  struct PaintInfo;
 diff --git third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
-index 4df9bb8..c22d0bc 100644
+index 3e07fa0d7e03a7058ee8063d3972a603e65cfa66..763526894e7812f1ffccaf4c565074d2339d2335 100644
 --- third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
 +++ third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
-@@ -223,6 +223,7 @@ V8RenderingContext* CanvasRenderingContext2D::AsV8RenderingContext() {
+@@ -221,6 +221,7 @@ V8RenderingContext* CanvasRenderingContext2D::AsV8RenderingContext() {
  CanvasRenderingContext2D::~CanvasRenderingContext2D() = default;
  
  void CanvasRenderingContext2D::ResetInternal() {
@@ -425,22 +428,41 @@ index 4df9bb8..c22d0bc 100644
    if (IsHibernating()) {
      CanvasHibernationHandler::ReportHibernationEvent(
          CanvasHibernationHandler::HibernationEvent::kHibernationEndedOnReset);
-@@ -782,6 +783,10 @@ CanvasRenderingContext2D::PaintRenderingResultsToResource(
- scoped_refptr<StaticBitmapImage>
- CanvasRenderingContext2D::PaintRenderingResultsToSnapshot(
-     SourceDrawingBuffer source_buffer) {
-+  if (Canvas2DBitmapProvider::IsReachCanvasVideoMode() &&
-+      !IsResourceProviderValid() && !GetOrCreatePaintCanvas()) {
+@@ -1141,6 +1142,16 @@ bool CanvasRenderingContext2D::HasBacking() const {
+   return BaseRenderingContext2D::HasBacking();
+ }
+ 
++scoped_refptr<StaticBitmapImage>
++CanvasRenderingContext2D::PaintRenderingResultsToSnapshot(
++    SourceDrawingBuffer source_buffer) {
++  if (Canvas2DResourceProvider::IsReachCanvasVideoMode() &&
++      !IsBackingValid() && !GetOrCreatePaintCanvas()) {
 +    return nullptr;
 +  }
-   if (!IsResourceProviderValid()) {
-     return nullptr;
-   }
++  return BaseRenderingContext2D::PaintRenderingResultsToSnapshot(source_buffer);
++}
++
+ scoped_refptr<StaticBitmapImage> CanvasRenderingContext2D::Snapshot() {
+   return BaseRenderingContext2D::Snapshot();
+ }
+diff --git third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.h third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.h
+index cabe395e24e759b51c8d985a227bd13bcb314fb8..068c8f7f6d4b52596fffca7f0bd6cf27759d86ed 100644
+--- third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.h
++++ third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.h
+@@ -199,6 +199,8 @@ class MODULES_EXPORT CanvasRenderingContext2D final
+                 CanvasPerformanceMonitor::DrawType) final;
+ 
+   scoped_refptr<StaticBitmapImage> GetImage() final;
++  scoped_refptr<StaticBitmapImage> PaintRenderingResultsToSnapshot(
++      SourceDrawingBuffer source_buffer) override;
+ 
+   sk_sp<PaintFilter> StateGetFilter() final;
+ 
 diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index b17f336..08a9439 100644
+index 1a00418d114d8fee6401328e446d2c61212647a3..eae8547b9bdd35696ac5b3124d1d2c862abe06bc 100644
 --- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-@@ -908,6 +908,7 @@ void WebGLRenderingContextBase::drawingBufferStorage(GLenum sizedformat,
+@@ -909,6 +909,7 @@ void WebGLRenderingContextBase::drawingBufferStorage(GLenum sizedformat,
  
    GetDrawingBuffer()->ResizeWithFormat(sizedformat, alpha_type,
                                         gfx::Size(width, height));
@@ -448,7 +470,7 @@ index b17f336..08a9439 100644
  }
  
  scoped_refptr<StaticBitmapImage> WebGLRenderingContextBase::GetImage() {
-@@ -1574,6 +1575,7 @@ void WebGLRenderingContextBase::InitializeNewContext() {
+@@ -1627,6 +1628,7 @@ void WebGLRenderingContextBase::InitializeNewContext() {
    // initialized. Restore it now.
    GetDrawingBuffer()->RestoreAllState();
    ActivateContext(this);
@@ -456,7 +478,7 @@ index b17f336..08a9439 100644
  }
  
  void WebGLRenderingContextBase::SetupFlags() {
-@@ -1681,6 +1683,8 @@ void WebGLRenderingContextBase::MarkContextChanged(
+@@ -1734,6 +1736,8 @@ void WebGLRenderingContextBase::MarkContextChanged(
      return;
    }
  
@@ -465,7 +487,7 @@ index b17f336..08a9439 100644
    // Regardless of whether dirty propagations are optimized away, the back
    // buffer is now out of sync with respect to the canvas's internal backing
    // store -- which is only used for certain purposes, like printing.
-@@ -1923,9 +1927,17 @@ void WebGLRenderingContextBase::RestoreActiveTexture() {
+@@ -1977,9 +1981,17 @@ void WebGLRenderingContextBase::RestoreActiveTexture() {
    ContextGL()->ActiveTexture(active_texture_unit_ + GL_TEXTURE0);
  }
  
@@ -484,7 +506,7 @@ index b17f336..08a9439 100644
  }
  
  bool WebGLRenderingContextBase::OnMemoryDump(
-@@ -2455,6 +2467,7 @@ void WebGLRenderingContextBase::Reshape(int width, int height) {
+@@ -2530,6 +2542,7 @@ void WebGLRenderingContextBase::Reshape(gfx::Size old_size,
    // buffer will also start off clear (and this matches what reshape will do).
    GetDrawingBuffer()->Resize(gfx::Size(width, height));
    GetDrawingBuffer()->MarkContentsChanged();
@@ -492,7 +514,7 @@ index b17f336..08a9439 100644
  
    Host()->UpdateMemoryUsage();
  
-@@ -2506,6 +2519,7 @@ void WebGLRenderingContextBase::setDrawingBufferColorSpace(
+@@ -2585,6 +2598,7 @@ void WebGLRenderingContextBase::setDrawingBufferColorSpace(
    drawing_buffer_color_space_ = color_space;
    if (GetDrawingBuffer())
      GetDrawingBuffer()->SetColorSpace(drawing_buffer_color_space_);
@@ -500,7 +522,7 @@ index b17f336..08a9439 100644
  }
  
  CanvasToneMapping* WebGLRenderingContextBase::drawingBufferToneMapping(
-@@ -7721,6 +7735,7 @@ void WebGLRenderingContextBase::ForceLostContext(
+@@ -7747,6 +7761,7 @@ void WebGLRenderingContextBase::ForceLostContext(
    }
  
    context_lost_mode_ = mode;
@@ -509,10 +531,10 @@ index b17f336..08a9439 100644
    auto_recovery_method_ = auto_recovery_method;
  
 diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
-index 2e5ca58..fce25a8 100644
+index 016013bb5453a2fa38b0ee3c41ffb116efe81a95..b21d5d275c81e3fb333f4f1ae04199039e28e4c0 100644
 --- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
 +++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h
-@@ -147,6 +147,11 @@ class MODULES_EXPORT WebGLRenderingContextBase
+@@ -148,6 +148,11 @@ class MODULES_EXPORT WebGLRenderingContextBase
  
    ~WebGLRenderingContextBase() override;
  
@@ -525,10 +547,10 @@ index 2e5ca58..fce25a8 100644
  
    virtual String ContextName() const = 0;
 diff --git third_party/blink/renderer/platform/BUILD.gn third_party/blink/renderer/platform/BUILD.gn
-index 6101076..0aab5e0 100644
+index ec13ed073610cc166bd3d7f14aa65d36338abd2c..c978926a203b9a66852d3c4ed2bb9417e5e7a7b4 100644
 --- third_party/blink/renderer/platform/BUILD.gn
 +++ third_party/blink/renderer/platform/BUILD.gn
-@@ -1243,6 +1243,7 @@ component("platform") {
+@@ -1299,6 +1299,7 @@ component("platform") {
      "graphics/profiling_canvas.h",
      "graphics/raster_dark_mode_filter_impl.cc",
      "graphics/raster_dark_mode_filter_impl.h",
@@ -536,36 +558,36 @@ index 6101076..0aab5e0 100644
      "graphics/replaying_canvas.cc",
      "graphics/replaying_canvas.h",
      "graphics/resource_id_traits.h",
-diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
-index d216fff..37a0f8f 100644
---- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
-+++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
-@@ -43,6 +43,10 @@ bool Canvas2DBitmapProvider::IsReachCommandMode() {
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.cc third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.cc
+index 3d9671985e9d6ae1ec5ff4b5020dc0548bdcc062..d6c10a3b3b3d26373bb546e331143351642546f8 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.cc
++++ third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.cc
+@@ -73,6 +73,10 @@ bool Canvas2DResourceProvider::IsReachCommandMode() {
        "reach-drawing-commands");
  }
  
-+bool Canvas2DBitmapProvider::IsReachCanvasVideoMode() {
++bool Canvas2DResourceProvider::IsReachCanvasVideoMode() {
 +  return IsReachCommandMode();
 +}
 +
- Canvas2DBitmapProvider::Canvas2DBitmapProvider(
-     gfx::Size size,
-     viz::SharedImageFormat format,
-diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
-index 21c8f76..b2b7281 100644
---- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
-+++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
-@@ -69,6 +69,7 @@ class PLATFORM_EXPORT Canvas2DBitmapProvider final
-   ~Canvas2DBitmapProvider() override;
+ BASE_FEATURE(kAppendCpuUsages, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+ // When enabled, unused resources (ready to be recycled) are reclaimed after a
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h
+index b0640131e9f2c7a4caf61f0d0a25807ae810fc5a..582e137e285caaad46654b909f02b8be7bf2c6db 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h
++++ third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h
+@@ -131,6 +131,7 @@ class PLATFORM_EXPORT Canvas2DResourceProvider
+   ~Canvas2DResourceProvider() override;
  
    static bool IsReachCommandMode();
 +  static bool IsReachCanvasVideoMode();
-   bool IsValid() const { return GetSkSurface(); }
-   void SetDelegate(CanvasResourceProviderDelegate* delegate) {
-     delegate_ = delegate;
+ 
+   bool unused_resources_reclaim_timer_is_running_for_testing() const;
+   bool HasUnusedResourcesForTesting() const;
 diff --git third_party/blink/renderer/platform/graphics/reach_canvas_video.h third_party/blink/renderer/platform/graphics/reach_canvas_video.h
 new file mode 100644
-index 0000000..507023a
+index 0000000000000000000000000000000000000000..507023a58c8c9e26db9280b4ec0ce6ef589c86d9
 --- /dev/null
 +++ third_party/blink/renderer/platform/graphics/reach_canvas_video.h
 @@ -0,0 +1,216 @@

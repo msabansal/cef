@@ -790,14 +790,16 @@ uint32_t CefRenderWidgetHostViewOSR::GetCaptureSequenceNumber() const {
   return latest_capture_sequence_number_;
 }
 
-void CefRenderWidgetHostViewOSR::CopyFromSurface(
+void CefRenderWidgetHostViewOSR::CopyFromSurfaceImpl(
     const gfx::Rect& src_rect,
     const gfx::Size& output_size,
+    bool is_copy_request_secure,
     base::TimeDelta timeout,
     base::OnceCallback<void(const content::CopyFromSurfaceResult&)> callback) {
   if (delegated_frame_host_) {
     delegated_frame_host_->CopyFromCompositingSurface(
-        src_rect, output_size, timeout, std::move(callback));
+        src_rect, output_size, is_copy_request_secure, timeout,
+        std::move(callback));
   }
 }
 
@@ -1451,11 +1453,22 @@ void CefRenderWidgetHostViewOSR::SendMouseWheelEvent(
 
   ui::LatencyInfo latency_info = CreateLatencyInfo(web_event);
   if (render_widget_host_ && render_widget_host_->GetView()) {
-    mouse_wheel_phase_handler_.SendWheelEndForTouchpadScrollingIfNeeded(false);
+    const bool should_route = ShouldRouteEvents();
+    const bool precise =
+        web_event.delta_units == ui::ScrollGranularity::kScrollByPrecisePixel;
+    if (!precise) {
+      mouse_wheel_phase_handler_.SendWheelEndForTouchpadScrollingIfNeeded(
+          should_route);
+    }
     mouse_wheel_phase_handler_.AddPhaseIfNeededAndScheduleEndEvent(
-        web_event, false, /*is_fling_capable=*/false);
+        web_event, should_route, /*is_fling_capable=*/precise);
+    // Let the phase handler defer the end to allow momentum scrolling to
+    // start, or send it immediately when momentum is explicitly blocked.
+    if (web_event.phase == blink::WebMouseWheelEvent::kPhaseEnded) {
+      return;
+    }
 
-    if (ShouldRouteEvents()) {
+    if (should_route) {
       render_widget_host_->delegate()
           ->GetInputEventRouter()
           ->RouteMouseWheelEvent(this, &web_event, latency_info);
@@ -1642,6 +1655,15 @@ void CefRenderWidgetHostViewOSR::ProcessAckedTouchEvent(
                                      event_consumed, false);
 }
 
+void CefRenderWidgetHostViewOSR::GestureEventAck(
+    const blink::WebGestureEvent& event,
+    blink::mojom::InputEventResultSource ack_source,
+    blink::mojom::InputEventResultState ack_result) {
+  // Like the native views, resume a touchpad zoom gesture only after its
+  // synthetic wheel event was left unhandled by the renderer.
+  ForwardTouchpadZoomEventIfNecessary(event, ack_result);
+}
+
 void CefRenderWidgetHostViewOSR::OnGestureEvent(
     const ui::GestureEventData& gesture) {
   if ((gesture.type() == ui::EventType::kGesturePinchBegin ||
@@ -1656,6 +1678,26 @@ void CefRenderWidgetHostViewOSR::OnGestureEvent(
 
   // without this check, forwarding gestures does not work!
   if (web_event.GetType() == blink::WebInputEvent::Type::kUndefined) {
+    return;
+  }
+
+  SendGestureEvent(web_event);
+}
+
+void CefRenderWidgetHostViewOSR::SendGestureEvent(
+    const blink::WebGestureEvent& web_event) {
+  if (!render_widget_host_ || !render_widget_host_->GetView()) {
+    return;
+  }
+
+  if (!IsPopupWidget() && popup_host_view_ &&
+      popup_host_view_->popup_position_.Contains(
+          web_event.PositionInWidget().x(), web_event.PositionInWidget().y())) {
+    blink::WebGestureEvent popup_event(web_event);
+    popup_event.SetPositionInWidget(
+        web_event.PositionInWidget() -
+        popup_host_view_->popup_position_.OffsetFromOrigin());
+    popup_host_view_->SendGestureEvent(popup_event);
     return;
   }
 
@@ -2098,6 +2140,12 @@ void CefRenderWidgetHostViewOSR::OnImeCompositionRangeChanged(
   // view coordinates.
   if (updated_view == this ||
       updated_view->host() != GetFocusedWidgetForIme()) {
+    return;
+  }
+  // Focus and text-input state updates can arrive independently. The getter
+  // below returns the active widget's cached bounds, which may still belong
+  // to the previously focused widget. Do not forward them as a child update.
+  if (text_input_manager->GetActiveWidget() != updated_view->host()) {
     return;
   }
   if (const auto* info = text_input_manager->GetCompositionRangeInfo()) {

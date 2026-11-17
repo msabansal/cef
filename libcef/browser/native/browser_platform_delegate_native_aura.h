@@ -36,26 +36,32 @@ class CefBrowserPlatformDelegateNativeAura
                            bool mouseUp,
                            int clickCount) override;
   void SendMouseMoveEvent(const CefMouseEvent& event, bool mouseLeave) override;
+  void SendWheelEvent(const CefWheelInputEvent& event) override;
   void SendMouseWheelEvent(const CefMouseEvent& event,
                            int deltaX,
                            int deltaY) override;
-  void SendTouchEvent(const CefTouchEvent& event) override;
   std::unique_ptr<CefMenuRunner> CreateMenuRunner() override;
   gfx::Point GetScreenPoint(const gfx::Point& view,
                             bool want_dip_coords) const override;
 
   // CefBrowserPlatformDelegateNative methods:
+  void SendWebTouchEvent(const blink::WebTouchEvent& event) override;
   // DEPRECATED: Legacy SendKeyEvent conversion; use
   // TranslateWebKeyboardInputEvent for unified keyboard input.
   input::NativeWebKeyboardEvent TranslateWebKeyEvent(
       const CefKeyEvent& key_event) const override;
+  // DEPRECATED: Retained for legacy mouse injection. Unified mouse input
+  // uses GetWebMouseInputEvent without platform conversion.
   blink::WebMouseEvent TranslateWebClickEvent(
       const CefMouseEvent& mouse_event,
       CefBrowserHost::MouseButtonType type,
       bool mouseUp,
       int clickCount) const override;
+  // DEPRECATED: Retained for legacy mouse injection. Unified mouse input
+  // uses GetWebMouseInputEvent without platform conversion.
   blink::WebMouseEvent TranslateWebMoveEvent(const CefMouseEvent& mouse_event,
                                              bool mouseLeave) const override;
+  // DEPRECATED: Unified wheel input uses GetWebWheelInputEvent.
   blink::WebMouseWheelEvent TranslateWebWheelEvent(
       const CefMouseEvent& mouse_event,
       int deltaX,
@@ -66,17 +72,23 @@ class CefBrowserPlatformDelegateNativeAura
   // Unified input uses SendKeyboardEvent with a resolved portable snapshot.
   virtual ui::KeyEvent TranslateUiKeyEvent(
       const CefKeyEvent& key_event) const = 0;
+  // DEPRECATED: Retained for the legacy mouse native-event path.
+  // Unified mouse input uses SendMouseEvent with a portable snapshot.
   virtual ui::MouseEvent TranslateUiClickEvent(
       const CefMouseEvent& mouse_event,
       CefBrowserHost::MouseButtonType type,
       bool mouseUp,
       int clickCount) const;
+  // DEPRECATED: Retained for the legacy mouse native-event path.
+  // Unified mouse input uses SendMouseEvent with a portable snapshot.
   virtual ui::MouseEvent TranslateUiMoveEvent(const CefMouseEvent& mouse_event,
                                               bool mouseLeave) const;
+  // DEPRECATED: Retained for legacy wheel injection.
   virtual ui::MouseWheelEvent TranslateUiWheelEvent(
       const CefMouseEvent& mouse_event,
       int deltaX,
       int deltaY) const;
+  // DEPRECATED: Retained for legacy wheel injection.
   virtual gfx::Vector2d GetUiWheelEventOffset(int deltaX, int deltaY) const;
 
   // Returns the root window bounds in screen DIP coordinates.

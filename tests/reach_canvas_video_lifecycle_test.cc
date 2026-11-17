@@ -49,7 +49,7 @@ struct HTMLCanvasElement {
   LayoutObject* GetLayoutObject() { return &layout; }
   LayoutObject layout;
 };
-struct Canvas2DBitmapProvider {
+struct Canvas2DResourceProvider {
   static bool IsReachCanvasVideoMode() { return true; }
 };
 void (*reach_canvas_video_change_callback)(HTMLCanvasElement*) = nullptr;

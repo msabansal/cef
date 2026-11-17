@@ -1,8 +1,8 @@
 diff --git third_party/blink/renderer/core/html/build.gni third_party/blink/renderer/core/html/build.gni
-index 1d7cd61..1d0f316 100644
+index 29e4efa4817f0119c78cbf737a2bbd92c1aaf869..18fe75cbfd51946fca41025001067c7849b199e2 100644
 --- third_party/blink/renderer/core/html/build.gni
 +++ third_party/blink/renderer/core/html/build.gni
-@@ -531,6 +531,8 @@ blink_core_sources_html = [
+@@ -537,6 +537,8 @@ blink_core_sources_html = [
    "media/media_video_visibility_tracker.h",
    "media/picture_in_picture_interstitial.cc",
    "media/picture_in_picture_interstitial.h",
@@ -13,7 +13,7 @@ index 1d7cd61..1d0f316 100644
    "media/remote_playback_observer.h",
 diff --git third_party/blink/renderer/core/html/media/reach_media_journal.cc third_party/blink/renderer/core/html/media/reach_media_journal.cc
 new file mode 100644
-index 0000000..e2b4e6c
+index 0000000000000000000000000000000000000000..e2b4e6cb4ea20f411364269cb5516b0eac7af840
 --- /dev/null
 +++ third_party/blink/renderer/core/html/media/reach_media_journal.cc
 @@ -0,0 +1,305 @@
@@ -324,7 +324,7 @@ index 0000000..e2b4e6c
 +}  // namespace blink
 diff --git third_party/blink/renderer/core/html/media/reach_media_journal.h third_party/blink/renderer/core/html/media/reach_media_journal.h
 new file mode 100644
-index 0000000..febe2c5
+index 0000000000000000000000000000000000000000..febe2c5167410184fcf84ef69be54d521f3819e8
 --- /dev/null
 +++ third_party/blink/renderer/core/html/media/reach_media_journal.h
 @@ -0,0 +1,124 @@
@@ -453,7 +453,7 @@ index 0000000..febe2c5
 +
 +#endif  // THIRD_PARTY_BLINK_RENDERER_CORE_HTML_MEDIA_REACH_MEDIA_JOURNAL_H_
 diff --git third_party/blink/renderer/modules/mediasource/media_source.cc third_party/blink/renderer/modules/mediasource/media_source.cc
-index d87d072..4e7942a 100644
+index f95ec8f5731709eb445533c2fc79d571e51420fb..7e5383b8bbc645118fd46ae40c92fb63dc6c0e9c 100644
 --- third_party/blink/renderer/modules/mediasource/media_source.cc
 +++ third_party/blink/renderer/modules/mediasource/media_source.cc
 @@ -373,6 +373,8 @@ void MediaSource::AddSourceBuffer_Locked(
@@ -501,7 +501,7 @@ index d87d072..4e7942a 100644
    }
  
    if (old_state == state)
-@@ -1296,6 +1313,15 @@ void MediaSource::EndOfStreamAlgorithm(
+@@ -1300,6 +1317,15 @@ void MediaSource::EndOfStreamAlgorithm(
      MediaSourceAttachmentSupplement::ExclusiveKey pass_key) {
    AssertAttachmentsMutexHeldIfCrossThreadForDebugging();
  
@@ -517,7 +517,7 @@ index d87d072..4e7942a 100644
    // https://www.w3.org/TR/media-source/#end-of-stream-algorithm
    // 1. Change the readyState attribute value to "ended".
    // 2. Queue a task to fire a simple event named sourceended at the
-@@ -1363,6 +1389,7 @@ MediaSourceTracer* MediaSource::StartAttachingToMediaElement(
+@@ -1367,6 +1393,7 @@ MediaSourceTracer* MediaSource::StartAttachingToMediaElement(
    media_source_attachment_ = attachment;
    attachment_tracer_ =
        MakeGarbageCollected<SameThreadMediaSourceTracer>(element, this);
@@ -526,7 +526,7 @@ index d87d072..4e7942a 100644
  }
  
 diff --git third_party/blink/renderer/modules/mediasource/media_source.h third_party/blink/renderer/modules/mediasource/media_source.h
-index 088140c..116ee9f 100644
+index c26ee90adf014ed13197073eb1b5cb0da82f5acb..7c9b6c94d87cb0a7da2953d719b114140e1fe8f2 100644
 --- third_party/blink/renderer/modules/mediasource/media_source.h
 +++ third_party/blink/renderer/modules/mediasource/media_source.h
 @@ -15,6 +15,7 @@
@@ -547,7 +547,7 @@ index 088140c..116ee9f 100644
    // Completing the attachment always occurs on the thread/context that owns
    // this MediaSource.
    void CompleteAttachingToMediaElement(std::unique_ptr<WebMediaSource>)
-@@ -283,6 +287,9 @@ class MediaSource final : public EventTarget,
+@@ -289,6 +293,9 @@ class MediaSource final : public EventTarget,
  
    Member<MediaSourceHandleImpl> worker_media_source_handle_;
  
@@ -558,7 +558,7 @@ index 088140c..116ee9f 100644
    // |attachment_tracer_|, |context_already_destroyed_|, and execution of
    // handle().
 diff --git third_party/blink/renderer/modules/mediasource/source_buffer.cc third_party/blink/renderer/modules/mediasource/source_buffer.cc
-index e7ac669..98e4bb1 100644
+index 35764e02f387c2a3b233e476fdbd65db5b89f0ec..7c88d1734249bd60a6c7d4a0aef71ab53592a71d 100644
 --- third_party/blink/renderer/modules/mediasource/source_buffer.cc
 +++ third_party/blink/renderer/modules/mediasource/source_buffer.cc
 @@ -338,6 +338,11 @@ void SourceBuffer::SetMode_Locked(
@@ -670,7 +670,7 @@ index e7ac669..98e4bb1 100644
    // 3. Set the updating attribute to true.
    updating_ = true;
 diff --git third_party/blink/renderer/modules/mediasource/source_buffer.h third_party/blink/renderer/modules/mediasource/source_buffer.h
-index 5338a7f..5062562 100644
+index 5338a7f233704c9cd75e0e10d978948ba4890400..50625621b2f443749f38d06e40c2c34c4e8748d7 100644
 --- third_party/blink/renderer/modules/mediasource/source_buffer.h
 +++ third_party/blink/renderer/modules/mediasource/source_buffer.h
 @@ -42,6 +42,7 @@

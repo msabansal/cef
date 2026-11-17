@@ -217,7 +217,7 @@ class TestHandlerClient : public CefClient, public CefLifeSpanHandler {
   FORWARD_HANDLER(Print)
   FORWARD_HANDLER(Render)
   FORWARD_HANDLER(Request)
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   FORWARD_HANDLER(Input)
 #endif
 #undef FORWARD_HANDLER
@@ -329,7 +329,7 @@ class ReusableBrowserClient : public TestHandlerClient,
     }
   }
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   bool WindowKeyboardEvent(const CefKeyboardInputEvent& event) {
     EXPECT_UI_THREAD();
     auto handler = resetting_ ? nullptr : GetDelegate(true);
@@ -927,8 +927,7 @@ class ReusableBrowserClient : public TestHandlerClient,
   }
 
   std::chrono::steady_clock::time_point timing_start_;
-  const bool trace_timing_ = CefCommandLine::GetGlobalCommandLine()->HasSwitch(
-      "reuse-test-browsers-timing");
+  const bool trace_timing_ = IsBrowserReuseTimingEnabled();
   CefRefPtr<TestHandler> GetDelegate(bool committed_only = false) {
     std::lock_guard<std::mutex> guard(lock_);
     return committed_only && awaiting_commit_ ? nullptr : delegate_;
@@ -1063,7 +1062,7 @@ class ReusableWindowDelegate : public CefWindowDelegate {
     return allowed;
   }
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   bool OnKeyboardEvent(CefRefPtr<CefWindow>,
                        const CefKeyboardInputEvent& event) override {
     return client_->WindowKeyboardEvent(event);
@@ -1146,8 +1145,7 @@ struct ReusableContextEntry {
   std::chrono::steady_clock::time_point last_used;
   size_t uses = 1;
   bool initialized = false;
-  const bool trace_timing = CefCommandLine::GetGlobalCommandLine()->HasSwitch(
-      "reuse-test-browsers-timing");
+  const bool trace_timing = IsBrowserReuseTimingEnabled();
   std::vector<base::OnceCallback<void(TestHandler::ReusableRequestContext)>>
       callbacks;
 };
@@ -1267,12 +1265,12 @@ class TestWindowDelegate : public CefWindowDelegate {
     handler_->OnWindowActivationChanged(browser_id_, active);
   }
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   bool OnKeyboardEvent(CefRefPtr<CefWindow> window,
                        const CefKeyboardInputEvent& event) override {
     return handler_->OnWindowKeyboardEvent(browser_id_, event);
   }
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 
   // DEPRECATED: Use OnKeyboardEvent(); retained for legacy route tests.
   bool OnKeyEvent(CefRefPtr<CefWindow> window,
@@ -1667,6 +1665,20 @@ CefResponse::HeaderMap ToCefHeaderMap(
 }
 
 }  // namespace
+
+cef_return_value_t TestHandler::OnBeforeResourceLoad(
+    CefRefPtr<CefBrowser> browser,
+    CefRefPtr<CefFrame> frame,
+    CefRefPtr<CefRequest> request,
+    CefRefPtr<CefCallback> callback) {
+  EXPECT_IO_THREAD();
+  // Favicon requests do not always have the correct resource type.
+  if (request->GetResourceType() == RT_FAVICON ||
+      IgnoreURL(request->GetURL())) {
+    return RV_CANCEL;
+  }
+  return RV_CONTINUE;
+}
 
 CefRefPtr<CefResourceHandler> TestHandler::GetResourceHandler(
     CefRefPtr<CefBrowser> browser,

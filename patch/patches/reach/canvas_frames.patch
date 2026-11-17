@@ -1,5 +1,5 @@
 diff --git cc/paint/paint_image.h cc/paint/paint_image.h
-index 85ea12c..c0ad1d2 100644
+index 2862a0703945d2bf2ac817d2c428bd96e1aaf3b8..cf06e29fbc4d7cdeae5304cc6e67c89911f06856 100644
 --- cc/paint/paint_image.h
 +++ cc/paint/paint_image.h
 @@ -329,6 +329,10 @@ class CC_PAINT_EXPORT PaintImage {
@@ -14,7 +14,7 @@ index 85ea12c..c0ad1d2 100644
    bool IsPaintWorklet() const {
      return deferred_paint_record_ &&
 diff --git cc/paint/paint_image_builder.cc cc/paint/paint_image_builder.cc
-index 44d2dcb..25bb8b8 100644
+index 44d2dcb8a7683a5b9196d4ebe0ce91b04d073b8a..25bb8b8b35f72d7bf58308a1f5e1ef9e9451eda0 100644
 --- cc/paint/paint_image_builder.cc
 +++ cc/paint/paint_image_builder.cc
 @@ -4,6 +4,15 @@
@@ -69,28 +69,32 @@ index 44d2dcb..25bb8b8 100644
  }
  
 diff --git third_party/blink/renderer/core/paint/embedded_content_painter.cc third_party/blink/renderer/core/paint/embedded_content_painter.cc
-index 55382dc..25e6a2c 100644
+index 49a431f9104cb7420eb43bc7048ed3ec5fa86e6d..ca16c9ef4a74dea76f98fef762f82c8eb83f6260 100644
 --- third_party/blink/renderer/core/paint/embedded_content_painter.cc
 +++ third_party/blink/renderer/core/paint/embedded_content_painter.cc
-@@ -20,9 +20,11 @@
- #include "third_party/blink/renderer/core/paint/paint_layer.h"
- #include "third_party/blink/renderer/core/paint/paint_property_tree_builder.h"
- #include "third_party/blink/renderer/core/paint/replaced_painter.h"
+@@ -13,6 +13,7 @@
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/frame/embedded_content_view.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
 +#include "third_party/blink/renderer/core/frame/local_frame_view.h"
+ #include "third_party/blink/renderer/core/layout/layout_embedded_content.h"
+ #include "third_party/blink/renderer/core/layout/layout_view.h"
+ #include "third_party/blink/renderer/core/paint/box_painter.h"
+@@ -24,6 +25,7 @@
  #include "third_party/blink/renderer/core/paint/scrollable_area_painter.h"
  #include "third_party/blink/renderer/core/view_transition/view_transition.h"
  #include "third_party/blink/renderer/platform/geometry/physical_offset.h"
-+#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h"
  #include "third_party/blink/renderer/platform/graphics/paint/display_item_cache_skipper.h"
  #include "third_party/blink/renderer/platform/graphics/paint/drawing_recorder.h"
- #include "third_party/blink/renderer/platform/graphics/paint/foreign_layer_display_item.h"
-@@ -62,6 +64,32 @@ void EmbeddedContentPainter::PaintReplaced(const PaintInfo& paint_info,
+ #include "third_party/blink/renderer/platform/graphics/paint/effect_paint_property_node.h"
+@@ -66,6 +68,32 @@ void EmbeddedContentPainter::PaintReplaced(const PaintInfo& paint_info,
    if (!embedded_content_view)
      return;
  
 +  // Command mode composes cross-process frames and plugins by identity.
 +  // Local frames paint inline into their local root, as in normal paint.
-+  if (Canvas2DBitmapProvider::IsReachCommandMode() &&
++  if (Canvas2DResourceProvider::IsReachCommandMode() &&
 +      !IsA<LocalFrameView>(embedded_content_view)) {
 +    PhysicalRect rect = layout_embedded_content_.ReplacedContentRect();
 +    rect.Move(paint_offset);
@@ -117,51 +121,52 @@ index 55382dc..25e6a2c 100644
    std::optional<ScopedPaintChunkProperties> removed_svg_filter_paint =
        RemoveSvgFilterPaint(layout_embedded_content_, paint_info);
  
-diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
-index 6aa6d12..d216fff 100644
---- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
-+++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.cc
-@@ -12,6 +12,7 @@
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.cc third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.cc
+index f09b9cbf3a8a52a4ad92669525482fba51f77efc..3d9671985e9d6ae1ec5ff4b5020dc0548bdcc062 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.cc
++++ third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.cc
+@@ -10,6 +10,7 @@
+ #include <vector>
  
- #include "base/check.h"
- #include "base/check_op.h"
+ #include "base/byte_size.h"
 +#include "base/command_line.h"
+ #include "base/containers/span.h"
+ #include "base/feature_list.h"
  #include "base/functional/bind.h"
- #include "base/memory/ptr_util.h"
- #include "base/strings/stringprintf.h"
-@@ -37,6 +38,11 @@
+@@ -67,6 +68,11 @@
  
  namespace blink {
  
-+bool Canvas2DBitmapProvider::IsReachCommandMode() {
++bool Canvas2DResourceProvider::IsReachCommandMode() {
 +  return base::CommandLine::ForCurrentProcess()->HasSwitch(
 +      "reach-drawing-commands");
 +}
 +
- Canvas2DBitmapProvider::Canvas2DBitmapProvider(
-     gfx::Size size,
-     viz::SharedImageFormat format,
-diff --git third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
-index dd887ad..21c8f76 100644
---- third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
-+++ third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h
-@@ -68,6 +68,7 @@ class PLATFORM_EXPORT Canvas2DBitmapProvider final
+ BASE_FEATURE(kAppendCpuUsages, base::FEATURE_ENABLED_BY_DEFAULT);
  
-   ~Canvas2DBitmapProvider() override;
+ // When enabled, unused resources (ready to be recycled) are reclaimed after a
+diff --git third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h
+index 3a7f58781b997add86431df686bd4df6a36ccfe0..b0640131e9f2c7a4caf61f0d0a25807ae810fc5a 100644
+--- third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h
++++ third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h
+@@ -130,6 +130,8 @@ class PLATFORM_EXPORT Canvas2DResourceProvider
+ 
+   ~Canvas2DResourceProvider() override;
  
 +  static bool IsReachCommandMode();
-   bool IsValid() const { return GetSkSurface(); }
-   void SetDelegate(CanvasResourceProviderDelegate* delegate) {
-     delegate_ = delegate;
++
+   bool unused_resources_reclaim_timer_is_running_for_testing() const;
+   bool HasUnusedResourcesForTesting() const;
+   bool IsSingleBuffered() const;
 diff --git third_party/blink/renderer/platform/graphics/image_pattern.cc third_party/blink/renderer/platform/graphics/image_pattern.cc
-index 6f17b81..4556fb4 100644
+index 6f17b816f481b4c5387950374d8b4c1e75230f7d..897d329353ec559bae9a70fbc22d934220556b4a 100644
 --- third_party/blink/renderer/platform/graphics/image_pattern.cc
 +++ third_party/blink/renderer/platform/graphics/image_pattern.cc
 @@ -6,9 +6,11 @@
  
  #include "base/check.h"
  #include "base/memory/ptr_util.h"
-+#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h"
  #include "third_party/blink/renderer/platform/graphics/image.h"
  #include "third_party/blink/renderer/platform/graphics/paint/paint_shader.h"
  #include "third_party/skia/include/core/SkImage.h"
@@ -173,7 +178,7 @@ index 6f17b81..4556fb4 100644
      return PaintShader::MakeColor(SkColors::kTransparent);
    }
  
-+  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++  if (Canvas2DResourceProvider::IsReachCommandMode()) {
 +    if (const auto* record = tile_image_.paint_record()) {
 +      return PaintShader::MakePaintRecord(
 +          *record, gfx::RectToSkRect(tile_image_.paint_record_rect()),
@@ -187,14 +192,14 @@ index 6f17b81..4556fb4 100644
        tile_image_, IsRepeatX() ? SkTileMode::kRepeat : SkTileMode::kDecal,
        IsRepeatY() ? SkTileMode::kRepeat : SkTileMode::kDecal, &local_matrix);
 diff --git third_party/blink/renderer/platform/graphics/static_bitmap_image.cc third_party/blink/renderer/platform/graphics/static_bitmap_image.cc
-index a588009..866e300 100644
+index a588009869ed799c93fddf916682e97bd1789594..4887c61ad79e66ba97cde5983992b298b35b5206 100644
 --- third_party/blink/renderer/platform/graphics/static_bitmap_image.cc
 +++ third_party/blink/renderer/platform/graphics/static_bitmap_image.cc
 @@ -7,9 +7,11 @@
  #include "base/numerics/checked_math.h"
  #include "gpu/command_buffer/client/gles2_interface.h"
  #include "third_party/blink/renderer/platform/graphics/accelerated_static_bitmap_image.h"
-+#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
++#include "third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h"
  #include "third_party/blink/renderer/platform/graphics/graphics_context.h"
  #include "third_party/blink/renderer/platform/graphics/image_observer.h"
  #include "third_party/blink/renderer/platform/graphics/paint/paint_image.h"
@@ -206,7 +211,7 @@ index a588009..866e300 100644
        adjusted_dst_rect.set_size(gfx::TransposeSize(adjusted_dst_rect.size()));
    }
  
-+  if (Canvas2DBitmapProvider::IsReachCommandMode()) {
++  if (Canvas2DResourceProvider::IsReachCommandMode()) {
 +    if (const auto* record = image.paint_record()) {
 +      const auto matrix =
 +          SkMatrix::RectToRect(gfx::RectFToSkRect(adjusted_src_rect),

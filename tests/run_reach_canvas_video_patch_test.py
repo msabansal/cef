@@ -29,17 +29,23 @@ def check_normal_semantics(output, baseline):
     methods = {
         "modules/canvas/canvas2d/canvas_rendering_context_2d.cc": [
             "bool CanvasRenderingContext2D::WritePixels(",
-            "void CanvasRenderingContext2D::RecordingCleared(",
             "std::optional<cc::PaintRecord> CanvasRenderingContext2D::FlushCanvas(",
             "scoped_refptr<StaticBitmapImage> blink::CanvasRenderingContext2D::GetImage(",
             "ImageData* CanvasRenderingContext2D::getImageDataInternal(",
-            "void CanvasRenderingContext2D::CreateProvider(",
+            "CanvasRenderingContext2D::Snapshot(",
+            "bool CanvasRenderingContext2D::InitializeBacking(",
         ],
-        "platform/graphics/canvas_2d_bitmap_provider.cc": [
-            "scoped_refptr<StaticBitmapImage> Canvas2DBitmapProvider::Snapshot(",
-            "void Canvas2DBitmapProvider::ClearAtCreation(",
-            "void Canvas2DBitmapProvider::RasterRecord(",
-            "bool Canvas2DBitmapProvider::WritePixels(",
+        "modules/canvas/canvas2d/base_rendering_context_2d.cc": [
+            "void BaseRenderingContext2D::RecordingCleared(",
+            "BaseRenderingContext2D::PaintRenderingResultsToSnapshot(",
+            "bool BaseRenderingContext2D::WritePixelsToBacking(",
+            "ImageData* BaseRenderingContext2D::getImageDataInternal(",
+            "BaseRenderingContext2D::FlushCanvasInternal(",
+        ],
+        "platform/graphics/canvas_2d_resource_provider.cc": [
+            "scoped_refptr<StaticBitmapImage> Canvas2DResourceProvider::Snapshot(",
+            "void Canvas2DResourceProvider::RasterRecord(",
+            "bool Canvas2DResourceProvider::WritePixels(",
         ],
         "modules/webgl/webgl_rendering_context_base.cc": [
             "void WebGLRenderingContextBase::TexImageStaticBitmapImage(",
@@ -97,8 +103,10 @@ def main():
         else:
             assert paths(text).isdisjoint(files), "New overlapping patch dependency"
     retired = json.loads((root / "patch" / "retired_canvas_files.json").read_text())
+    equivalence_inputs = set(manifest["equivalence_inputs"])
     assert selected_paths.isdisjoint(retired)
-    assert selected_paths.union(retired) == set(files)
+    assert equivalence_inputs.isdisjoint(selected_paths.union(retired))
+    assert selected_paths.union(retired, equivalence_inputs) == set(files)
     cef = output / "cef"
     (cef / "tools").mkdir(parents=True)
     (cef / "patch" / "patches" / "reach").mkdir(parents=True)

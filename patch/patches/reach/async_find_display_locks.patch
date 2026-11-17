@@ -1,33 +1,5 @@
-diff --git third_party/blink/renderer/core/editing/finder/async_find_buffer.cc third_party/blink/renderer/core/editing/finder/async_find_buffer.cc
-index dedfb3c..0ef9d8f 100644
---- third_party/blink/renderer/core/editing/finder/async_find_buffer.cc
-+++ third_party/blink/renderer/core/editing/finder/async_find_buffer.cc
-@@ -6,6 +6,8 @@
- #include "base/auto_reset.h"
- #include "base/metrics/histogram_macros.h"
- #include "base/task/single_thread_task_runner.h"
-+#include "third_party/blink/renderer/core/display_lock/display_lock_document_state.h"
-+#include "third_party/blink/renderer/core/dom/document.h"
- #include "third_party/blink/renderer/core/editing/ephemeral_range.h"
- #include "third_party/blink/renderer/core/editing/finder/find_buffer.h"
- 
-@@ -49,8 +51,12 @@ void AsyncFindBuffer::Run(RangeInFlatTree* search_range,
-     std::move(completeCallback).Run(EphemeralRangeInFlatTree());
-     return;
-   }
--  search_range->StartPosition().GetDocument()->UpdateStyleAndLayout(
--      DocumentUpdateReason::kFindInPage);
-+  Document& document = *search_range->StartPosition().GetDocument();
-+  // Match synchronous find-in-page: a document-wide update alone skips dirty
-+  // activatable subtrees. Each asynchronous slice must reacquire this scope.
-+  auto forced_activatable_locks =
-+      document.GetDisplayLockDocumentState().GetScopedForceActivatableLocks();
-+  document.UpdateStyleAndLayout(DocumentUpdateReason::kFindInPage);
- 
-   EphemeralRangeInFlatTree range =
-       FindBuffer::FindMatchInRange(search_range->ToEphemeralRange(),
 diff --git third_party/blink/renderer/core/editing/finder/find_buffer_test.cc third_party/blink/renderer/core/editing/finder/find_buffer_test.cc
-index dd15bbd..7cbdb9c 100644
+index e56245e862f1c3a8ddb38340fec488b113dcc210..a7fdd230098bcc053e00154d4987eca68f46a4d7 100644
 --- third_party/blink/renderer/core/editing/finder/find_buffer_test.cc
 +++ third_party/blink/renderer/core/editing/finder/find_buffer_test.cc
 @@ -4,15 +4,22 @@
@@ -53,7 +25,7 @@ index dd15bbd..7cbdb9c 100644
  
  namespace blink {
  
-@@ -973,6 +980,59 @@ TEST_F(FindBufferTest, ForwardVisibleTextNode) {
+@@ -974,6 +981,59 @@ TEST_F(FindBufferTest, ForwardVisibleTextNode) {
    EXPECT_EQ(String("a"), To<Text>(text)->data());
  }
  

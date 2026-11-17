@@ -16,7 +16,7 @@
 #include "tests/ceftests/test_util.h"
 #include "tests/gtest/include/gtest/gtest.h"
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
 namespace {
 
 constexpr char kUrl[] = "https://tests/window-capture.html";
@@ -198,8 +198,10 @@ class CaptureTestHandler : public RoutingTestHandler,
     CefWindowInfo info;
     info.SetAsWindowless(kNullWindowHandle);
     info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+    // Unsupported-window capture needs only the browser host. Do not start a
+    // resource load that would race the close in OnCaptureComplete.
     EXPECT_TRUE(CefBrowserHost::CreateBrowser(
-        info, this, kUrl, CefBrowserSettings(), nullptr, nullptr));
+        info, this, CefString(), CefBrowserSettings(), nullptr, nullptr));
   }
 
   const bool alloy_;
@@ -280,4 +282,4 @@ INSTANTIATE_TEST_SUITE_P(,
                          });
 
 }  // namespace
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)

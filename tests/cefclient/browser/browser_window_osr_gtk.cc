@@ -10,18 +10,22 @@
 #include <gdk/gdkx.h>
 #endif
 #include <glib-object.h>
+#include <glib-unix.h>
 #include <gtk/gtk.h>
 
 #include <algorithm>
+#include <cmath>
 
 #include "include/base/cef_logging.h"
 #include "include/base/cef_macros.h"
 #include "include/views/cef_display.h"
 #include "include/wrapper/cef_closure_task.h"
+#include "tests/cefclient/browser/main_context.h"
 #include "tests/cefclient/browser/util_gtk.h"
 #include "tests/shared/browser/geometry_util.h"
 #include "tests/shared/browser/main_message_loop.h"
 #include "tests/shared/browser/osr_gl_linux.h"
+#include "tests/shared/browser/osr_input_util.h"
 #include "tests/shared/browser/osr_keyboard_util_gtk.h"
 
 namespace client {
@@ -453,6 +457,7 @@ void BrowserWindowOsrGtk::OnBeforeClose(CefRefPtr<CefBrowser> browser) {
 
   ScopedGdkThreadsEnter scoped_gdk_threads;
 
+  UpdateTouchpadMode(false);
   UnregisterDragDrop();
 
   // Disconnect all signal handlers that reference |this|.
@@ -792,7 +797,7 @@ void BrowserWindowOsrGtk::Create(ClientWindowHandle parent_handle) {
                    GDK_KEY_PRESS_MASK | GDK_KEY_RELEASE_MASK |
                    GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK |
                    GDK_POINTER_MOTION_MASK | GDK_POINTER_MOTION_HINT_MASK |
-                   GDK_SCROLL_MASK | GDK_FOCUS_CHANGE_MASK);
+                   GDK_SCROLL_MASK | GDK_FOCUS_CHANGE_MASK | GDK_TOUCH_MASK);
   g_signal_connect(G_OBJECT(widget_), "button_press_event",
                    G_CALLBACK(&BrowserWindowOsrGtk::ClickEvent), this);
   g_signal_connect(G_OBJECT(widget_), "button_release_event",
@@ -813,8 +818,15 @@ void BrowserWindowOsrGtk::Create(ClientWindowHandle parent_handle) {
                    G_CALLBACK(&BrowserWindowOsrGtk::FocusEvent), this);
   g_signal_connect(G_OBJECT(widget_), "focus_out_event",
                    G_CALLBACK(&BrowserWindowOsrGtk::FocusEvent), this);
+  g_signal_connect(G_OBJECT(widget_), "grab-broken-event",
+                   G_CALLBACK(&BrowserWindowOsrGtk::PointerGrabBroken), this);
   g_signal_connect(G_OBJECT(widget_), "touch-event",
                    G_CALLBACK(&BrowserWindowOsrGtk::TouchEvent), this);
+#if CEF_API_ADDED(15800)
+  gtk_widget_add_events(widget_, GDK_TOUCHPAD_GESTURE_MASK);
+  g_signal_connect(G_OBJECT(widget_), "event",
+                   G_CALLBACK(&BrowserWindowOsrGtk::GestureEvent), this);
+#endif
 
   RegisterDragDrop();
 
@@ -842,6 +854,24 @@ gint BrowserWindowOsrGtk::ClickEvent(GtkWidget* widget,
                                      GdkEventButton* event,
                                      BrowserWindowOsrGtk* self) {
   REQUIRE_MAIN_THREAD();
+  if (event->button == 1 && event->type == GDK_BUTTON_PRESS) {
+    gtk_widget_grab_focus(widget);
+  }
+  self->UpdateTouchpadMode(self->touchpad_focused_);
+  if (self->touchpad_emulator_.enabled()) {
+    return TRUE;
+  }
+  if (self->pointer_touch_emulator_.enabled()) {
+    if (!gdk_event_get_pointer_emulated(reinterpret_cast<GdkEvent*>(event)) &&
+        event->button == 1 &&
+        (event->type == GDK_BUTTON_PRESS ||
+         event->type == GDK_BUTTON_RELEASE)) {
+      self->SendPointerTouchEvent(
+          event->type == GDK_BUTTON_PRESS ? CEF_TET_PRESSED : CEF_TET_RELEASED,
+          event->x, event->y);
+    }
+    return TRUE;
+  }
 
   if (!self->browser_.get()) {
     return TRUE;
@@ -894,7 +924,15 @@ gint BrowserWindowOsrGtk::ClickEvent(GtkWidget* widget,
       break;
   }
 
+#if CEF_API_ADDED(15800)
+  const CefPoint screen(DeviceToLogical(event->x_root, device_scale_factor),
+                        DeviceToLogical(event->y_root, device_scale_factor));
+  host->SendMouseEvent(MakeOsrMouseInputEvent(
+      mouse_event, screen, mouse_up ? CEF_MOUSE_EVENT_UP : CEF_MOUSE_EVENT_DOWN,
+      button_type, click_count));
+#else
   host->SendMouseClickEvent(mouse_event, button_type, mouse_up, click_count);
+#endif
 
   // Save mouse event that can be a possible trigger for drag.
   if (!self->drag_context_ && button_type == MBT_LEFT) {
@@ -913,12 +951,13 @@ gint BrowserWindowOsrGtk::KeyEvent(GtkWidget* widget,
                                    GdkEventKey* event,
                                    BrowserWindowOsrGtk* self) {
   REQUIRE_MAIN_THREAD();
+  self->UpdateTouchpadMode(self->touchpad_focused_);
 
   if (!self->browser_.get()) {
     return TRUE;
   }
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   CefRefPtr<CefBrowserHost> host = self->browser_->GetHost();
 
   // GTK OSR supports X11 and Wayland. Keep all toolkit objects and
@@ -962,7 +1001,7 @@ gint BrowserWindowOsrGtk::KeyEvent(GtkWidget* widget,
   // Supporting the legacy keyboard API here would require maintaining copies
   // of Chromium's key mapping tables. Use the unified API instead.
   NOTIMPLEMENTED();
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
   return TRUE;
 }
 
@@ -970,6 +1009,10 @@ gint BrowserWindowOsrGtk::KeyEvent(GtkWidget* widget,
 gint BrowserWindowOsrGtk::MoveEvent(GtkWidget* widget,
                                     GdkEventMotion* event,
                                     BrowserWindowOsrGtk* self) {
+  self->UpdateTouchpadMode(self->touchpad_focused_);
+  if (self->touchpad_emulator_.enabled()) {
+    return TRUE;
+  }
   if (!self->browser_.get()) {
     return TRUE;
   }
@@ -978,13 +1021,17 @@ gint BrowserWindowOsrGtk::MoveEvent(GtkWidget* widget,
 
   gint x, y;
   GdkModifierType state;
+  auto* native_event = reinterpret_cast<GdkEvent*>(event);
 
-  if (event->is_hint) {
+  if (event->type == GDK_MOTION_NOTIFY && event->is_hint) {
     gdk_window_get_pointer(event->window, &x, &y, &state);
   } else {
-    x = (gint)event->x;
-    y = (gint)event->y;
-    state = (GdkModifierType)event->state;
+    // Crossing events have a different layout from motion events.
+    gdouble event_x = 0, event_y = 0;
+    gdk_event_get_coords(native_event, &event_x, &event_y);
+    gdk_event_get_state(native_event, &state);
+    x = event_x;
+    y = event_y;
     if (x == 0 && y == 0) {
       // Invalid coordinates of (0,0) appear from time to time in
       // enter-notify-event and leave-notify-event events. Sending them may
@@ -999,6 +1046,14 @@ gint BrowserWindowOsrGtk::MoveEvent(GtkWidget* widget,
     device_scale_factor = self->device_scale_factor_;
   }
 
+  if (self->pointer_touch_emulator_.enabled()) {
+    if (event->type == GDK_MOTION_NOTIFY &&
+        !gdk_event_get_pointer_emulated(native_event)) {
+      self->SendPointerTouchEvent(CEF_TET_MOVED, x, y);
+    }
+    return TRUE;
+  }
+
   CefMouseEvent mouse_event;
   mouse_event.x = x;
   mouse_event.y = y;
@@ -1007,7 +1062,25 @@ gint BrowserWindowOsrGtk::MoveEvent(GtkWidget* widget,
   mouse_event.modifiers = GetCefStateModifiers(state);
 
   bool mouse_leave = (event->type == GDK_LEAVE_NOTIFY);
+#if CEF_API_ADDED(15800)
+  gdouble root_x = 0, root_y = 0;
+  if (event->type == GDK_MOTION_NOTIFY && event->is_hint) {
+    gint origin_x = 0, origin_y = 0;
+    gdk_window_get_origin(event->window, &origin_x, &origin_y);
+    root_x = origin_x + x;
+    root_y = origin_y + y;
+  } else {
+    gdk_event_get_root_coords(native_event, &root_x, &root_y);
+  }
+  const CefPoint screen(DeviceToLogical(root_x, device_scale_factor),
+                        DeviceToLogical(root_y, device_scale_factor));
+  const auto type = mouse_leave                       ? CEF_MOUSE_EVENT_LEAVE
+                    : event->type == GDK_ENTER_NOTIFY ? CEF_MOUSE_EVENT_ENTER
+                                                      : CEF_MOUSE_EVENT_MOVE;
+  host->SendMouseEvent(MakeOsrMouseInputEvent(mouse_event, screen, type));
+#else
   host->SendMouseMoveEvent(mouse_event, mouse_leave);
+#endif
 
   // Save mouse event that can be a possible trigger for drag.
   if (!self->drag_context_ &&
@@ -1027,10 +1100,62 @@ gint BrowserWindowOsrGtk::ScrollEvent(GtkWidget* widget,
                                       GdkEventScroll* event,
                                       BrowserWindowOsrGtk* self) {
   REQUIRE_MAIN_THREAD();
+  self->UpdateTouchpadMode(self->touchpad_focused_);
+  if (self->touchpad_emulator_.enabled()) {
+    return TRUE;
+  }
 
   if (!self->browser_.get()) {
     return TRUE;
   }
+
+  if (self->pointer_touch_emulator_.enabled() &&
+      !(event->state & GDK_CONTROL_MASK)) {
+    if (gdk_event_is_scroll_stop_event(reinterpret_cast<GdkEvent*>(event))) {
+      self->EndPointerTouchScroll();
+      return TRUE;
+    }
+    double dx = 0, dy = 0;
+    switch (event->direction) {
+      case GDK_SCROLL_UP:
+        dy = -1;
+        break;
+      case GDK_SCROLL_DOWN:
+        dy = 1;
+        break;
+      case GDK_SCROLL_LEFT:
+        dx = -1;
+        break;
+      case GDK_SCROLL_RIGHT:
+        dx = 1;
+        break;
+      case GDK_SCROLL_SMOOTH:
+        gdk_event_get_scroll_deltas(reinterpret_cast<GdkEvent*>(event), &dx,
+                                    &dy);
+        break;
+    }
+    const int width = gtk_widget_get_allocated_width(widget);
+    const int height = gtk_widget_get_allocated_height(widget);
+    if (width > 0 && height > 0) {
+      self->SendTouchpadEvents(self->pointer_touch_emulator_.Scroll(
+          event->x / width, event->y / height, -dx * 40 / width,
+          -dy * 40 / height));
+      if (self->pointer_touch_emulator_.scrolling()) {
+        if (self->pointer_touch_scroll_source_) {
+          g_source_remove(self->pointer_touch_scroll_source_);
+        }
+        self->pointer_touch_scroll_source_ = g_timeout_add(
+            kPointerTouchScrollTimeoutMs,
+            &BrowserWindowOsrGtk::PointerTouchScrollTimeout, self);
+        if (!self->pointer_touch_scroll_source_) {
+          self->EndPointerTouchScroll();
+        }
+      }
+    }
+    return TRUE;
+  }
+
+  self->EndPointerTouchScroll();
 
   CefRefPtr<CefBrowserHost> host = self->browser_->GetHost();
 
@@ -1044,6 +1169,51 @@ gint BrowserWindowOsrGtk::ScrollEvent(GtkWidget* widget,
   mouse_event.x = event->x;
   mouse_event.y = event->y;
   self->ApplyPopupOffset(mouse_event.x, mouse_event.y);
+#if CEF_API_ADDED(15800)
+  mouse_event.modifiers = GetCefStateModifiers(event->state);
+  auto input =
+      MakeOsrWheelInputEvent(mouse_event, event->x_root / device_scale_factor,
+                             event->y_root / device_scale_factor);
+  // Apply the integer popup offset while retaining the native subpixel point.
+  input.x = (event->x + mouse_event.x - static_cast<int>(event->x)) /
+            device_scale_factor;
+  input.y = (event->y + mouse_event.y - static_cast<int>(event->y)) /
+            device_scale_factor;
+  switch (event->direction) {
+    case GDK_SCROLL_UP:
+      input.wheel_ticks_y = 1;
+      break;
+    case GDK_SCROLL_DOWN:
+      input.wheel_ticks_y = -1;
+      break;
+    case GDK_SCROLL_LEFT:
+      input.wheel_ticks_x = 1;
+      break;
+    case GDK_SCROLL_RIGHT:
+      input.wheel_ticks_x = -1;
+      break;
+    case GDK_SCROLL_SMOOTH: {
+      gdouble dx = 0, dy = 0;
+      if (!gdk_event_get_scroll_deltas(reinterpret_cast<GdkEvent*>(event), &dx,
+                                       &dy)) {
+        return TRUE;
+      }
+      input.wheel_ticks_x = -dx;
+      input.wheel_ticks_y = -dy;
+      // GTK sends a zero-delta stop event for smooth scrolling sequences.
+      if (gdk_event_is_scroll_stop_event(reinterpret_cast<GdkEvent*>(event))) {
+        input.phase = CEF_WHEEL_PHASE_ENDED;
+      }
+      break;
+    }
+  }
+  input.delta_x = input.wheel_ticks_x * 40.f;
+  input.delta_y = input.wheel_ticks_y * 40.f;
+  input.delta_units = event->direction == GDK_SCROLL_SMOOTH
+                          ? CEF_GESTURE_SCROLL_PRECISE_PIXEL
+                          : CEF_GESTURE_SCROLL_PIXEL;
+  host->SendWheelEvent(input);
+#else
   DeviceToLogical(mouse_event, device_scale_factor);
   mouse_event.modifiers = GetCefStateModifiers(event->state);
   mouse_event.modifiers |= EVENTFLAG_PRECISION_SCROLLING_DELTA;
@@ -1064,13 +1234,231 @@ gint BrowserWindowOsrGtk::ScrollEvent(GtkWidget* widget,
     case GDK_SCROLL_RIGHT:
       deltaX = -scrollbarPixelsPerGtkTick;
       break;
-    case GDK_SCROLL_SMOOTH:
-      NOTIMPLEMENTED();
+    case GDK_SCROLL_SMOOTH: {
+      // Touchpads and high-resolution wheels report fractional deltas in
+      // units of scroll ticks, with positive values meaning down/right.
+      gdouble dx = 0, dy = 0;
+      if (!gdk_event_get_scroll_deltas(reinterpret_cast<GdkEvent*>(event), &dx,
+                                       &dy)) {
+        return TRUE;
+      }
+      deltaX = static_cast<int>(std::lround(-dx * scrollbarPixelsPerGtkTick));
+      deltaY = static_cast<int>(std::lround(-dy * scrollbarPixelsPerGtkTick));
+      if (deltaX == 0 && deltaY == 0) {
+        return TRUE;
+      }
       break;
+    }
   }
 
   host->SendMouseWheelEvent(mouse_event, deltaX, deltaY);
+#endif  // CEF_API_ADDED(15800)
   return TRUE;
+}
+
+#if CEF_API_ADDED(15800)
+// GTK reports pinch scale relative to the beginning of the sequence; Chromium
+// expects the multiplicative change for each update.
+gboolean BrowserWindowOsrGtk::GestureEvent(GtkWidget*,
+                                           GdkEvent* event,
+                                           BrowserWindowOsrGtk* self) {
+  REQUIRE_MAIN_THREAD();
+  self->UpdateTouchpadMode(self->touchpad_focused_);
+  if (self->touchpad_emulator_.enabled()) {
+    return TRUE;
+  }
+  if (event->type != GDK_TOUCHPAD_PINCH || !self->browser_) {
+    return FALSE;
+  }
+  self->EndPointerTouchScroll();
+  self->SendTouchpadEvents(self->pointer_touch_emulator_.Cancel());
+  const auto& pinch = event->touchpad_pinch;
+  CefGestureInputEvent input;
+  switch (pinch.phase) {
+    case GDK_TOUCHPAD_GESTURE_PHASE_BEGIN:
+      self->pinch_scale_ = 1;
+      input.type = CEF_GESTURE_EVENT_PINCH_BEGIN;
+      break;
+    case GDK_TOUCHPAD_GESTURE_PHASE_UPDATE:
+      if (!std::isfinite(pinch.scale) || pinch.scale <= 0) {
+        return TRUE;
+      }
+      input.type = CEF_GESTURE_EVENT_PINCH_UPDATE;
+      input.scale = pinch.scale / self->pinch_scale_;
+      self->pinch_scale_ = pinch.scale;
+      break;
+    case GDK_TOUCHPAD_GESTURE_PHASE_END:
+    case GDK_TOUCHPAD_GESTURE_PHASE_CANCEL:
+      input.type = CEF_GESTURE_EVENT_PINCH_END;
+      self->pinch_scale_ = 1;
+      break;
+    default:
+      return FALSE;
+  }
+  const float scale = self->GetDeviceScaleFactor();
+  int x = pinch.x, y = pinch.y;
+  self->ApplyPopupOffset(x, y);
+  input.x = DeviceToLogical(x, scale);
+  input.y = DeviceToLogical(y, scale);
+  input.screen_x = DeviceToLogical(pinch.x_root, scale);
+  input.screen_y = DeviceToLogical(pinch.y_root, scale);
+  input.modifiers = GetCefStateModifiers(pinch.state);
+  input.source_device = CEF_GESTURE_DEVICE_TOUCHPAD;
+  input.primary_pointer_type = CEF_POINTER_TYPE_TOUCH;
+  input.needs_wheel_event = 1;
+  self->browser_->GetHost()->SendGestureEvent(input);
+  return TRUE;
+}
+#endif
+
+void BrowserWindowOsrGtk::OnBrowserCreated(CefRefPtr<CefBrowser> browser) {
+  BrowserWindow::OnBrowserCreated(browser);
+  ScopedGdkThreadsEnter scoped_gdk_threads;
+  UpdateTouchpadMode(gtk_widget_has_focus(widget_));
+}
+
+void BrowserWindowOsrGtk::UpdateTouchpadMode(bool focused) {
+  touchpad_focused_ = focused;
+  const bool requested =
+      focused && browser_ && MainContext::Get()->TouchEventsEnabled();
+  if (requested && !touchpad_ && !touchpad_attempted_) {
+    touchpad_attempted_ = true;
+    auto reader = std::make_unique<OsrTouchpadLinux>(
+        [this](const std::optional<OsrTouchpadFrame>& frame) {
+          SendTouchpadEvents(touchpad_emulator_.ProcessFrame(frame));
+        });
+    if (reader->Open()) {
+      touchpad_source_ = g_unix_fd_add(
+          reader->fd(),
+          static_cast<GIOCondition>(G_IO_IN | G_IO_HUP | G_IO_ERR),
+          &BrowserWindowOsrGtk::TouchpadReady, this);
+      if (touchpad_source_) {
+        touchpad_ = std::move(reader);
+      }
+    }
+  }
+  auto* keymap = gdk_keymap_get_for_display(gtk_widget_get_display(widget_));
+  const bool caps_lock = gdk_keymap_get_caps_lock_state(keymap);
+  if (requested && caps_lock && !touchpad_ && !touchpad_warning_) {
+    touchpad_warning_ = true;
+    LOG(WARNING)
+        << "No readable full-multitouch touchpad in /dev/input; using "
+           "single-touch pointer emulation. Check input-device permissions "
+           "for raw multitouch support.";
+  }
+  const bool enabled = requested && caps_lock && touchpad_;
+  const bool fallback = requested && caps_lock && !touchpad_;
+  float scale;
+  {
+    base::AutoLock lock(lock_);
+    scale = device_scale_factor_;
+  }
+  if (!fallback) {
+    EndPointerTouchScroll();
+    SendTouchpadEvents(pointer_touch_emulator_.SetEnabled(false));
+  }
+  if (!enabled) {
+    SendTouchpadEvents(touchpad_emulator_.SetEnabled(false));
+  }
+  if ((enabled && !touchpad_emulator_.enabled()) ||
+      (fallback && !pointer_touch_emulator_.enabled())) {
+    for (auto& touch : touch_state_.Cancel()) {
+      DeviceToLogical(touch, scale);
+      browser_->GetHost()->SendTouchEvent(touch);
+    }
+  }
+  SendTouchpadEvents(touchpad_emulator_.SetEnabled(enabled));
+  SendTouchpadEvents(pointer_touch_emulator_.SetEnabled(fallback));
+  if (!requested) {
+    if (touchpad_source_) {
+      g_source_remove(touchpad_source_);
+      touchpad_source_ = 0;
+    }
+    touchpad_.reset();
+    touchpad_emulator_.ProcessFrame(OsrTouchpadFrame());
+    touchpad_attempted_ = false;
+    touchpad_warning_ = false;
+  }
+}
+
+void BrowserWindowOsrGtk::SendPointerTouchEvent(cef_touch_event_type_t type,
+                                                double x,
+                                                double y) {
+  const int width = gtk_widget_get_allocated_width(widget_);
+  const int height = gtk_widget_get_allocated_height(widget_);
+  if (width > 0 && height > 0) {
+    if (type == CEF_TET_PRESSED) {
+      EndPointerTouchScroll();
+    }
+    SendTouchpadEvents(
+        pointer_touch_emulator_.Pointer(type, x / width, y / height));
+  }
+}
+
+void BrowserWindowOsrGtk::EndPointerTouchScroll() {
+  if (pointer_touch_scroll_source_) {
+    g_source_remove(pointer_touch_scroll_source_);
+    pointer_touch_scroll_source_ = 0;
+  }
+  SendTouchpadEvents(pointer_touch_emulator_.EndScroll());
+}
+
+// static
+gboolean BrowserWindowOsrGtk::PointerTouchScrollTimeout(gpointer data) {
+  auto* self = static_cast<BrowserWindowOsrGtk*>(data);
+  ScopedGdkThreadsEnter scoped_gdk_threads;
+  self->pointer_touch_scroll_source_ = 0;
+  self->SendTouchpadEvents(self->pointer_touch_emulator_.EndScroll());
+  return G_SOURCE_REMOVE;
+}
+
+void BrowserWindowOsrGtk::SendTouchpadEvents(
+    const std::vector<CefTouchEvent>& events) {
+  if (!browser_ || events.empty()) {
+    return;
+  }
+  float scale;
+  {
+    base::AutoLock lock(lock_);
+    scale = device_scale_factor_;
+  }
+  auto* keymap = gdk_keymap_get_for_display(gtk_widget_get_display(widget_));
+  for (auto event : events) {
+    MapTouchpadToView(event, gtk_widget_get_allocated_width(widget_),
+                      gtk_widget_get_allocated_height(widget_), scale);
+    event.modifiers =
+        GetCefStateModifiers(gdk_keymap_get_modifier_state(keymap));
+    if (touch_state_.Update(
+            event.id, event,
+            IsOverPopupWidget(static_cast<int>(std::floor(event.x)),
+                              static_cast<int>(std::floor(event.y))),
+            GetPopupXOffset(), GetPopupYOffset())) {
+      DeviceToLogical(event, scale);
+      browser_->GetHost()->SendTouchEvent(event);
+    }
+  }
+}
+
+// static
+gboolean BrowserWindowOsrGtk::TouchpadReady(gint fd,
+                                            GIOCondition condition,
+                                            gpointer data) {
+  auto* self = static_cast<BrowserWindowOsrGtk*>(data);
+  ScopedGdkThreadsEnter scoped_gdk_threads;
+  self->UpdateTouchpadMode(self->touchpad_focused_);
+  if (!self->touchpad_) {
+    return G_SOURCE_REMOVE;
+  }
+  if ((condition & (G_IO_HUP | G_IO_ERR)) || !self->touchpad_->Read()) {
+    self->SendTouchpadEvents(
+        self->touchpad_emulator_.ProcessFrame(std::nullopt));
+    self->SendTouchpadEvents(self->touchpad_emulator_.SetEnabled(false));
+    self->touchpad_source_ = 0;
+    self->touchpad_.reset();
+    self->UpdateTouchpadMode(self->touchpad_focused_);
+    return G_SOURCE_REMOVE;
+  }
+  return G_SOURCE_CONTINUE;
 }
 
 // static
@@ -1078,14 +1466,35 @@ gint BrowserWindowOsrGtk::FocusEvent(GtkWidget* widget,
                                      GdkEventFocus* event,
                                      BrowserWindowOsrGtk* self) {
   // May be called on the main thread and the UI thread.
+  self->UpdateTouchpadMode(event->in == TRUE);
   if (!event->in) {
     base::AutoLock lock(self->lock_);
     self->pressed_keycodes_.clear();
   }
   if (self->browser_.get()) {
+    if (!event->in) {
+      float scale;
+      {
+        base::AutoLock lock(self->lock_);
+        scale = self->device_scale_factor_;
+      }
+      for (auto& touch : self->touch_state_.Cancel()) {
+        DeviceToLogical(touch, scale);
+        self->browser_->GetHost()->SendTouchEvent(touch);
+      }
+    }
     self->browser_->GetHost()->SetFocus(event->in == TRUE);
   }
   return TRUE;
+}
+
+// static
+gboolean BrowserWindowOsrGtk::PointerGrabBroken(GtkWidget*,
+                                                GdkEventGrabBroken*,
+                                                BrowserWindowOsrGtk* self) {
+  self->EndPointerTouchScroll();
+  self->SendTouchpadEvents(self->pointer_touch_emulator_.Cancel());
+  return FALSE;
 }
 
 // static
@@ -1093,6 +1502,10 @@ gboolean BrowserWindowOsrGtk::TouchEvent(GtkWidget* widget,
                                          GdkEventTouch* event,
                                          BrowserWindowOsrGtk* self) {
   REQUIRE_MAIN_THREAD();
+  if (self->touchpad_emulator_.enabled() ||
+      self->pointer_touch_emulator_.enabled()) {
+    return TRUE;
+  }
 
   if (!self->browser_.get()) {
     return TRUE;
@@ -1117,6 +1530,9 @@ gboolean BrowserWindowOsrGtk::TouchEvent(GtkWidget* widget,
     case GDK_TOUCH_END:
       touch_event.type = CEF_TET_RELEASED;
       break;
+    case GDK_TOUCH_CANCEL:
+      touch_event.type = CEF_TET_CANCELLED;
+      break;
     default:
       return TRUE;
   }
@@ -1127,8 +1543,15 @@ gboolean BrowserWindowOsrGtk::TouchEvent(GtkWidget* widget,
   touch_event.radius_y = 0;
   touch_event.rotation_angle = 0;
   touch_event.pressure = 0;
-  DeviceToLogical(touch_event, device_scale_factor);
   touch_event.modifiers = GetCefStateModifiers(event->state);
+  if (!self->touch_state_.Update(
+          reinterpret_cast<uintptr_t>(event->sequence), touch_event,
+          self->IsOverPopupWidget(static_cast<int>(std::floor(event->x)),
+                                  static_cast<int>(std::floor(event->y))),
+          self->GetPopupXOffset(), self->GetPopupYOffset())) {
+    return TRUE;
+  }
+  DeviceToLogical(touch_event, device_scale_factor);
 
   host->SendTouchEvent(touch_event);
   return TRUE;
@@ -1382,8 +1805,7 @@ gboolean BrowserWindowOsrGtk::DragMotion(GtkWidget* widget,
     device_scale_factor = self->device_scale_factor_;
   }
 
-  // MoveEvent is never called during drag & drop, so must call
-  // SendMouseMoveEvent here.
+  // MoveEvent is never called during drag & drop, so send a mouse move here.
   CefMouseEvent mouse_event;
   mouse_event.x = x;
   mouse_event.y = y;
@@ -1392,7 +1814,17 @@ gboolean BrowserWindowOsrGtk::DragMotion(GtkWidget* widget,
   DeviceToLogical(mouse_event, device_scale_factor);
   if (self->browser_) {
     bool mouse_leave = self->drag_leave_;
+#if CEF_API_ADDED(15800)
+    gint origin_x = 0, origin_y = 0;
+    gdk_window_get_origin(gtk_widget_get_window(widget), &origin_x, &origin_y);
+    const CefPoint screen(DeviceToLogical(origin_x + x, device_scale_factor),
+                          DeviceToLogical(origin_y + y, device_scale_factor));
+    self->browser_->GetHost()->SendMouseEvent(MakeOsrMouseInputEvent(
+        mouse_event, screen,
+        mouse_leave ? CEF_MOUSE_EVENT_LEAVE : CEF_MOUSE_EVENT_MOVE));
+#else
     self->browser_->GetHost()->SendMouseMoveEvent(mouse_event, mouse_leave);
+#endif
   }
 
   // Mouse event.

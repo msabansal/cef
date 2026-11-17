@@ -1,7 +1,8 @@
 diff --git third_party/blink/renderer/core/display_lock/display_lock_context.cc third_party/blink/renderer/core/display_lock/display_lock_context.cc
+index 36fc7115e3bdb0f42b28b551009b7db96f28d3ef..8cd5b296f9df306ad1122d1c768f71a5090eb2a3 100644
 --- third_party/blink/renderer/core/display_lock/display_lock_context.cc
 +++ third_party/blink/renderer/core/display_lock/display_lock_context.cc
-@@ -686,7 +686,14 @@
+@@ -698,7 +698,14 @@ bool DisplayLockContext::MarkForLayoutIfNeeded() {
      // Ensure any layout-type specific caches are dirty.
      layout_object->SetGridPlacementDirty(true);
  
@@ -17,11 +18,17 @@ diff --git third_party/blink/renderer/core/display_lock/display_lock_context.cc 
        // We've previously blocked a child traversal when doing self-layout for
        // the locked element, so we're marking it with child-needs-layout so that
        // it will traverse to the locked element and do the child traversal
-@@ -705,6 +712,11 @@
+@@ -717,12 +724,11 @@ bool DisplayLockContext::MarkForLayoutIfNeeded() {
        // different time / opportunity to restore the offset.
        layout_object->SetChildNeedsLayout();
        child_layout_was_blocked_ = false;
-+      // Backport of upstream 491571b360 (crbug.com/40063752):
+-      if (RuntimeEnabledFeatures::MarkAncestorsOnDisplayLockUnlockEnabled()) {
+-        // |SetChildNeedsLayout()| skips the ancestors when this object was
+-        // already child-dirty, but dirty-bit propagation from the locked
+-        // subtree stopped here, so they are clean.
+-        layout_object->MarkContainerChainForLayout();
+-      }
++      // Retain Reach's unlock fix independently of the upstream experiment.
 +      // |SetChildNeedsLayout()| skips the ancestors when this object was
 +      // already child-dirty, but dirty-bit propagation from the locked
 +      // subtree stopped here, so they are clean.

@@ -43,7 +43,7 @@ enum class Operation {
 enum class Editor { Input, Textarea, ContentEditable };
 enum class KeyboardApi {
   Legacy,
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   Portable,
 #endif
 };
@@ -200,7 +200,7 @@ bool CompositionTextColorEnabled() {
 // installed input method, particular keyboard layout, or toolkit dependency.
 class ImeInputTestHandler : public RoutingTestHandler,
                             public CefRenderHandler,
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
                             public CefInputHandler,
 #endif
                             public CefKeyboardHandler,
@@ -230,7 +230,7 @@ class ImeInputTestHandler : public RoutingTestHandler,
   }
 
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   CefRefPtr<CefInputHandler> GetInputHandler() override { return this; }
 #endif
   CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override { return this; }
@@ -253,7 +253,7 @@ class ImeInputTestHandler : public RoutingTestHandler,
     }
   }
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   bool OnKeyboardEvent(CefRefPtr<CefBrowser> browser,
                        const CefKeyboardInputEvent& event,
                        const CefInputEventContext&) override {
@@ -1540,10 +1540,10 @@ class ImeInputTestHandler : public RoutingTestHandler,
     // unhandled key-up acknowledgement observes processing even when the IME
     // command intentionally emits no DOM event. A key-up inserts no text.
     waiting_for_ack_ = true;
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
     if (keyboard_api_ == KeyboardApi::Portable) {
       CefKeyboardInputEvent event;
-      event.type = CEF_KEYEVENT_KEYUP;
+      event.type = CEF_KEY_EVENT_KEYUP;
       event.dom_code = CEF_DOM_CODE_US_A;
       event.dom_key = CEF_DOM_KEY_UNICODE_FLAG | 'a';
       event.windows_key_code = 'A';
@@ -1756,7 +1756,7 @@ class ImeInputTestHandler : public RoutingTestHandler,
   }
 
   void SendTypedWord(CefRefPtr<CefBrowser> browser) {
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
     if (keyboard_api_ == KeyboardApi::Portable) {
       constexpr uint32_t codes[] = {CEF_DOM_CODE_US_D, CEF_DOM_CODE_US_O,
                                     CEF_DOM_CODE_US_N, CEF_DOM_CODE_US_E};
@@ -1766,11 +1766,11 @@ class ImeInputTestHandler : public RoutingTestHandler,
         event.dom_code = codes[i];
         event.dom_key = CEF_DOM_KEY_UNICODE_FLAG | word[i];
         event.text[0] = event.unmodified_text[0] = word[i];
-        for (const auto type :
-             {CEF_KEYEVENT_RAWKEYDOWN, CEF_KEYEVENT_CHAR, CEF_KEYEVENT_KEYUP}) {
+        for (const auto type : {CEF_KEY_EVENT_RAWKEYDOWN, CEF_KEY_EVENT_CHAR,
+                                CEF_KEY_EVENT_KEYUP}) {
           event.type = type;
           event.windows_key_code =
-              type == CEF_KEYEVENT_CHAR ? word[i] : word[i] - u'a' + 'A';
+              type == CEF_KEY_EVENT_CHAR ? word[i] : word[i] - u'a' + 'A';
           browser->GetHost()->SendKeyboardEvent(event);
         }
       }
@@ -2049,7 +2049,7 @@ bool RegisterImeTests(const char* name, Scenario scenario, int line) {
       }
       for (const auto keyboard_api : {
                KeyboardApi::Legacy,
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
                KeyboardApi::Portable,
 #endif
            }) {

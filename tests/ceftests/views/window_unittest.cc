@@ -629,8 +629,6 @@ bool OnAccelerator(CefRefPtr<CefWindow> window, int command_id) {
   EXPECT_EQ(kCloseWindowId, command_id);
   got_accelerator = true;
 
-  window->Close();
-
   return true;
 }
 
@@ -652,6 +650,18 @@ void WindowAcceleratorImpl(CefRefPtr<CefWaitableEvent> event) {
   config->on_window_created = base::BindOnce(RunWindowAccelerator);
   config->on_window_destroyed = base::BindOnce(VerifyWindowAccelerator);
   config->on_accelerator = base::BindRepeating(OnAccelerator);
+  config->on_key_event = base::BindRepeating(
+      [](CefRefPtr<CefWindow> window, const CefKeyEvent& input) {
+        if (input.type == KEYEVENT_KEYUP &&
+            input.windows_key_code == VK_MENU) {
+          // Alt is released last. Keep the window alive until the complete
+          // synthetic sequence has been dispatched so that pending releases
+          // cannot reach the next test's window on macOS.
+          EXPECT_TRUE(got_accelerator);
+          CefPostTask(TID_UI, base::BindOnce(&CefWindow::Close, window));
+        }
+        return false;
+      });
   config->on_focus = base::BindRepeating([](CefRefPtr<CefView> view) {
     EXPECT_TRUE(view->HasFocus());
     // Dispatch after the focus notification finishes, without guessing timing.
@@ -662,7 +672,7 @@ void WindowAcceleratorImpl(CefRefPtr<CefWaitableEvent> event) {
   TestWindowDelegate::RunTest(event, std::move(config));
 }
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
 
 struct WindowKeyboardState {
   explicit WindowKeyboardState(bool handle) : handle_unified(handle) {}
@@ -700,14 +710,17 @@ void WindowKeyboardInputImpl(CefRefPtr<CefWaitableEvent> event,
   config->on_keyboard_event = base::BindRepeating(
       [](std::shared_ptr<WindowKeyboardState> state,
          CefRefPtr<CefWindow> window, const CefKeyboardInputEvent& input) {
+        if (input.windows_key_code != 'A') {
+          return false;
+        }
         EXPECT_EQ(sizeof(cef_keyboard_input_event_t), input.size);
         EXPECT_GT(input.timestamp, 0);
         state->latest = input;
         ++state->unified_count;
-        const bool keydown = input.type == CEF_KEYEVENT_RAWKEYDOWN ||
-                             input.type == CEF_KEYEVENT_KEYDOWN;
-        if (keydown || input.type == CEF_KEYEVENT_CHAR ||
-            input.type == CEF_KEYEVENT_KEYUP) {
+        const bool keydown = input.type == CEF_KEY_EVENT_RAWKEYDOWN ||
+                             input.type == CEF_KEY_EVENT_KEYDOWN;
+        if (keydown || input.type == CEF_KEY_EVENT_CHAR ||
+            input.type == CEF_KEY_EVENT_KEYUP) {
           EXPECT_EQ(static_cast<uint32_t>(CEF_DOM_CODE_US_A), input.dom_code);
           EXPECT_EQ(CEF_DOM_KEY_UNICODE_FLAG | uint32_t{'a'}, input.dom_key);
           EXPECT_EQ('A', input.windows_key_code);
@@ -715,7 +728,7 @@ void WindowKeyboardInputImpl(CefRefPtr<CefWaitableEvent> event,
           EXPECT_EQ(u'a', input.unmodified_text[0]);
           if (keydown) {
             ++state->keydown_count;
-          } else if (input.type == CEF_KEYEVENT_CHAR) {
+          } else if (input.type == CEF_KEY_EVENT_CHAR) {
             ++state->character_count;
           } else {
             ++state->keyup_count;
@@ -728,6 +741,9 @@ void WindowKeyboardInputImpl(CefRefPtr<CefWaitableEvent> event,
   config->on_key_event = base::BindRepeating(
       [](std::shared_ptr<WindowKeyboardState> state,
          CefRefPtr<CefWindow> window, const CefKeyEvent& input) {
+        if (input.windows_key_code != 'A') {
+          return false;
+        }
         EXPECT_FALSE(state->handle_unified);
         ++state->legacy_count;
         EXPECT_EQ(state->unified_count, state->legacy_count);
@@ -764,7 +780,7 @@ void WindowKeyboardLegacyFallthroughImpl(CefRefPtr<CefWaitableEvent> event) {
   WindowKeyboardInputImpl(event, false);
 }
 
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 
 }  // namespace
 
@@ -791,10 +807,10 @@ WINDOW_TEST_ASYNC(WindowIcon)
 WINDOW_TEST_ASYNC(WindowIconFrameless)
 WINDOW_TEST_ASYNC(WindowAccelerator)
 WINDOW_TEST_ASYNC(WindowFocus)
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
 WINDOW_TEST_ASYNC(WindowKeyboardEvent)
 WINDOW_TEST_ASYNC(WindowKeyboardLegacyFallthrough)
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 
 namespace {
 

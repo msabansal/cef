@@ -4,17 +4,28 @@
 
 #include "cef/libcef/browser/native/browser_platform_delegate_native_aura.h"
 
+#include "base/logging.h"
 #include "base/notimplemented.h"
+#include "cef/libcef/browser/browser_event_util.h"
 #include "cef/libcef/browser/browser_host_base.h"
 #include "cef/libcef/browser/key_event_util.h"
 #include "cef/libcef/browser/native/menu_runner_views_aura.h"
 #include "cef/libcef/browser/views/view_util.h"
 #include "cef/libcef/common/api_version_util.h"
+#include "components/input/render_widget_host_input_event_router.h"
+#include "content/browser/renderer_host/input/mouse_wheel_phase_handler.h"
+#include "content/browser/renderer_host/render_widget_host_impl.h"
 #include "content/browser/renderer_host/render_widget_host_view_aura.h"
 #include "content/public/browser/render_view_host.h"
 #include "content/public/browser/render_widget_host.h"
+#include "third_party/blink/public/common/input/web_touch_event.h"
+#include "ui/aura/event_injector.h"
+#include "ui/aura/window.h"
+#include "ui/aura/window_tree_host.h"
 #include "ui/events/blink/blink_event_util.h"
 #include "ui/events/blink/web_input_event.h"
+#include "ui/events/event.h"
+#include "ui/events/event_sink.h"
 #include "ui/gfx/geometry/vector2d.h"
 #include "ui/views/widget/widget.h"
 
@@ -97,6 +108,38 @@ void CefBrowserPlatformDelegateNativeAura::SendMouseMoveEvent(
   view->OnMouseEvent(&ui_event);
 }
 
+void CefBrowserPlatformDelegateNativeAura::SendWheelEvent(
+    const CefWheelInputEvent& event) {
+  auto* view = GetHostView();
+  if (!view || view->destroy_pending()) {
+    return;
+  }
+  blink::WebMouseWheelEvent web_event;
+  if (!GetWebWheelInputEvent(event, web_event)) {
+    LOG(WARNING) << "SendWheelEvent: Invalid input event";
+    return;
+  }
+  auto* host = content::RenderWidgetHostImpl::From(view->GetRenderWidgetHost());
+  auto* router =
+      host->delegate() ? host->delegate()->GetInputEventRouter() : nullptr;
+  auto* phases = view->GetMouseWheelPhaseHandler();
+  if (web_event.delta_units != ui::ScrollGranularity::kScrollByPrecisePixel) {
+    phases->SendWheelEndForTouchpadScrollingIfNeeded(router != nullptr);
+  }
+  phases->AddPhaseIfNeededAndScheduleEndEvent(
+      web_event, router != nullptr,
+      /*is_fling_capable=*/web_event.delta_units ==
+          ui::ScrollGranularity::kScrollByPrecisePixel);
+  if (web_event.phase == blink::WebMouseWheelEvent::kPhaseEnded) {
+    return;
+  }
+  if (router) {
+    router->RouteMouseWheelEvent(view, &web_event, ui::LatencyInfo());
+  } else {
+    host->ForwardWheelEvent(web_event);
+  }
+}
+
 void CefBrowserPlatformDelegateNativeAura::SendMouseWheelEvent(
     const CefMouseEvent& event,
     int deltaX,
@@ -110,9 +153,57 @@ void CefBrowserPlatformDelegateNativeAura::SendMouseWheelEvent(
   view->OnMouseEvent(&ui_event);
 }
 
-void CefBrowserPlatformDelegateNativeAura::SendTouchEvent(
-    const CefTouchEvent& event) {
-  NOTIMPLEMENTED();
+void CefBrowserPlatformDelegateNativeAura::SendWebTouchEvent(
+    const blink::WebTouchEvent& event) {
+  auto* view = GetHostView();
+  if (!view || view->destroy_pending()) {
+    return;
+  }
+  auto* window = view->GetNativeView();
+  auto* host = window->GetHost();
+  if (!host) {
+    return;
+  }
+  const float scale = view->host()->GetDeviceScaleFactor();
+  auto weak_this = weak_ptr_factory_.GetWeakPtr();
+  for (unsigned i = 0; i < event.touches_length; ++i) {
+    const auto& point = event.touches[i];
+    ui::EventType type;
+    switch (point.state) {
+      case blink::WebTouchPoint::State::kStatePressed:
+        type = ui::EventType::kTouchPressed;
+        break;
+      case blink::WebTouchPoint::State::kStateMoved:
+        type = ui::EventType::kTouchMoved;
+        break;
+      case blink::WebTouchPoint::State::kStateReleased:
+        type = ui::EventType::kTouchReleased;
+        break;
+      case blink::WebTouchPoint::State::kStateCancelled:
+        type = ui::EventType::kTouchCancelled;
+        break;
+      default:
+        continue;
+    }
+    // Like SyntheticGestureTargetAura, enter through the Aura dispatcher so
+    // its gesture recognizer sees the complete touch sequence and renderer
+    // acknowledgments. The dispatcher expects physical-pixel touch radii.
+    ui::TouchEvent touch(
+        type, gfx::Point(), event.TimeStamp(),
+        ui::PointerDetails(
+            ui::WebPointerTypeToEventPointerType(point.pointer_type), point.id,
+            point.radius_x * scale, point.radius_y * scale, point.force,
+            point.rotation_angle),
+        ui::WebEventModifiersToEventFlags(event.GetModifiers()));
+    touch.set_location_f(point.PositionInWidget());
+    touch.set_root_location_f(point.PositionInWidget());
+    touch.ConvertLocationToTarget(window, host->window());
+    aura::EventInjector injector;
+    const auto details = injector.Inject(host, &touch);
+    if (details.dispatcher_destroyed || !weak_this) {
+      return;
+    }
+  }
 }
 
 std::unique_ptr<CefMenuRunner>
@@ -192,14 +283,20 @@ ui::MouseEvent CefBrowserPlatformDelegateNativeAura::TranslateUiClickEvent(
 
   int changed_button_flags = 0;
   switch (type) {
-    case MBT_LEFT:
+    case CEF_MOUSE_BUTTON_LEFT:
       changed_button_flags |= ui::EF_LEFT_MOUSE_BUTTON;
       break;
-    case MBT_MIDDLE:
+    case CEF_MOUSE_BUTTON_MIDDLE:
       changed_button_flags |= ui::EF_MIDDLE_MOUSE_BUTTON;
       break;
-    case MBT_RIGHT:
+    case CEF_MOUSE_BUTTON_RIGHT:
       changed_button_flags |= ui::EF_RIGHT_MOUSE_BUTTON;
+      break;
+    case CEF_MOUSE_BUTTON_BACK:
+      changed_button_flags |= ui::EF_BACK_MOUSE_BUTTON;
+      break;
+    case CEF_MOUSE_BUTTON_FORWARD:
+      changed_button_flags |= ui::EF_FORWARD_MOUSE_BUTTON;
       break;
     default:
       DCHECK(false);
@@ -269,19 +366,30 @@ base::TimeTicks CefBrowserPlatformDelegateNativeAura::GetEventTimeStamp() {
 // static
 int CefBrowserPlatformDelegateNativeAura::TranslateUiEventModifiers(
     uint32_t cef_modifiers) {
-  return GetLegacyUiEventModifiers(cef_modifiers);
+  int result = GetLegacyUiEventModifiers(cef_modifiers);
+  if (cef_modifiers & CEF_EVENTFLAG_BACK_MOUSE_BUTTON) {
+    result |= ui::EF_BACK_MOUSE_BUTTON;
+  }
+  if (cef_modifiers & CEF_EVENTFLAG_FORWARD_MOUSE_BUTTON) {
+    result |= ui::EF_FORWARD_MOUSE_BUTTON;
+  }
+  return result;
 }
 
 // static
 int CefBrowserPlatformDelegateNativeAura::TranslateUiChangedButtonFlags(
     uint32_t cef_modifiers) {
   int result = 0;
-  if (cef_modifiers & EVENTFLAG_LEFT_MOUSE_BUTTON) {
+  if (cef_modifiers & CEF_EVENTFLAG_LEFT_MOUSE_BUTTON) {
     result |= ui::EF_LEFT_MOUSE_BUTTON;
-  } else if (cef_modifiers & EVENTFLAG_MIDDLE_MOUSE_BUTTON) {
+  } else if (cef_modifiers & CEF_EVENTFLAG_MIDDLE_MOUSE_BUTTON) {
     result |= ui::EF_MIDDLE_MOUSE_BUTTON;
-  } else if (cef_modifiers & EVENTFLAG_RIGHT_MOUSE_BUTTON) {
+  } else if (cef_modifiers & CEF_EVENTFLAG_RIGHT_MOUSE_BUTTON) {
     result |= ui::EF_RIGHT_MOUSE_BUTTON;
+  } else if (cef_modifiers & CEF_EVENTFLAG_BACK_MOUSE_BUTTON) {
+    result |= ui::EF_BACK_MOUSE_BUTTON;
+  } else if (cef_modifiers & CEF_EVENTFLAG_FORWARD_MOUSE_BUTTON) {
+    result |= ui::EF_FORWARD_MOUSE_BUTTON;
   }
   return result;
 }

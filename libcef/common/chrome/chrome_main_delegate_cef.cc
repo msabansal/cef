@@ -35,6 +35,7 @@
 #include "components/signin/public/base/signin_switches.h"
 #include "components/variations/service/buildflags.h"
 #include "content/common/features.h"
+#include "content/public/common/content_features.h"
 #include "content/public/common/content_switches.h"
 #include "net/base/features.h"
 #include "sandbox/policy/switches.h"
@@ -159,18 +160,7 @@ ChromeMainDelegateCef::ChromeMainDelegateCef(CefMainRunner* runner,
 ChromeMainDelegateCef::~ChromeMainDelegateCef() = default;
 
 std::optional<int> ChromeMainDelegateCef::BasicStartupComplete() {
-  // Returns no value if startup should proceed.
-  auto result = ChromeMainDelegate::BasicStartupComplete();
-  if (result.has_value()) {
-    return result;
-  }
-
   base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
-
-#if BUILDFLAG(IS_POSIX)
-  // Read the crash configuration file. On Windows this is done from chrome_elf.
-  crash_reporting::BasicStartupComplete(command_line);
-#endif
 
   const std::string& process_type =
       command_line->GetSwitchValueASCII(switches::kProcessType);
@@ -365,6 +355,15 @@ std::optional<int> ChromeMainDelegateCef::BasicStartupComplete() {
       DisableFeatureByDefault(base::kEnableHangWatcher, disable_features);
     }
 
+#if BUILDFLAG(IS_MAC)
+    // Chromium enables Aperitif helpers by default, but CEF clients package
+    // the original helper variants. They initialize the sandbox through
+    // CefScopedSandboxContext before dynamically loading the CEF framework.
+    // Disable Aperitif helper selection to preserve that startup contract and
+    // avoid launching helper executables that clients do not provide.
+    DisableFeatureByDefault(features::kAperitifHelpers, disable_features);
+#endif  // BUILDFLAG(IS_MAC)
+
 #if BUILDFLAG(IS_WIN)
     // Disable TcpSocketIoCompletionPortWin which breaks embedded test servers.
     // See https://crbug.com/40287434#comment36
@@ -425,6 +424,18 @@ std::optional<int> ChromeMainDelegateCef::BasicStartupComplete() {
                                                 commandLinePtr.get());
     std::ignore = commandLinePtr->Detach(nullptr);
   }
+
+  // Chromium's early startup checks must see settings and client modifications,
+  // including do-not-de-elevate on Windows.
+  auto result = ChromeMainDelegate::BasicStartupComplete();
+  if (result.has_value()) {
+    return result;
+  }
+
+#if BUILDFLAG(IS_POSIX)
+  // Read the crash configuration file. On Windows this is done from chrome_elf.
+  crash_reporting::BasicStartupComplete(command_line);
+#endif
 
   // Call as early as possible.
   InitLogging(command_line);

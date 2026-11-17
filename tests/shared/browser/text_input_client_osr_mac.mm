@@ -124,7 +124,7 @@ extern NSString* NSTextInputReplacementRangeAttributeName;
 - (void)doCommandBySelector:(SEL)aSelector {
   // An input method calls this function to dispatch an editing command to be
   // handled by this view.
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   if (handlingKeyDown_ && aSelector != @selector(noop:)) {
     if ([NSStringFromSelector(aSelector) hasPrefix:@"insert"]) {
       hasInsertionCommand_ = YES;
@@ -132,7 +132,7 @@ extern NSString* NSTextInputReplacementRangeAttributeName;
       hasOtherCommand_ = YES;
     }
   }
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 }
 
 - (void)setMarkedText:(id)aString
@@ -284,31 +284,31 @@ extern NSString* NSTextInputReplacementRangeAttributeName;
   underlines_.clear();
   setMarkedTextReplacementRange_ = CefRange::InvalidRange();
   unmarkTextCalled_ = NO;
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   hasInsertionCommand_ = NO;
   hasOtherCommand_ = NO;
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 }
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
 - (void)HandleKeyEventAfterTextInputClient:(CefKeyboardInputEvent)keyEvent
                              keyEventValid:(BOOL)valid {
 #else
 - (void)HandleKeyEventAfterTextInputClient:(CefKeyEvent)keyEvent {
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
   handlingKeyDown_ = NO;
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   // insertText: records UTF-8. Eligibility is based on the actual UTF-16
   // insertion, not byte length or a copied native key event.
   const std::u16string insertion = CefString(textToBeInserted_).ToString16();
   const bool composing = hasMarkedText_ || oldHasMarkedText_;
   BOOL textInserted = NO;
   if (valid && !composing && insertion.size() < 4) {
-    keyEvent.type = CEF_KEYEVENT_RAWKEYDOWN;
+    keyEvent.type = CEF_KEY_EVENT_RAWKEYDOWN;
     browser_->GetHost()->SendKeyboardEvent(keyEvent);
     if (!insertion.empty() && keyEvent.dom_key != CEF_DOM_KEY_CLEAR) {
-      keyEvent.type = CEF_KEYEVENT_CHAR;
+      keyEvent.type = CEF_KEY_EVENT_CHAR;
       keyEvent.windows_key_code = insertion[0];
       std::fill(std::begin(keyEvent.text), std::end(keyEvent.text), 0);
       std::copy(insertion.begin(), insertion.end(), keyEvent.text);
@@ -333,7 +333,7 @@ extern NSString* NSTextInputReplacementRangeAttributeName;
         ((keyEvent.modifiers &
           (CEF_EVENTFLAG_CONTROL_DOWN | CEF_EVENTFLAG_COMMAND_DOWN)) ||
          (hasInsertionCommand_ && !hasOtherCommand_))) {
-      keyEvent.type = CEF_KEYEVENT_CHAR;
+      keyEvent.type = CEF_KEY_EVENT_CHAR;
       browser_->GetHost()->SendKeyboardEvent(keyEvent);
     }
   } else if (!insertion.empty()) {
@@ -378,7 +378,7 @@ extern NSString* NSTextInputReplacementRangeAttributeName;
     textToBeInserted_.clear();
   }
 
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 
   // Update or cancel the composition. If some text has been inserted then we
   // don't need to explicitly cancel the composition.

@@ -7,6 +7,7 @@
 #include "base/memory/raw_ptr.h"
 #include "cef/libcef/browser/browser_event_util.h"
 #include "cef/libcef/browser/browser_host_base.h"
+#include "cef/libcef/browser/browser_info_manager.h"
 #include "cef/libcef/browser/browser_platform_delegate.h"
 #include "cef/libcef/browser/native/cursor_util.h"
 #include "cef/libcef/common/api_version_util.h"
@@ -91,11 +92,19 @@ CefBrowserContentsDelegate::CefBrowserContentsDelegate(
     scoped_refptr<CefBrowserInfo> browser_info)
     : browser_info_(browser_info) {}
 
+CefBrowserContentsDelegate::~CefBrowserContentsDelegate() = default;
+
 void CefBrowserContentsDelegate::ObserveWebContents(
     content::WebContents* new_contents) {
+  find_observation_.Reset();
   WebContentsObserver::Observe(new_contents);
 
   if (new_contents) {
+    // Chrome may attach the browser host before initializing TabFeatures.
+    // Ensure the helper exists before observing its processed results.
+    find_in_page::FindTabHelper::CreateForWebContents(new_contents);
+    find_observation_.Observe(
+        find_in_page::FindTabHelper::FromWebContents(new_contents));
     // Make sure MaybeCreateFrame is called at least one time.
     // Create the frame representation before OnAfterCreated is called for a new
     // browser.
@@ -270,7 +279,7 @@ CefBrowserContentsDelegate::PreHandleKeyboardEvent(
     const input::NativeWebKeyboardEvent& event) {
   if (auto delegate = platform_delegate()) {
     if (auto c = client()) {
-      if (CEF_API_IS_ADDED(CEF_NEXT)) {
+      if (CEF_API_IS_ADDED(15800)) {
         if (auto handler = c->GetInputHandler()) {
           CefKeyboardInputEvent cef_event;
           if (GetCefKeyboardInputEvent(event, cef_event)) {
@@ -309,6 +318,38 @@ CefBrowserContentsDelegate::PreHandleKeyboardEvent(
   return KeyboardEventProcessingResult::NOT_HANDLED;
 }
 
+bool CefBrowserContentsDelegate::PreHandleMouseEvent(
+    content::WebContents* source,
+    const blink::WebMouseEvent& event) {
+  if (CEF_API_IS_ADDED(15800)) {
+    if (auto c = client()) {
+      if (auto handler = c->GetInputHandler()) {
+        CefMouseInputEvent cef_event;
+        if (GetCefMouseInputEvent(event, cef_event)) {
+          return handler->OnPreMouseEvent(browser(), cef_event);
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool CefBrowserContentsDelegate::PreHandleGestureEvent(
+    content::WebContents* source,
+    const blink::WebGestureEvent& event) {
+  if (CEF_API_IS_ADDED(15800)) {
+    if (auto c = client()) {
+      if (auto handler = c->GetInputHandler()) {
+        CefGestureInputEvent cef_event;
+        if (GetCefGestureInputEvent(event, cef_event)) {
+          return handler->OnPreGestureEvent(browser(), cef_event);
+        }
+      }
+    }
+  }
+  return false;
+}
+
 bool CefBrowserContentsDelegate::HandleKeyboardEvent(
     content::WebContents* source,
     const input::NativeWebKeyboardEvent& event) {
@@ -319,7 +360,7 @@ bool CefBrowserContentsDelegate::HandleKeyboardEvent(
 
   if (auto delegate = platform_delegate()) {
     if (auto c = client()) {
-      if (CEF_API_IS_ADDED(CEF_NEXT)) {
+      if (CEF_API_IS_ADDED(15800)) {
         if (auto handler = c->GetInputHandler()) {
           CefKeyboardInputEvent cef_event;
           if (GetCefKeyboardInputEvent(event, cef_event)) {
@@ -410,6 +451,12 @@ void CefBrowserContentsDelegate::RenderFrameDeleted(
     content::RenderFrameHost* render_frame_host) {
   browser_info_->RemoveFrame(render_frame_host);
 
+  // Resolve pending lookups even when the frame was discarded before CEF
+  // registered it. RemoveFrame has released its notification lock here.
+  if (auto* manager = CefBrowserInfoManager::GetInstance()) {
+    manager->OnFrameDeleted(render_frame_host->GetGlobalFrameToken());
+  }
+
   if (focused_frame_ && focused_frame_->IsSameFrame(render_frame_host)) {
     focused_frame_ = nullptr;
     OnStateChanged(State::kFocusedFrame);
@@ -470,6 +517,8 @@ void CefBrowserContentsDelegate::PrimaryMainFrameRenderProcessGone(
   } else if (status == base::TERMINATION_STATUS_INTEGRITY_FAILURE) {
     ts = TS_INTEGRITY_FAILURE;
 #endif
+  } else if (status == base::TERMINATION_STATUS_EVICTED_FOR_MEMORY) {
+    ts = TS_EVICTED_FOR_MEMORY;
   } else if (status != base::TERMINATION_STATUS_ABNORMAL_TERMINATION) {
     return;
   }
@@ -704,20 +753,19 @@ bool CefBrowserContentsDelegate::TakeFocus(content::WebContents* source,
   return false;
 }
 
-void CefBrowserContentsDelegate::FindReply(content::WebContents* web_contents,
-                                           int request_id,
-                                           int number_of_matches,
-                                           const gfx::Rect& selection_rect,
-                                           int active_match_ordinal,
-                                           bool final_update) {
+void CefBrowserContentsDelegate::OnFindTabHelperDestroyed(
+    find_in_page::FindTabHelper* helper) {
+  find_observation_.Reset();
+}
+
+void CefBrowserContentsDelegate::OnFindResultAvailable(
+    content::WebContents* web_contents) {
   auto browser_host = browser_info_->browser();
   if (!browser_host) {
     return;
   }
 
-  if (browser_host->HandleFindReply(request_id, number_of_matches,
-                                    selection_rect, active_match_ordinal,
-                                    final_update)) {
+  if (browser_host->HandleFindReply()) {
     if (auto c = client()) {
       if (auto handler = c->GetFindHandler()) {
         const auto& details = browser_host->last_search_result();

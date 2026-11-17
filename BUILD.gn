@@ -414,12 +414,14 @@ if (is_win) {
 # that is limited in scope (e.g. utility classes/methods).
 source_set("libcef_static_unittested") {
   sources = [
+    "libcef/browser/browser_info_request_state.h",
     "libcef/browser/devtools/devtools_util.cc",
     "libcef/browser/devtools/devtools_util.h",
     "libcef/browser/geometry_util.cc",
     "libcef/browser/geometry_util.h",
     "libcef/browser/key_event_util.h",
     "libcef/browser/keyboard_input_event_util.cc",
+    "libcef/browser/mouse_gesture_input_event_util.cc",
     "libcef/browser/osr/external_begin_frame_request_state.h",
   ]
 
@@ -455,16 +457,19 @@ test("libcef_static_unittests") {
   testonly = true
 
   sources = [
+    "libcef/browser/browser_info_request_state_unittest.cc",
     "libcef/browser/devtools/devtools_util_unittest.cc",
     "libcef/browser/geometry_util_unittest.cc",
     "libcef/browser/key_event_util_unittest.cc",
     "libcef/browser/keyboard_input_event_util_unittest.cc",
+    "libcef/browser/mouse_gesture_input_event_util_unittest.cc",
     "libcef/browser/osr/external_begin_frame_request_state_unittest.cc",
   ]
 
   deps = [
     ":libcef_static_unittested",
     "//base/test:run_all_unittests",
+    "//base/test:test_support",
     "//components/input",
     "//testing/gtest",
     "//third_party/blink/public/common",
@@ -544,6 +549,8 @@ source_set("libcef_static") {
             gypi_paths.autogen_cpp_includes + [
     "libcef/browser/alloy/alloy_browser_host_impl.cc",
     "libcef/browser/alloy/alloy_browser_host_impl.h",
+    "libcef/browser/alloy/alloy_tab_interface.cc",
+    "libcef/browser/alloy/alloy_tab_interface.h",
     "libcef/browser/alloy/browser_platform_delegate_alloy.cc",
     "libcef/browser/alloy/browser_platform_delegate_alloy.h",
     "libcef/browser/alloy/dialogs/alloy_constrained_window_views_client.cc",
@@ -2637,6 +2644,7 @@ if (is_mac) {
       libs = [
         "comctl32.lib",
         "d3d11.lib",
+        "hid.lib",
         "imm32.lib",
         "oleacc.lib",
         "rpcrt4.lib",
@@ -2725,6 +2733,7 @@ if (is_mac) {
       libs = [
         "comctl32.lib",
         "d3d11.lib",
+        "hid.lib",
         "imm32.lib",
         "oleacc.lib",
         "rpcrt4.lib",

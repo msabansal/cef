@@ -82,11 +82,21 @@ void CefBrowserPlatformDelegateChrome::SendMouseMoveEvent(
   native_delegate_->SendMouseMoveEvent(event, mouseLeave);
 }
 
+void CefBrowserPlatformDelegateChrome::SendWheelEvent(
+    const CefWheelInputEvent& event) {
+  native_delegate_->SendWheelEvent(event);
+}
+
 void CefBrowserPlatformDelegateChrome::SendMouseWheelEvent(
     const CefMouseEvent& event,
     int deltaX,
     int deltaY) {
   native_delegate_->SendMouseWheelEvent(event, deltaX, deltaY);
+}
+
+void CefBrowserPlatformDelegateChrome::SendTouchEvent(
+    const CefTouchEvent& event) {
+  native_delegate_->SendTouchEvent(event);
 }
 
 gfx::Point CefBrowserPlatformDelegateChrome::GetScreenPoint(

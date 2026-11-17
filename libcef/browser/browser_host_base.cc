@@ -1042,6 +1042,50 @@ void CefBrowserHostBase::AddWordToDictionary(const CefString& word) {
 #endif
 }
 
+void CefBrowserHostBase::SendTouchEvent(const CefTouchEvent& event) {
+  if (!CEF_CURRENTLY_ON_UIT()) {
+    CEF_POST_TASK(CEF_UIT, base::BindOnce(&CefBrowserHostBase::SendTouchEvent,
+                                          this, event));
+    return;
+  }
+  if (platform_delegate_) {
+    platform_delegate_->SendTouchEvent(event);
+  }
+}
+
+void CefBrowserHostBase::SendMouseEvent(const CefMouseInputEvent& event) {
+  if (!CEF_CURRENTLY_ON_UIT()) {
+    CEF_POST_TASK(CEF_UIT, base::BindOnce(&CefBrowserHostBase::SendMouseEvent,
+                                          this, event));
+    return;
+  }
+  if (platform_delegate_) {
+    platform_delegate_->SendMouseEvent(event);
+  }
+}
+
+void CefBrowserHostBase::SendGestureEvent(const CefGestureInputEvent& event) {
+  if (!CEF_CURRENTLY_ON_UIT()) {
+    CEF_POST_TASK(CEF_UIT, base::BindOnce(&CefBrowserHostBase::SendGestureEvent,
+                                          this, event));
+    return;
+  }
+  if (platform_delegate_) {
+    platform_delegate_->SendGestureEvent(event);
+  }
+}
+
+void CefBrowserHostBase::SendWheelEvent(const CefWheelInputEvent& event) {
+  if (!CEF_CURRENTLY_ON_UIT()) {
+    CEF_POST_TASK(CEF_UIT, base::BindOnce(&CefBrowserHostBase::SendWheelEvent,
+                                          this, event));
+    return;
+  }
+  if (platform_delegate_) {
+    platform_delegate_->SendWheelEvent(event);
+  }
+}
+
 void CefBrowserHostBase::SendKeyboardEvent(const CefKeyboardInputEvent& event) {
   if (!CEF_CURRENTLY_ON_UIT()) {
     CEF_POST_TASK(
@@ -1489,11 +1533,7 @@ CefBrowserHostBase::GetJavaScriptDialogManager() {
   return javascript_dialog_manager_.get();
 }
 
-bool CefBrowserHostBase::HandleFindReply(int request_id,
-                                         int number_of_matches,
-                                         const gfx::Rect& selection_rect,
-                                         int active_match_ordinal,
-                                         bool final_update) {
+bool CefBrowserHostBase::HandleFindReply() {
   auto web_contents = GetWebContents();
   if (!web_contents) {
     return false;
@@ -1502,8 +1542,9 @@ bool CefBrowserHostBase::HandleFindReply(int request_id,
   auto find_in_page =
       find_in_page::FindTabHelper::FromWebContents(web_contents);
 
-  find_in_page->HandleFindReply(request_id, number_of_matches, selection_rect,
-                                active_match_ordinal, final_update);
+  if (!find_in_page) {
+    return false;
+  }
   if (!(find_in_page->find_result() == last_search_result_)) {
     last_search_result_ = find_in_page->find_result();
     return true;

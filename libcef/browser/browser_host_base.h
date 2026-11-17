@@ -251,6 +251,9 @@ class CefBrowserHostBase : public CefBrowserHost,
   void ReplaceMisspelling(const CefString& word) override;
   void AddWordToDictionary(const CefString& word) override;
   void SendKeyEvent(const CefKeyEvent& event) override;
+  void SendMouseEvent(const CefMouseInputEvent& event) override;
+  void SendGestureEvent(const CefGestureInputEvent& event) override;
+  void SendWheelEvent(const CefWheelInputEvent& event) override;
   void SendKeyboardEvent(const CefKeyboardInputEvent& event) override;
   void SendMouseClickEvent(const CefMouseEvent& event,
                            MouseButtonType type,
@@ -260,6 +263,7 @@ class CefBrowserHostBase : public CefBrowserHost,
   void SendMouseWheelEvent(const CefMouseEvent& event,
                            int deltaX,
                            int deltaY) override;
+  void SendTouchEvent(const CefTouchEvent& event) override;
   bool SendDevToolsMessage(const void* message, size_t message_size) override;
   int ExecuteDevToolsMethod(int message_id,
                             const CefString& method,
@@ -360,12 +364,8 @@ class CefBrowserHostBase : public CefBrowserHost,
   // Called from CefBrowserContentsDelegate::ResizeDueToAutoResize.
   void SetAutoResizeSize(const gfx::Size& size);
 
-  // Called from CefBrowserContentsDelegate::FindReply.
-  bool HandleFindReply(int request_id,
-                       int number_of_matches,
-                       const gfx::Rect& selection_rect,
-                       int active_match_ordinal,
-                       bool final_update);
+  // Called after FindTabHelper has processed a reply.
+  bool HandleFindReply();
 
   const find_in_page::FindNotificationDetails& last_search_result() const {
     return last_search_result_;

@@ -91,13 +91,14 @@ struct WebGLRenderingContextBase {
     });
   }
   void ClearMarkedCanvasDirty() { marked_canvas_dirty_ = false; }
-  std::shared_ptr<CanvasResource> PaintRenderingResultsToResource(
+  std::shared_ptr<ExportedCanvasResource> PaintRenderingResultsToResource(
       SourceDrawingBuffer,
       FlushReason) {
     // Export itself may mark a drawing buffer as composited.
     buffer.clear_needed = true;
     MarkLayerComposited();
-    return std::make_shared<CanvasResource>();
+    return std::make_shared<ExportedCanvasResource>(
+        std::make_shared<CanvasResource>());
   }
   blink::ReachCanvasVideo capture;
   std::vector<uint8_t> pixels{1, 2, 3, 17};
@@ -121,6 +122,7 @@ struct Dispatcher {
   unsigned frames = 0;
 };
 struct Accessibility {
+  bool ShouldCaptureRenderedText() const { return false; }
   void UpdateAnnotation() {}
 };
 struct HTMLCanvasElement {

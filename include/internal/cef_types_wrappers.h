@@ -388,17 +388,26 @@ class CefScreenInfo : public CefStructBaseSimple<cef_screen_info_t> {
 ///
 using CefKeyEvent = CefStructBaseSimple<cef_key_event_t>;
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
 
 using CefKeyboardInputEvent =
     CefStructBase<CefStructBaseSimpleTraits<cef_keyboard_input_event_t>>;
+using CefMouseInputEvent =
+    CefStructBase<CefStructBaseSimpleTraits<cef_mouse_input_event_t>>;
+using CefGestureInputEvent =
+    CefStructBase<CefStructBaseSimpleTraits<cef_gesture_input_event_t>>;
 using CefInputEventContext =
     CefStructBase<CefStructBaseSimpleTraits<cef_input_event_context_t>>;
 
-#endif  // CEF_API_ADDED(CEF_NEXT)
+using CefWheelInputEvent =
+    CefStructBase<CefStructBaseSimpleTraits<cef_wheel_input_event_t>>;
+#endif  // CEF_API_ADDED(15800)
 
 ///
 /// Class representing a mouse event.
+/// Used by drag-and-drop and legacy input APIs. For input injection, use
+/// CefMouseInputEvent for mouse input or CefWheelInputEvent for wheel input
+/// instead.
 ///
 class CefMouseEvent : public cef_mouse_event_t {
  public:

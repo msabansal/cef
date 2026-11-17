@@ -9,7 +9,9 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <objc/runtime.h>
 
+#include <cmath>
 #include <optional>
+#include <utility>
 
 #include "include/base/cef_logging.h"
 #include "include/cef_input_event_utils.h"
@@ -24,6 +26,7 @@
 #include "tests/shared/browser/osr_accessibility_helper.h"
 #include "tests/shared/browser/osr_accessibility_node.h"
 #include "tests/shared/browser/osr_begin_frame_timer_mac.h"
+#include "tests/shared/browser/osr_input_util.h"
 #include "tests/shared/browser/osr_renderer_metal.h"
 #include "tests/shared/browser/text_input_client_osr_mac.h"
 
@@ -41,6 +44,10 @@
   bool was_last_mouse_down_on_view_;
 
   float device_scale_factor_;
+
+  client::OsrTouchInputState touch_state_;
+  NSMutableDictionary* touch_ids_;
+  uint64_t next_touch_id_;
 
   // Drag and drop.
   CefRefPtr<CefDragData> current_drag_data_;
@@ -62,6 +69,8 @@
 
 - (void)requestDisplay;
 - (void)updateDrawableSize;
+- (void)cancelTouchEvents;
+- (void)setTouchEmulationEnabled:(BOOL)enabled;
 @end  // @interface BrowserOsrView
 
 namespace {
@@ -73,6 +82,24 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
   NSRect point_rect = NSMakeRect(point.x, point.y, 0, 0);
   return [window convertRectToScreen:point_rect].origin;
 }
+
+#if CEF_API_ADDED(15800)
+cef_wheel_event_phase_t WheelPhaseFromNSEventPhase(NSEventPhase phase) {
+  uint32_t result = CEF_WHEEL_PHASE_NONE;
+  for (const auto& entry :
+       {std::pair{NSEventPhaseBegan, CEF_WHEEL_PHASE_BEGAN},
+        std::pair{NSEventPhaseStationary, CEF_WHEEL_PHASE_STATIONARY},
+        std::pair{NSEventPhaseChanged, CEF_WHEEL_PHASE_CHANGED},
+        std::pair{NSEventPhaseEnded, CEF_WHEEL_PHASE_ENDED},
+        std::pair{NSEventPhaseCancelled, CEF_WHEEL_PHASE_CANCELLED},
+        std::pair{NSEventPhaseMayBegin, CEF_WHEEL_PHASE_MAY_BEGIN}}) {
+    if (phase & entry.first) {
+      result |= entry.second;
+    }
+  }
+  return static_cast<cef_wheel_event_phase_t>(result);
+}
+#endif
 
 }  // namespace
 
@@ -88,6 +115,13 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
     display_pending_ = false;
     endWheelMonitor_ = nil;
     device_scale_factor_ = 1.0f;
+    touch_ids_ = [[NSMutableDictionary alloc] init];
+    next_touch_id_ = 0;
+    // Preserve contacts when AppKit classifies a finger as resting. Otherwise
+    // it synthesizes end/begin events while the finger is still on the device.
+    self.wantsRestingTouches = YES;
+    [self setTouchEmulationEnabled:([NSEvent modifierFlags] &
+                                    NSEventModifierFlagCapsLock) != 0];
 
     tracking_area_ = [[NSTrackingArea alloc]
         initWithRect:frame
@@ -123,6 +157,7 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
   [self detach];
   [[NSNotificationCenter defaultCenter] removeObserver:self];
 #if !__has_feature(objc_arc)
+  [touch_ids_ release];
   if (text_input_context_osr_mac_) {
     [text_input_client_ release];
     [text_input_context_osr_mac_ release];
@@ -132,6 +167,7 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
 }
 
 - (void)detach {
+  [self cancelTouchEvents];
   [NSObject cancelPreviousPerformRequestsWithTarget:self];
   display_pending_ = false;
   // Clear the view's pointer before destruction notifications can reenter it.
@@ -187,8 +223,16 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
     return;
   }
 
+#if CEF_API_ADDED(15800)
+  const NSPoint screen = [self getScreenPointForEvent:event];
+  browser->GetHost()->SendMouseEvent(client::MakeOsrMouseInputEvent(
+      mouseEvent, CefPoint(screen.x, screen.y),
+      isUp ? CEF_MOUSE_EVENT_UP : CEF_MOUSE_EVENT_DOWN, type,
+      static_cast<int>(event.clickCount)));
+#else
   browser->GetHost()->SendMouseClickEvent(mouseEvent, type, isUp,
                                           static_cast<int>([event clickCount]));
+#endif
 }
 
 - (void)mouseDown:(NSEvent*)event {
@@ -207,6 +251,15 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
 }
 
 - (void)otherMouseDown:(NSEvent*)event {
+#if CEF_API_ADDED(15800)
+  if (event.buttonNumber == 3 || event.buttonNumber == 4) {
+    [self sendMouseClick:event
+                  button:event.buttonNumber == 3 ? CEF_MOUSE_BUTTON_BACK
+                                                 : CEF_MOUSE_BUTTON_FORWARD
+                    isUp:false];
+    return;
+  }
+#endif
   [self sendMouseClick:event button:MBT_MIDDLE isUp:false];
 }
 
@@ -226,6 +279,15 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
 }
 
 - (void)otherMouseUp:(NSEvent*)event {
+#if CEF_API_ADDED(15800)
+  if (event.buttonNumber == 3 || event.buttonNumber == 4) {
+    [self sendMouseClick:event
+                  button:event.buttonNumber == 3 ? CEF_MOUSE_BUTTON_BACK
+                                                 : CEF_MOUSE_BUTTON_FORWARD
+                    isUp:true];
+    return;
+  }
+#endif
   [self sendMouseClick:event button:MBT_MIDDLE isUp:true];
 }
 
@@ -249,7 +311,20 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
   CefMouseEvent mouseEvent;
   [self getMouseEvent:mouseEvent forEvent:event];
 
+#if CEF_API_ADDED(15800)
+  const NSPoint screen = [self getScreenPointForEvent:event];
+  auto input = client::MakeOsrMouseInputEvent(
+      mouseEvent, CefPoint(screen.x, screen.y),
+      event.type == NSEventTypeMouseEntered ? CEF_MOUSE_EVENT_ENTER
+                                            : CEF_MOUSE_EVENT_MOVE);
+  if (input.type == CEF_MOUSE_EVENT_MOVE) {
+    input.movement_x = static_cast<int32_t>(event.deltaX);
+    input.movement_y = static_cast<int32_t>(event.deltaY);
+  }
+  browser->GetHost()->SendMouseEvent(input);
+#else
   browser->GetHost()->SendMouseMoveEvent(mouseEvent, false);
+#endif
 }
 
 - (void)mouseDragged:(NSEvent*)event {
@@ -277,8 +352,70 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
   CefMouseEvent mouseEvent;
   [self getMouseEvent:mouseEvent forEvent:event];
 
+#if CEF_API_ADDED(15800)
+  const NSPoint screen = [self getScreenPointForEvent:event];
+  browser->GetHost()->SendMouseEvent(client::MakeOsrMouseInputEvent(
+      mouseEvent, CefPoint(screen.x, screen.y), CEF_MOUSE_EVENT_LEAVE));
+#else
   browser->GetHost()->SendMouseMoveEvent(mouseEvent, true);
+#endif
 }
+
+#if CEF_API_ADDED(15800)
+- (NSPoint)getScreenPointForEvent:(NSEvent*)event {
+  return ConvertPointFromWindowToScreen(self.window, event.locationInWindow);
+}
+
+- (void)sendGesture:(NSEvent*)event smartMagnify:(bool)smart {
+  auto browser = [self getBrowser];
+  if (!browser || (client::MainContext::Get()->TouchEventsEnabled() &&
+                   (event.modifierFlags & NSEventModifierFlagCapsLock))) {
+    return;
+  }
+  CefMouseEvent mouse;
+  [self getMouseEvent:mouse forEvent:event];
+  const NSPoint screen = [self getScreenPointForEvent:event];
+  CefGestureInputEvent input;
+  input.x = mouse.x;
+  input.y = mouse.y;
+  input.screen_x = screen.x;
+  input.screen_y = screen.y;
+  input.modifiers = mouse.modifiers;
+  input.source_device = CEF_GESTURE_DEVICE_TOUCHPAD;
+  input.primary_pointer_type = CEF_POINTER_TYPE_TOUCH;
+  input.needs_wheel_event = 1;
+  if (smart) {
+    input.type = CEF_GESTURE_EVENT_DOUBLE_TAP;
+    input.tap_count = 1;
+  } else {
+    switch (event.phase) {
+      case NSEventPhaseBegan:
+        input.type = CEF_GESTURE_EVENT_PINCH_BEGIN;
+        break;
+      case NSEventPhaseChanged:
+      case NSEventPhaseStationary:
+        input.type = CEF_GESTURE_EVENT_PINCH_UPDATE;
+        input.scale = 1.0 + event.magnification;
+        break;
+      case NSEventPhaseEnded:
+      case NSEventPhaseCancelled:
+        input.type = CEF_GESTURE_EVENT_PINCH_END;
+        break;
+      default:
+        return;
+    }
+  }
+  browser->GetHost()->SendGestureEvent(input);
+}
+
+- (void)magnifyWithEvent:(NSEvent*)event {
+  [self sendGesture:event smartMagnify:false];
+}
+
+- (void)smartMagnifyWithEvent:(NSEvent*)event {
+  [self sendGesture:event smartMagnify:true];
+}
+#endif
 
 - (void)keyDown:(NSEvent*)event {
   CefRefPtr<CefBrowser> browser = [self getBrowser];
@@ -294,7 +431,7 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
       // ignore it and ask the host view whether IME is active or not.
       [text_input_context_osr_mac_ handleEvent:event];
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
       CefKeyboardInputEvent keyEvent;
       // The text client still processes composition/oversized insertion when
       // native conversion rejects the keyboard text capacity.
@@ -303,14 +440,14 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
 #else
       CefKeyEvent keyEvent;
       [self getKeyEvent:keyEvent forEvent:event];
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
       [text_input_client_ HandleKeyEventAfterTextInputClient:keyEvent
                                                keyEventValid:keyEventValid];
 #else
       [text_input_client_ HandleKeyEventAfterTextInputClient:keyEvent];
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
     }
   }
 
@@ -326,14 +463,29 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
 // touch-events=enabled commandline is passed and caps lock key is on.
 - (void)toggleTouchEmulation:(NSEvent*)event {
   if ([event type] == NSEventTypeFlagsChanged && [event keyCode] == 0x39) {
-    NSUInteger flags = [event modifierFlags];
-    BOOL touch_enabled = flags & NSEventModifierFlagCapsLock ? YES : NO;
-    if (touch_enabled) {
-      self.allowedTouchTypes |= NSTouchTypeMaskDirect;
-    } else {
-      self.allowedTouchTypes &= ~NSTouchTypeMaskDirect;
+    [self setTouchEmulationEnabled:([event modifierFlags] &
+                                    NSEventModifierFlagCapsLock) != 0];
+  }
+}
+
+- (void)setTouchEmulationEnabled:(BOOL)enabled {
+  if (enabled && client::MainContext::Get()->TouchEventsEnabled()) {
+    self.allowedTouchTypes = NSTouchTypeMaskIndirect;
+  } else {
+    [self cancelTouchEvents];
+    self.allowedTouchTypes = 0;
+  }
+}
+
+- (void)cancelTouchEvents {
+  auto browser = [self getBrowser];
+  for (auto& touch : touch_state_.Cancel()) {
+    client::DeviceToLogical(touch, [self getDeviceScaleFactor]);
+    if (browser) {
+      browser->GetHost()->SendTouchEvent(touch);
     }
   }
+  [touch_ids_ removeAllObjects];
 }
 
 - (cef_touch_event_type_t)getTouchPhase:(NSTouchPhase)phase {
@@ -362,49 +514,50 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
   int modifiers = [self getModifiersForEvent:event];
   CefRefPtr<CefBrowser> browser = [self getBrowser];
 
+  if (!browser || !(self.allowedTouchTypes & NSTouchTypeMaskIndirect)) {
+    return;
+  }
   NSSet* touches = [event touchesMatchingPhase:phase inView:self];
 
   for (NSTouch* touch in touches) {
     // Convert NSTouch to CefTouchEvent.
     CefTouchEvent touch_event;
 
-    // NSTouch.identity is unique during the life of the touch
-    touch_event.id = static_cast<int>(touch.identity.hash);
+    // Identity implements NSCopying/isEqual: but its hash is not a unique ID.
+    NSNumber* native_id = [touch_ids_ objectForKey:touch.identity];
+    if (phase == NSTouchPhaseBegan && native_id) {
+      continue;
+    }
+    if (phase == NSTouchPhaseBegan && !native_id) {
+      native_id = [NSNumber numberWithUnsignedLongLong:next_touch_id_++];
+      [touch_ids_ setObject:native_id forKey:touch.identity];
+    }
+    if (!native_id) {
+      continue;
+    }
     touch_event.type = [self getTouchPhase:phase];
 
     NSPoint scaled_pos = [touch normalizedPosition];
-    NSSize view_size = [self bounds].size;
-
-    // Map point on Touch Device to View coordinates.
-    NSPoint touch_point = NSMakePoint(scaled_pos.x * view_size.width,
-                                      scaled_pos.y * view_size.height);
-
-    NSPoint contentLocal = [self convertPoint:touch_point fromView:nil];
-    NSPoint point;
-    point.x = contentLocal.x;
-    point.y = [self frame].size.height - contentLocal.y;  // Flip y.
-
-    // Convert to device coordinates.
-    point = [self convertPointToBackingInternal:point];
-
-    int device_x = point.x;
-    int device_y = point.y;
-
-    const float device_scale_factor = [self getDeviceScaleFactor];
-    // Convert to browser view coordinates.
-    touch_event.x = client::DeviceToLogical(device_x, device_scale_factor);
-    touch_event.y = client::DeviceToLogical(device_y, device_scale_factor);
-
-    touch_event.radius_x = 0;
-    touch_event.radius_y = 0;
-
-    touch_event.rotation_angle = 0;
-    touch_event.pressure = 0;
-
+    NSSize view_size = [self convertSizeToBacking:self.bounds.size];
+    // Normalized trackpad coordinates are already relative to the view;
+    // flip the lower-left origin without converting from window coordinates.
+    touch_event.x = scaled_pos.x * view_size.width;
+    touch_event.y = (1 - scaled_pos.y) * view_size.height;
     touch_event.modifiers = modifiers;
 
-    // Notify the browser of touch event.
-    browser->GetHost()->SendTouchEvent(touch_event);
+    const bool accepted = touch_state_.Update(
+        native_id.unsignedLongLongValue, touch_event,
+        [self isOverPopupWidgetX:static_cast<int>(std::floor(touch_event.x))
+                            andY:static_cast<int>(std::floor(touch_event.y))],
+        [self getPopupXOffset], [self getPopupYOffset]);
+    if (!accepted || phase == NSTouchPhaseEnded ||
+        phase == NSTouchPhaseCancelled) {
+      [touch_ids_ removeObjectForKey:touch.identity];
+    }
+    if (accepted) {
+      client::DeviceToLogical(touch_event, [self getDeviceScaleFactor]);
+      browser->GetHost()->SendTouchEvent(touch_event);
+    }
   }
 }
 
@@ -430,7 +583,7 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
     return;
   }
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   CefKeyboardInputEvent keyEvent;
   if (CefKeyboardInputEventFromMacEvent(CAST_NSEVENT_TO_CEF_EVENT_HANDLE(event),
                                         keyEvent)) {
@@ -442,11 +595,11 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
 
   keyEvent.type = KEYEVENT_KEYUP;
   browser->GetHost()->SendKeyEvent(keyEvent);
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 }
 
 - (void)flagsChanged:(NSEvent*)event {
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   CefRefPtr<CefBrowser> browser = [self getBrowser];
   CefKeyboardInputEvent keyEvent;
   if (browser && CefKeyboardInputEventFromMacEvent(
@@ -462,7 +615,7 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
   } else {
     [self keyDown:event];
   }
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 }
 
 - (void)shortCircuitScrollWheelEvent:(NSEvent*)event {
@@ -506,6 +659,41 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
   CGEventRef cgEvent = [event CGEvent];
   DCHECK(cgEvent);
 
+#if CEF_API_ADDED(15800)
+  CefMouseEvent mouse;
+  [self getMouseEvent:mouse forEvent:event];
+  const NSPoint screen = [self getScreenPointForEvent:event];
+  auto input = client::MakeOsrWheelInputEvent(mouse, screen.x, screen.y);
+  NSPoint point = [self getClickPointForEvent:event];
+  point = [self convertPointToBackingInternal:point];
+  int device_x = point.x;
+  int device_y = point.y;
+  if ([self isOverPopupWidgetX:device_x andY:device_y]) {
+    [self applyPopupOffsetToX:device_x andY:device_y];
+  }
+  const float scale = [self getDeviceScaleFactor];
+  input.x = (point.x + device_x - static_cast<int>(point.x)) / scale;
+  input.y = (point.y + device_y - static_cast<int>(point.y)) / scale;
+  constexpr float pixels_per_tick = 40.f;
+  if (event.hasPreciseScrollingDeltas) {
+    input.delta_units = CEF_GESTURE_SCROLL_PRECISE_PIXEL;
+    input.delta_x = event.scrollingDeltaX;
+    input.delta_y = event.scrollingDeltaY;
+    input.wheel_ticks_x = input.delta_x / pixels_per_tick;
+    input.wheel_ticks_y = input.delta_y / pixels_per_tick;
+  } else {
+    input.delta_units = CEF_GESTURE_SCROLL_PIXEL;
+    input.delta_x = event.deltaX * pixels_per_tick;
+    input.delta_y = event.deltaY * pixels_per_tick;
+    input.wheel_ticks_x =
+        CGEventGetIntegerValueField(cgEvent, kCGScrollWheelEventDeltaAxis2);
+    input.wheel_ticks_y =
+        CGEventGetIntegerValueField(cgEvent, kCGScrollWheelEventDeltaAxis1);
+  }
+  input.phase = WheelPhaseFromNSEventPhase(event.phase);
+  input.momentum_phase = WheelPhaseFromNSEventPhase(event.momentumPhase);
+  browser->GetHost()->SendWheelEvent(input);
+#else
   int deltaX = static_cast<int>(
       CGEventGetIntegerValueField(cgEvent, kCGScrollWheelEventPointDeltaAxis2));
   int deltaY = static_cast<int>(
@@ -515,6 +703,7 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
   [self getMouseEvent:mouseEvent forEvent:event];
 
   browser->GetHost()->SendMouseWheelEvent(mouseEvent, deltaX, deltaY);
+#endif  // CEF_API_ADDED(15800)
 }
 
 - (BOOL)canBecomeKeyView {
@@ -538,6 +727,7 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
 }
 
 - (BOOL)resignFirstResponder {
+  [self cancelTouchEvents];
   CefRefPtr<CefBrowser> browser = [self getBrowser];
   if (browser.get()) {
     browser->GetHost()->SetFocus(false);
@@ -663,7 +853,33 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
   mouseEvent.x = client::DeviceToLogical(device_x, device_scale_factor);
   mouseEvent.y = client::DeviceToLogical(device_y, device_scale_factor);
 
+#if CEF_API_ADDED(15800)
+  mouseEvent.modifiers =
+      [self getModifiersForEvent:event] &
+      ~(CEF_EVENTFLAG_LEFT_MOUSE_BUTTON | CEF_EVENTFLAG_MIDDLE_MOUSE_BUTTON |
+        CEF_EVENTFLAG_RIGHT_MOUSE_BUTTON);
+  const NSUInteger buttons = NSEvent.pressedMouseButtons;
+  if (buttons & (1 << 0)) {
+    mouseEvent.modifiers |= CEF_EVENTFLAG_LEFT_MOUSE_BUTTON;
+  }
+  if (buttons & (1 << 1)) {
+    mouseEvent.modifiers |= CEF_EVENTFLAG_RIGHT_MOUSE_BUTTON;
+  }
+  if (buttons & (1 << 2)) {
+    mouseEvent.modifiers |= CEF_EVENTFLAG_MIDDLE_MOUSE_BUTTON;
+  }
+  if (buttons & (1 << 3)) {
+    mouseEvent.modifiers |= CEF_EVENTFLAG_BACK_MOUSE_BUTTON;
+  }
+  if (buttons & (1 << 4)) {
+    mouseEvent.modifiers |= CEF_EVENTFLAG_FORWARD_MOUSE_BUTTON;
+  }
+  if (event.modifierFlags & NSEventModifierFlagFunction) {
+    mouseEvent.modifiers |= CEF_EVENTFLAG_FN_DOWN;
+  }
+#else
   mouseEvent.modifiers = [self getModifiersForEvent:event];
+#endif
 }
 
 - (void)getMouseEvent:(CefMouseEvent&)mouseEvent
@@ -807,6 +1023,16 @@ NSPoint ConvertPointFromWindowToScreen(NSWindow* window, NSPoint point) {
   // This delegate method is only called on 10.7 and later, so don't worry about
   // other backing changes calling it on 10.6 or earlier
   [self resetDeviceScaleFactor:std::nullopt];
+}
+
+- (void)windowDidResignKey:(NSNotification*)notification {
+  [self cancelTouchEvents];
+}
+
+- (void)windowDidBecomeKey:(NSNotification*)notification {
+  // Caps Lock may have changed while a different window was active.
+  [self setTouchEmulationEnabled:([NSEvent modifierFlags] &
+                                  NSEventModifierFlagCapsLock) != 0];
 }
 
 - (BOOL)wantsUpdateLayer {
@@ -1991,6 +2217,16 @@ void BrowserWindowOsrMacImpl::Create(ClientWindowHandle parent_handle,
       addObserver:native_browser_view_
          selector:@selector(windowVisibilityChanged:)
              name:NSWindowDidChangeOcclusionStateNotification
+           object:native_browser_view_.window];
+  [[NSNotificationCenter defaultCenter]
+      addObserver:native_browser_view_
+         selector:@selector(windowDidResignKey:)
+             name:NSWindowDidResignKeyNotification
+           object:native_browser_view_.window];
+  [[NSNotificationCenter defaultCenter]
+      addObserver:native_browser_view_
+         selector:@selector(windowDidBecomeKey:)
+             name:NSWindowDidBecomeKeyNotification
            object:native_browser_view_.window];
 }
 
