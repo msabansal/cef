@@ -1,8 +1,8 @@
 diff --git base/test/BUILD.gn base/test/BUILD.gn
-index afddfd4..b43775d 100644
+index 1f60e21b6dfcb8cdb6c3deb2f3d6560c98e84cc6..35303ed06ad5d53f316f3262ed7445d99acb01fe 100644
 --- base/test/BUILD.gn
 +++ base/test/BUILD.gn
-@@ -724,7 +724,7 @@ action("amalgamated_perfetto_sql_stdlib") {
+@@ -727,7 +727,7 @@ action("amalgamated_perfetto_sql_stdlib") {
  # processor depends on dev_sqlite. The two share the same symbols but have
  # different implementations, so we need to hide dev_sqlite in this shared
  # library even in non-component builds to prevent duplicate symbols.
@@ -11,7 +11,7 @@ index afddfd4..b43775d 100644
  if (is_ios) {
    _target_type = "ios_framework_bundle"
  }
-@@ -750,33 +750,6 @@ target(_target_type, "test_trace_processor") {
+@@ -753,33 +753,6 @@ target(_target_type, "test_trace_processor") {
      output_name = "TestTraceProcessor"
      bundle_deps_filter = [ "//third_party/icu:icudata" ]
    }
@@ -67,10 +67,10 @@ index dc5c18bd66d1cc6fe55edc1a0709795cb2b3b3ec..15f25c0e92f87b2dc73be30b5366c084
 +
  #endif  // BASE_TEST_TRACING_TEST_TRACE_PROCESSOR_EXPORT_H_
 diff --git content/shell/BUILD.gn content/shell/BUILD.gn
-index b469f348694065feb03ddc3ea389124b125acf7c..8ca38caa6899d17c8fbad8633048ff4993f06477 100644
+index 8b637148169c240b17fe3e2091645d752074bb51..e69315eef31a21eb212d0af5eeb3f2e3324572e4 100644
 --- content/shell/BUILD.gn
 +++ content/shell/BUILD.gn
-@@ -942,7 +942,6 @@ if (is_mac) {
+@@ -944,7 +944,6 @@ if (is_mac) {
        # Specify a sensible install_name for static builds. The library is
        # dlopen()ed so this is not used to resolve the module.
        ldflags = [ "-Wl,-install_name,@executable_path/../Frameworks/$output_name.framework/$output_name" ]
@@ -79,10 +79,10 @@ index b469f348694065feb03ddc3ea389124b125acf7c..8ca38caa6899d17c8fbad8633048ff49
        # Both the main :content_shell and :content_shell_helper_app executables
        # need to link the framework. Because they are at different directory
 diff --git ui/views/examples/BUILD.gn ui/views/examples/BUILD.gn
-index db6385c2d4761aff2617004f589cd8d2fa3b3d9f..ca4596413082681894eb42da5fcd46b6e3210312 100644
+index 828d276b9277294bbb2388db1a1fbc8d36ce42f2..4574b03203ca10fe5efb5cc749abbcb5b1def9d1 100644
 --- ui/views/examples/BUILD.gn
 +++ ui/views/examples/BUILD.gn
-@@ -372,7 +372,6 @@ if (is_mac) {
+@@ -371,7 +371,6 @@ if (is_mac) {
        # Specify a sensible install_name for static builds. The library is
        # dlopen()ed so this is not used to resolve the module.
        ldflags = [ "-Wl,-install_name,@executable_path/../Frameworks/$output_name.framework/$output_name.framework" ]

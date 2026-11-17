@@ -85,7 +85,7 @@ bool CefMainRunner::Initialize(CefSettings* settings,
 
 void CefMainRunner::Shutdown(base::OnceClosure shutdown_on_ui_thread,
                              base::OnceClosure finalize_shutdown) {
-  if (multi_threaded_message_loop_) {
+  if (ui_thread_) {
     // Start shutdown on the UI thread. This is guaranteed to run before the
     // thread RunLoop has stopped.
     CEF_POST_TASK(CEF_UIT,
@@ -101,10 +101,9 @@ void CefMainRunner::Shutdown(base::OnceClosure shutdown_on_ui_thread,
     // Blocks until the thread has stopped.
     ui_thread_->Stop();
     ui_thread_.reset();
-  }
-
-  if (!multi_threaded_message_loop_) {
-    // Main thread and UI thread are the same.
+  } else {
+    // Main thread and UI thread are the same, or startup exited before the
+    // separate UI thread was created.
     StartShutdownOnUIThread(std::move(shutdown_on_ui_thread));
 
     // |browser_runner_| may be nullptr when shutting down after early exit.
@@ -127,6 +126,21 @@ void CefMainRunner::Shutdown(base::OnceClosure shutdown_on_ui_thread,
   keep_alive_.reset();
   settings_ = nullptr;
   application_ = nullptr;
+}
+
+void CefMainRunner::DoMessageLoopWork() {
+  CEF_REQUIRE_UIT();
+
+  if (!do_message_loop_work_called_) {
+    do_message_loop_work_called_ = true;
+    // Prevent closing the last Chrome browser window from starting shutdown
+    // while the application is driving the message loop.
+    keep_alive_ = std::make_unique<ScopedKeepAlive>(
+        KeepAliveOrigin::APP_CONTROLLER, KeepAliveRestartOption::DISABLED);
+  }
+
+  base::RunLoop run_loop;
+  run_loop.RunUntilIdle();
 }
 
 void CefMainRunner::RunMessageLoop() {
@@ -198,9 +212,13 @@ int CefMainRunner::RunAsHelperProcess(const CefMainArgs& args,
     return crashpad_runner::RunAsCrashpadHandler(command_line);
   }
 
+  // Initialize the global command line before the delegate constructor calls
+  // TimeTicks::Now(). On Windows, clock selection must read
+  // --force-high-res-timeticks on the first call to match the browser process.
+  BeforeMainInitialize(args);
+
   auto main_delegate = std::make_unique<ChromeMainDelegateCef>(
       /*runner=*/nullptr, /*settings=*/nullptr, application);
-  BeforeMainInitialize(args);
 
   // Execute the secondary process.
   content::ContentMainParams main_params(main_delegate.get());
@@ -435,6 +453,9 @@ void CefMainRunner::StartShutdownOnUIThread(
   }
 
   std::move(shutdown_on_ui_thread).Run();
+  if (do_message_loop_work_called_) {
+    keep_alive_.reset();
+  }
   BeforeUIThreadShutdown();
 }
 

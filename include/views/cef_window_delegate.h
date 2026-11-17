@@ -226,7 +226,7 @@ class CefWindowDelegate : public CefPanelDelegate {
     return false;
   }
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
 
   ///
   /// Called after all other controls in the window have had a chance to
@@ -235,19 +235,19 @@ class CefWindowDelegate : public CefPanelDelegate {
   /// OnKeyEvent before default handling.
   ///
   /// On macOS, native Views text interpretation may consume a printable
-  /// keydown and deliver CEF_KEYEVENT_CHAR instead. CEF_KEYEVENT_KEYUP can
+  /// keydown and deliver CEF_KEY_EVENT_CHAR instead. CEF_KEY_EVENT_KEYUP can
   /// still follow, so do not assume that every keyup has a corresponding
   /// keydown callback. This applies to input routed through native Views
   /// controls; BrowserView input follows the browser keyboard event dispatch
   /// path.
   ///
-  /*--cef(added=next)--*/
+  /*--cef(added=15800)--*/
   virtual bool OnKeyboardEvent(CefRefPtr<CefWindow> window,
                                const CefKeyboardInputEvent& event) {
     return false;
   }
 
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 
   ///
   /// Called after all other controls in the window have had a chance to

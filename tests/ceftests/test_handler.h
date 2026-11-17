@@ -247,6 +247,14 @@ class TestHandler : public CefClient,
   }
 
   // CefResourceRequestHandler methods
+  // Cancel ignored requests so they cannot retain a completed test handler.
+  // Overrides should call this implementation before handling other requests.
+  cef_return_value_t OnBeforeResourceLoad(
+      CefRefPtr<CefBrowser> browser,
+      CefRefPtr<CefFrame> frame,
+      CefRefPtr<CefRequest> request,
+      CefRefPtr<CefCallback> callback) override;
+
   CefRefPtr<CefResourceHandler> GetResourceHandler(
       CefRefPtr<CefBrowser> browser,
       CefRefPtr<CefFrame> frame,
@@ -286,12 +294,12 @@ class TestHandler : public CefClient,
   void OnWindowCreated(int browser_id);
   virtual void OnWindowDestroyed(int browser_id);
   virtual void OnWindowActivationChanged(int browser_id, bool active) {}
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
   virtual bool OnWindowKeyboardEvent(int browser_id,
                                      const CefKeyboardInputEvent& event) {
     return false;
   }
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 
   // DEPRECATED: Use OnWindowKeyboardEvent(); retained for legacy route tests.
   virtual bool OnWindowKeyEvent(int browser_id, const CefKeyEvent& event) {
@@ -313,6 +321,7 @@ class TestHandler : public CefClient,
   // --reuse-test-browsers enables reuse; without it this creates an ordinary
   // browser. Test selection is unchanged.
   // --reuse-test-browsers-timing adds lease/navigation timing logs.
+  // BrowserReuseTest also enables lifecycle/shutdown and progress logs with it.
   // --reuse-test-browsers-max limits all pool-owned browsers (default 4; zero
   // forces isolated execution). Leased and closing browsers count toward the
   // limit. A full pool evicts its least recently released idle browser and

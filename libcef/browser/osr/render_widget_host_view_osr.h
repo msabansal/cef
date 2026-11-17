@@ -178,9 +178,10 @@ class CefRenderWidgetHostViewOSR
   void UpdateTooltipUnderCursor(const std::u16string& tooltip_text) override;
   input::CursorManager* GetCursorManager() override;
   gfx::Size GetCompositorViewportPixelSize() override;
-  void CopyFromSurface(
+  void CopyFromSurfaceImpl(
       const gfx::Rect& src_rect,
       const gfx::Size& output_size,
+      bool is_copy_request_secure,
       base::TimeDelta timeout,
       base::OnceCallback<void(const content::CopyFromSurfaceResult&)> callback)
       override;
@@ -248,6 +249,9 @@ class CefRenderWidgetHostViewOSR
   void ProcessAckedTouchEvent(
       const input::TouchEventWithLatencyInfo& touch,
       blink::mojom::InputEventResultState ack_result) override;
+  void GestureEventAck(const blink::WebGestureEvent& event,
+                       blink::mojom::InputEventResultSource ack_source,
+                       blink::mojom::InputEventResultState ack_result) override;
   void OnGestureEvent(const ui::GestureEventData& gesture) override;
 
   bool InstallTransparency();
@@ -261,6 +265,7 @@ class CefRenderWidgetHostViewOSR
   void SendExternalBeginFrame();
   void SendKeyEvent(const input::NativeWebKeyboardEvent& event);
   void SendMouseEvent(const blink::WebMouseEvent& event);
+  void SendGestureEvent(const blink::WebGestureEvent& event);
   void SendMouseWheelEvent(const blink::WebMouseWheelEvent& event);
   void SendTouchEvent(const CefTouchEvent& event);
   bool ShouldRouteEvents() const;

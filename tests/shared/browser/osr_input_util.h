@@ -1,0 +1,227 @@
+// Copyright 2026 The Chromium Embedded Framework Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be found
+// in the LICENSE file.
+
+#ifndef CEF_TESTS_SHARED_BROWSER_OSR_INPUT_UTIL_H_
+#define CEF_TESTS_SHARED_BROWSER_OSR_INPUT_UTIL_H_
+#pragma once
+
+#include <initializer_list>
+#include <limits>
+#include <map>
+#include <vector>
+
+#include "include/internal/cef_types_wrappers.h"
+
+namespace client {
+
+// Map native contact identifiers to CEF's supported contacts. The first press
+// selects the popup offset for the entire sequence, including additional
+// contacts and moves outside the popup. Coordinates and offsets are in pixels;
+// convert the returned event to DIPs before sending it to the browser.
+class OsrTouchInputState {
+ public:
+  bool Update(uint64_t native_id,
+              CefTouchEvent& event,
+              bool over_popup,
+              int popup_x_offset,
+              int popup_y_offset) {
+    auto it = contacts_.find(native_id);
+    if (event.type == CEF_TET_PRESSED) {
+      if (it != contacts_.end() || contacts_.size() == 16) {
+        return false;
+      }
+      int id = 0;
+      for (;; ++id) {
+        bool used = false;
+        for (const auto& contact : contacts_) {
+          if (contact.second.id == id) {
+            used = true;
+            break;
+          }
+        }
+        if (!used) {
+          break;
+        }
+      }
+      if (contacts_.empty()) {
+        popup_x_offset_ = over_popup ? popup_x_offset : 0;
+        popup_y_offset_ = over_popup ? popup_y_offset : 0;
+      }
+      it = contacts_.emplace(native_id, CefTouchEvent()).first;
+      it->second.id = id;
+    } else if (it == contacts_.end()) {
+      return false;
+    }
+    event.id = it->second.id;
+    event.x += popup_x_offset_;
+    event.y += popup_y_offset_;
+    it->second = event;
+    if (event.type == CEF_TET_RELEASED || event.type == CEF_TET_CANCELLED) {
+      contacts_.erase(it);
+    }
+    return true;
+  }
+
+  // Cancel using the last translated position, without applying the offset
+  // again. Later native updates/releases for these contacts are ignored.
+  std::vector<CefTouchEvent> Cancel() {
+    std::vector<CefTouchEvent> events;
+    for (auto& contact : contacts_) {
+      contact.second.type = CEF_TET_CANCELLED;
+      events.push_back(contact.second);
+    }
+    contacts_.clear();
+    return events;
+  }
+
+ private:
+  std::map<uint64_t, CefTouchEvent> contacts_;
+  int popup_x_offset_ = 0;
+  int popup_y_offset_ = 0;
+};
+
+// Match Windows wheel settings without rounding partial detents or pixel
+// deltas. UINT_MAX is WHEEL_PAGESCROLL; zero disables scrolling on this axis.
+// Return DIPs for line/character settings, or signed pages for page scrolling.
+// The caller normalizes ticks so positive values mean up/left.
+inline float GetOsrWindowsWheelDelta(float ticks, uint32_t scroll_amount) {
+  if (scroll_amount == std::numeric_limits<uint32_t>::max()) {
+    return ticks > 0 ? 1.f : ticks < 0 ? -1.f : 0.f;
+  }
+  return ticks * static_cast<float>(scroll_amount) * (100.f / 3.f);
+}
+
+#if CEF_API_ADDED(15800)
+inline uint32_t OsrMouseButtonFlag(cef_mouse_button_type_t button) {
+  switch (button) {
+    case CEF_MOUSE_BUTTON_LEFT:
+      return CEF_EVENTFLAG_LEFT_MOUSE_BUTTON;
+    case CEF_MOUSE_BUTTON_MIDDLE:
+      return CEF_EVENTFLAG_MIDDLE_MOUSE_BUTTON;
+    case CEF_MOUSE_BUTTON_RIGHT:
+      return CEF_EVENTFLAG_RIGHT_MOUSE_BUTTON;
+    case CEF_MOUSE_BUTTON_BACK:
+      return CEF_EVENTFLAG_BACK_MOUSE_BUTTON;
+    case CEF_MOUSE_BUTTON_FORWARD:
+      return CEF_EVENTFLAG_FORWARD_MOUSE_BUTTON;
+    default:
+      return 0;
+  }
+}
+
+// Keep existing popup-offset/DIP conversion in the platform views. Native
+// frameworks differ in whether button-event modifiers describe the state
+// before or after the transition; portable snapshots require the latter.
+inline CefMouseInputEvent MakeOsrMouseInputEvent(
+    const CefMouseEvent& mouse,
+    const CefPoint& screen,
+    cef_mouse_input_event_type_t type,
+    cef_mouse_button_type_t button = CEF_MOUSE_BUTTON_NONE,
+    int click_count = 0) {
+  CefMouseInputEvent result;
+  result.type = type;
+  result.x = mouse.x;
+  result.y = mouse.y;
+  result.screen_x = screen.x;
+  result.screen_y = screen.y;
+  result.modifiers = mouse.modifiers;
+  result.pointer_type = CEF_POINTER_TYPE_MOUSE;
+  result.button = button;
+  result.click_count = click_count;
+  // Zero timestamp uses dispatch time, avoiding conversion between native
+  // event clocks and Chromium's monotonic clock.
+  if (type == CEF_MOUSE_EVENT_DOWN) {
+    result.modifiers |= OsrMouseButtonFlag(button);
+  } else if (type == CEF_MOUSE_EVENT_UP) {
+    result.modifiers &= ~OsrMouseButtonFlag(button);
+  } else {
+    for (auto held : {CEF_MOUSE_BUTTON_LEFT, CEF_MOUSE_BUTTON_MIDDLE,
+                      CEF_MOUSE_BUTTON_RIGHT, CEF_MOUSE_BUTTON_BACK,
+                      CEF_MOUSE_BUTTON_FORWARD}) {
+      if (result.modifiers & OsrMouseButtonFlag(held)) {
+        result.button = held;
+        break;
+      }
+    }
+  }
+  return result;
+}
+
+inline CefWheelInputEvent MakeOsrWheelInputEvent(const CefMouseEvent& mouse,
+                                                 float screen_x,
+                                                 float screen_y) {
+  CefWheelInputEvent result;
+  result.x = mouse.x;
+  result.y = mouse.y;
+  result.screen_x = screen_x;
+  result.screen_y = screen_y;
+  result.modifiers =
+      mouse.modifiers &
+      ~(CEF_EVENTFLAG_PRECISION_SCROLLING_DELTA | CEF_EVENTFLAG_SCROLL_BY_PAGE);
+  return result;
+}
+
+// Populate the unified wheel event using the same conversion as touch
+// emulation.
+inline void SetOsrWindowsWheelDelta(CefWheelInputEvent& event,
+                                    float ticks,
+                                    bool horizontal,
+                                    uint32_t scroll_amount) {
+  const bool page = scroll_amount == std::numeric_limits<uint32_t>::max();
+  event.delta_units = page ? CEF_GESTURE_SCROLL_PAGE : CEF_GESTURE_SCROLL_PIXEL;
+  const float delta = GetOsrWindowsWheelDelta(ticks, scroll_amount);
+  event.wheel_ticks_x = horizontal ? ticks : 0;
+  event.wheel_ticks_y = horizontal ? 0 : ticks;
+  event.delta_x = horizontal ? delta : 0;
+  event.delta_y = horizontal ? 0 : delta;
+}
+
+// WM_GESTURE zoom reports absolute finger separation, including on the final
+// update. Convert it to incremental pinch scales. Zero distances are ignored,
+// but must not prevent an active sequence from ending. Touchscreen pinches
+// are nested in a scroll sequence, as in Chromium's touch gesture recognizer.
+inline std::vector<CefGestureInputEvent> OsrPinchInputEventsFromWindowsZoom(
+    uint64_t distance,
+    bool begin,
+    bool end,
+    uint64_t& previous_distance) {
+  std::vector<CefGestureInputEvent> events;
+  auto append = [&](cef_gesture_input_event_type_t type, double scale = 1) {
+    CefGestureInputEvent event;
+    event.type = type;
+    event.source_device = CEF_GESTURE_DEVICE_TOUCHSCREEN;
+    event.primary_pointer_type = CEF_POINTER_TYPE_TOUCH;
+    event.pointer_count = 2;
+    event.scale = scale;
+    events.push_back(event);
+  };
+  if (begin) {
+    if (previous_distance) {
+      append(CEF_GESTURE_EVENT_PINCH_END);
+      append(CEF_GESTURE_EVENT_SCROLL_END);
+    }
+    previous_distance = distance;
+    if (distance) {
+      append(CEF_GESTURE_EVENT_SCROLL_BEGIN);
+      append(CEF_GESTURE_EVENT_PINCH_BEGIN);
+    }
+  } else if (previous_distance && distance) {
+    if (distance != previous_distance) {
+      append(CEF_GESTURE_EVENT_PINCH_UPDATE,
+             static_cast<double>(distance) / previous_distance);
+    }
+    previous_distance = distance;
+  }
+  if (end && previous_distance) {
+    append(CEF_GESTURE_EVENT_PINCH_END);
+    append(CEF_GESTURE_EVENT_SCROLL_END);
+    previous_distance = 0;
+  }
+  return events;
+}
+#endif  // CEF_API_ADDED(15800)
+
+}  // namespace client
+
+#endif  // CEF_TESTS_SHARED_BROWSER_OSR_INPUT_UTIL_H_

@@ -963,7 +963,7 @@ bool ClientHandler::OnSetFocus(CefRefPtr<CefBrowser> browser,
   return false;
 }
 
-#if CEF_API_ADDED(CEF_NEXT)
+#if CEF_API_ADDED(15800)
 bool ClientHandler::OnPreKeyboardEvent(CefRefPtr<CefBrowser> browser,
                                        const CefKeyboardInputEvent& event,
                                        const CefInputEventContext& context,
@@ -977,7 +977,7 @@ bool ClientHandler::OnPreKeyboardEvent(CefRefPtr<CefBrowser> browser,
     // from being processed in the renderer. If we instead handled the event in
     // the OnKeyboardEvent() method the space key would cause the window to
     // scroll in addition to showing the alert box.
-    if (event.type == CEF_KEYEVENT_RAWKEYDOWN)
+    if (event.type == CEF_KEY_EVENT_RAWKEYDOWN)
       test_runner::Alert(browser, "You pressed the space bar!");
     return true;
   }
@@ -1008,7 +1008,7 @@ bool ClientHandler::OnPreKeyEvent(CefRefPtr<CefBrowser> browser,
 
   return false;
 }
-#endif  // CEF_API_ADDED(CEF_NEXT)
+#endif  // CEF_API_ADDED(15800)
 
 bool ClientHandler::OnBeforePopup(
     CefRefPtr<CefBrowser> browser,

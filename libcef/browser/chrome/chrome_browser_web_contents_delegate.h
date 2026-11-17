@@ -36,6 +36,10 @@ class ChromeBrowserWebContentsDelegate : public BrowserWebContentsDelegate {
   content::KeyboardEventProcessingResult PreHandleKeyboardEvent(
       content::WebContents* source,
       const input::NativeWebKeyboardEvent& event) override;
+  bool PreHandleMouseEvent(content::WebContents* source,
+                           const blink::WebMouseEvent& event) override;
+  bool PreHandleGestureEvent(content::WebContents* source,
+                             const blink::WebGestureEvent& event) override;
   bool HandleKeyboardEvent(content::WebContents* source,
                            const input::NativeWebKeyboardEvent& event) override;
   content::PreloadingEligibility IsPrerender2Supported(
@@ -78,12 +82,6 @@ class ChromeBrowserWebContentsDelegate : public BrowserWebContentsDelegate {
       content::RenderFrameHost* requesting_frame,
       const blink::mojom::FullscreenOptions& options) override;
   void ExitFullscreenModeForTab(content::WebContents* web_contents) override;
-  void FindReply(content::WebContents* web_contents,
-                 int request_id,
-                 int number_of_matches,
-                 const gfx::Rect& selection_rect,
-                 int active_match_ordinal,
-                 bool final_update) override;
   void UpdatePreferredSize(content::WebContents* source,
                            const gfx::Size& pref_size) override;
   void ResizeDueToAutoResize(content::WebContents* source,

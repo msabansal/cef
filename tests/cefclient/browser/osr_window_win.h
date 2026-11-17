@@ -15,11 +15,14 @@
 #include "tests/cefclient/browser/osr_render_handler_win.h"
 #include "tests/cefclient/browser/osr_renderer_settings.h"
 #include "tests/shared/browser/osr_accessibility_node.h"
+#include "tests/shared/browser/osr_input_util.h"
+#include "tests/shared/browser/osr_touchpad.h"
 
 namespace client {
 
 class OsrAccessibilityHelper;
 class OsrImeHandlerWin;
+class OsrTouchpadWin;
 
 // Represents the native parent window for an off-screen browser. This object
 // must live on the CEF UI thread in order to handle CefRenderHandler callbacks.
@@ -91,6 +94,14 @@ class OsrWindowWin
 
   // WndProc message handlers.
   void OnMouseEvent(UINT message, WPARAM wParam, LPARAM lParam);
+  bool OnPointerTouchEvent(UINT message, WPARAM wParam, LPARAM lParam);
+  void EndPointerTouchScroll();
+#if CEF_API_ADDED(15800)
+  void SendMouseInput(const CefMouseEvent& mouse,
+                      cef_mouse_input_event_type_t type,
+                      cef_mouse_button_type_t button = CEF_MOUSE_BUTTON_NONE,
+                      int click_count = 0);
+#endif
   void OnSize();
   void OnFocus(bool setFocus);
   void OnCaptureLost();
@@ -98,6 +109,11 @@ class OsrWindowWin
   void OnPaint();
   bool OnEraseBkgnd();
   bool OnTouchEvent(UINT message, WPARAM wParam, LPARAM lParam);
+  void UpdateTouchpadMode();
+  void SendTouchpadEvents(const std::vector<CefTouchEvent>& events);
+#if CEF_API_ADDED(15800)
+  bool OnGestureEvent(LPARAM lParam);
+#endif
 
   void OnIMESetContext(UINT message, WPARAM wParam, LPARAM lParam);
   void OnIMEStartComposition();
@@ -197,6 +213,10 @@ class OsrWindowWin
 #endif
 
   bool hidden_ = false;
+  OsrTouchInputState touch_state_;
+  OsrTouchpadEmulator touchpad_emulator_;
+  OsrPointerTouchEmulator pointer_touch_emulator_;
+  std::unique_ptr<OsrTouchpadWin> touchpad_;
 
   // Mouse state tracking.
   POINT last_mouse_pos_;
@@ -209,6 +229,10 @@ class OsrWindowWin
   int last_click_count_ = 1;
   double last_click_time_ = 0;
   bool last_mouse_down_on_view_ = false;
+#if CEF_API_ADDED(15800)
+  // Nonzero while processing a WM_GESTURE zoom sequence.
+  uint64_t pinch_distance_ = 0;
+#endif
 };
 
 }  // namespace client

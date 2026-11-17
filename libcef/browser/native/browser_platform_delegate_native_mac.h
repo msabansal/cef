@@ -37,10 +37,10 @@ class CefBrowserPlatformDelegateNativeMac
                            bool mouseUp,
                            int clickCount) override;
   void SendMouseMoveEvent(const CefMouseEvent& event, bool mouseLeave) override;
+  void SendWheelEvent(const CefWheelInputEvent& event) override;
   void SendMouseWheelEvent(const CefMouseEvent& event,
                            int deltaX,
                            int deltaY) override;
-  void SendTouchEvent(const CefTouchEvent& event) override;
   void SetFocus(bool setFocus) override;
   gfx::Point GetScreenPoint(const gfx::Point& view,
                             bool want_dip_coords) const override;
@@ -54,17 +54,23 @@ class CefBrowserPlatformDelegateNativeMac
   bool IsPrintPreviewSupported() const override;
 
   // CefBrowserPlatformDelegateNative methods:
+  void SendWebTouchEvent(const blink::WebTouchEvent& event) override;
   // DEPRECATED: Legacy SendKeyEvent conversion; use
   // TranslateWebKeyboardInputEvent for unified keyboard input.
   input::NativeWebKeyboardEvent TranslateWebKeyEvent(
       const CefKeyEvent& key_event) const override;
+  // DEPRECATED: Retained for legacy mouse injection. Unified mouse input
+  // uses GetWebMouseInputEvent without platform conversion.
   blink::WebMouseEvent TranslateWebClickEvent(
       const CefMouseEvent& mouse_event,
       CefBrowserHost::MouseButtonType type,
       bool mouseUp,
       int clickCount) const override;
+  // DEPRECATED: Retained for legacy mouse injection. Unified mouse input
+  // uses GetWebMouseInputEvent without platform conversion.
   blink::WebMouseEvent TranslateWebMoveEvent(const CefMouseEvent& mouse_event,
                                              bool mouseLeave) const override;
+  // DEPRECATED: Unified wheel input uses GetWebWheelInputEvent.
   blink::WebMouseWheelEvent TranslateWebWheelEvent(
       const CefMouseEvent& mouse_event,
       int deltaX,
