@@ -18,6 +18,7 @@
 #include "cc/layers/deadline_policy.h"
 #include "cef/include/cef_base.h"
 #include "cef/include/cef_browser.h"
+#include "cef/include/cef_process_message.h"
 #include "cef/libcef/browser/alloy/alloy_browser_host_impl.h"
 #include "cef/libcef/browser/osr/external_begin_frame_request_state.h"
 #include "cef/libcef/browser/osr/host_display_client_osr.h"
@@ -273,16 +274,11 @@ class CefRenderWidgetHostViewOSR
   void UpdateFrameRate();
 
   gfx::Size SizeInPixels();
-  void OnVideoSinkEvent(int kind,
-                       const std::string& stream,
-                       const std::string& error,
-                       uint64_t generation,
-                       uint64_t sequence,
-                       const gfx::Size& size,
-                       uint32_t stride,
-                       int64_t timestamp_us,
-                       const void* pixels,
-                       size_t bytes);
+  // Dispatches a Reach.VideoSink.v2 |event|, first sending |announce| if
+  // set. Returns true when a frame was delivered to the client, which then
+  // owns its lease until CefReleaseReachVideoFrame().
+  bool OnVideoSinkEvent(CefRefPtr<CefProcessMessage> event,
+                        CefRefPtr<CefProcessMessage> announce);
   void OnPaint(const gfx::Rect& damage_rect,
                const gfx::Size& pixel_size,
                const void* pixels);

@@ -57,7 +57,7 @@ Chromium's original path. This patch targets Chromium `156.0.8078.0`.
 | `canvaskit_picture_images.patch` | Skia/CanvasKit original-image resources and ordered media substitution. |
 | `async_find_display_locks.patch` | Activatable display-lock scope for asynchronous text finding. |
 | `osr_popup_context.patch` | Target-owned popup widget/context lifecycle; not a VIDEO capture fallback. |
-| `video_sink.patch` | Target-specific direct Viz compositor output and release/backpressure. |
+| `video_sink.patch` | Target-specific direct Viz compositor output: a leased multi-slot snapshot ring with per-slot release, graduated outstanding-frame throttling and damage-union coalescing. The `Reach.VideoSink.v2` event and `Reach.VideoSinkRelease.v1` release require the matched agent and its `reach-video-sink-slots` switch. |
 
 Use CEF's normal `tools/patcher.py` build hook and `tools/patch_updater.py`
 maintenance workflow, described in [README.txt](README.txt). Their existing

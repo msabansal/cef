@@ -5,7 +5,10 @@
 #ifndef CEF_LIBCEF_BROWSER_OSR_HOST_DISPLAY_CLIENT_OSR_H_
 #define CEF_LIBCEF_BROWSER_OSR_HOST_DISPLAY_CLIENT_OSR_H_
 
+#include <stdint.h>
+
 #include <memory>
+#include <string>
 
 #include "base/functional/callback.h"
 #include "base/memory/raw_ptr.h"
@@ -17,6 +20,11 @@
 class CefLayeredWindowUpdaterOSR;
 class CefReachVideoSink;
 class CefRenderWidgetHostViewOSR;
+
+// Releases a direct-video frame leased to the client. Late releases for
+// retired streams are ignored; unknown or repeated releases of a live stream
+// fail that stream. Must be called on the UI thread.
+void CefReleaseReachVideoFrame(const std::string& stream, uint64_t sequence);
 
 class CefHostDisplayClientOSR : public viz::HostDisplayClient {
  public:

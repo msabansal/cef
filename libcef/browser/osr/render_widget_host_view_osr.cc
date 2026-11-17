@@ -1755,50 +1755,33 @@ uint64_t CefRenderWidgetHostViewOSR::GetNSViewId() const {
 }
 #endif  // BUILDFLAG(IS_MAC)
 
-void CefRenderWidgetHostViewOSR::OnVideoSinkEvent(
-    int kind,
-    const std::string& stream,
-    const std::string& error,
-    uint64_t generation,
-    uint64_t sequence,
-    const gfx::Size& size,
-    uint32_t stride,
-    int64_t timestamp_us,
-    const void* pixels,
-    size_t bytes) {
+bool CefRenderWidgetHostViewOSR::OnVideoSinkEvent(
+    CefRefPtr<CefProcessMessage> event,
+    CefRefPtr<CefProcessMessage> announce) {
   TRACE_EVENT0("cef", "CefRenderWidgetHostViewOSR::OnVideoSinkEvent");
+  auto values = event->GetArgumentList();
+  const int kind = values->GetInt(0);
   if (!browser_impl_ || is_destroyed_ || (kind != 2 && !is_showing_))
-    return;
-  // Reannounce the active widget when restoring a hidden root after fullscreen.
-  if (kind == 1) {
-    auto weak_this = weak_ptr_factory_.GetWeakPtr();
-    OnVideoSinkEvent(0, stream, "", 0, 0, gfx::Size(), 0, 0, nullptr, 0);
-    if (!weak_this)
-      return;
-  }
-  auto message = CefProcessMessage::Create("Reach.VideoSink.v1");
-  auto values = message->GetArgumentList();
-  values->SetInt(0, kind);
+    return false;
   values->SetInt(1, IsPopupWidget() ? 1 : 0);
-  values->SetString(2, stream);
-  values->SetString(3, std::to_string(generation));
-  values->SetString(4, std::to_string(sequence));
-  values->SetInt(5, size.width());
-  values->SetInt(6, size.height());
-  values->SetInt(7, stride);
-  values->SetString(8, std::to_string(timestamp_us));
-  if (kind == 1)
-    values->SetBinary(9, CefBinaryValue::Create(pixels, bytes));
-  values->SetString(10, error);
+  // Reannounce the active widget when restoring a hidden root after fullscreen.
+  if (announce) {
+    auto weak_this = weak_ptr_factory_.GetWeakPtr();
+    OnVideoSinkEvent(announce, nullptr);
+    if (!weak_this)
+      return false;
+  }
+  const gfx::Size size(values->GetInt(5), values->GetInt(6));
   auto browser = browser_impl_;
   auto frame = browser->GetMainFrame();
   auto weak_this = weak_ptr_factory_.GetWeakPtr();
-  browser->client()->OnProcessMessageReceived(browser, frame, PID_BROWSER, message);
+  browser->client()->OnProcessMessageReceived(browser, frame, PID_BROWSER, event);
   if (!weak_this)
-    return;
+    return kind == 1;
   if (kind == 1 && hold_resize_ &&
       size == gfx::ScaleToCeiledSize(GetViewBounds().size(), cached_scale_factor_))
     ReleaseResizeHold();
+  return kind == 1;
 }
 
 void CefRenderWidgetHostViewOSR::OnPaint(const gfx::Rect& damage_rect,

@@ -12,6 +12,7 @@
 #include "cef/include/test/cef_test_helpers.h"
 #include "cef/libcef/browser/browser_host_base.h"
 #include "cef/libcef/browser/net_service/browser_urlrequest_impl.h"
+#include "cef/libcef/browser/osr/host_display_client_osr.h"
 #include "cef/libcef/common/frame_util.h"
 #include "cef/libcef/common/net/url_util.h"
 #include "cef/libcef/common/process_message_impl.h"
@@ -19,6 +20,7 @@
 #include "cef/libcef/common/request_impl.h"
 #include "cef/libcef/common/string_util.h"
 #include "cef/libcef/common/task_runner_impl.h"
+#include "base/strings/string_number_conversions.h"
 #include "components/input/cursor_manager.h"
 #include "content/browser/renderer_host/frame_tree_node.h"
 #include "content/browser/renderer_host/render_widget_host_impl.h"
@@ -288,6 +290,27 @@ void CefFrameHostImpl::SendProcessMessage(
   }
 
   const std::string name = message->GetName();
+  if (name == "Reach.VideoSinkRelease.v1") {
+    // [stream, sequence]: returns a direct-video snapshot leased to the
+    // client. Handled in the browser process; never sent to a renderer.
+    if (!CEF_CURRENTLY_ON_UIT()) {
+      CEF_POST_TASK(CEF_UIT,
+          base::BindOnce(&CefFrameHostImpl::SendProcessMessage, this,
+                         target_process, message));
+      return;
+    }
+    const auto arguments = message->GetArgumentList();
+    uint64_t sequence = 0;
+    if (!arguments || arguments->GetSize() != 2 ||
+        arguments->GetType(0) != VTYPE_STRING ||
+        arguments->GetType(1) != VTYPE_STRING ||
+        !base::StringToUint64(arguments->GetString(1).ToString(), &sequence)) {
+      LOG(ERROR) << "Invalid Reach video frame release";
+      return;
+    }
+    CefReleaseReachVideoFrame(arguments->GetString(0).ToString(), sequence);
+    return;
+  }
   if (name == "Reach.DrawingFrame.v1" || name == "Reach.DrawingRoute.v1" ||
       name == "Reach.DrawingInput.v1" ||
       name == "Reach.CaptureDrawingCommands.v1") {

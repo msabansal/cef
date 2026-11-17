@@ -71,9 +71,12 @@ diff --git components/viz/service/display_embedder/reach_video_output_device.cc 
 new file mode 100644
 --- /dev/null
 +++ components/viz/service/display_embedder/reach_video_output_device.cc
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,203 @@
 +#include "components/viz/service/display_embedder/reach_video_output_device.h"
 +
++#include <utility>
++
++#include "base/check_op.h"
 +#include "base/functional/bind.h"
 +#include "base/logging.h"
 +#include "base/trace_event/trace_event.h"
@@ -82,12 +85,22 @@ new file mode 100644
 +
 +namespace viz {
 +
++ReachVideoOutputDevice::Slot::Slot() = default;
++ReachVideoOutputDevice::Slot::Slot(Slot&&) = default;
++ReachVideoOutputDevice::Slot& ReachVideoOutputDevice::Slot::operator=(
++    Slot&&) = default;
++ReachVideoOutputDevice::Slot::~Slot() = default;
++
 +ReachVideoOutputDevice::ReachVideoOutputDevice(
 +    mojo::PendingRemote<mojom::ReachVideoSink> sink,
-+    base::TimeDelta capture_interval)
++    base::TimeDelta capture_interval,
++    size_t slots)
 +    : sink_(std::move(sink)), capture_interval_(capture_interval) {
 +  CHECK_GE(capture_interval_, base::Milliseconds(1));
 +  CHECK_LE(capture_interval_, base::Seconds(1));
++  CHECK_GE(slots, 1u);
++  CHECK_LE(slots, kMaxSlots);
++  slots_.resize(slots);
 +  sink_.set_disconnect_handler(base::BindOnce(
 +      &ReachVideoOutputDevice::Fail, weak_factory_.GetWeakPtr(),
 +      "Reach video consumer disconnected"));
@@ -99,6 +112,7 @@ new file mode 100644
 +void ReachVideoOutputDevice::Resize(const gfx::Size& size, float scale_factor) {
 +  if (size == viewport_pixel_size_)
 +    return;
++  // Each slot holds at most 64 MiB, so the ring is bounded by slots x 64 MiB.
 +  if (size.IsEmpty() || size.width() > 8192 || size.height() > 8192 ||
 +      static_cast<uint64_t>(size.width()) * size.height() > 16 * 1024 * 1024) {
 +    Fail("Reach video output dimensions exceed the capture budget");
@@ -107,65 +121,146 @@ new file mode 100644
 +  SoftwareOutputDevice::Resize(size, scale_factor);
 +  ++generation_;
 +  pending_ = false;
++  pending_damage_ = gfx::Rect();
++  capture_timer_.Stop();
++  // Leased slots of older generations drain and are freed on release.
++  for (auto& slot : slots_) {
++    if (!slot.sequence)
++      slot.memory = {};
++  }
 +  if (!surface_)
 +    Fail("Reach video raster surface allocation failed");
 +}
 +
 +void ReachVideoOutputDevice::EndPaint() {
 +  TRACE_EVENT0("viz", "ReachVideoOutputDevice::EndPaint");
-+  if (failed_ || !surface_ || damage_rect_.IsEmpty())
++  if (failed_ || !surface_)
 +    return;
++  gfx::Rect damage = damage_rect_;
++  damage.Intersect(gfx::Rect(viewport_pixel_size_));
++  if (damage.IsEmpty())
++    return;
++  const auto now = base::TimeTicks::Now();
++  if (!pending_) {
++    first_paint_ = now;
++    pending_damage_ = damage;
++  } else {
++    pending_damage_.Union(damage);
++  }
 +  pending_ = true;
-+  pending_timestamp_ = base::TimeTicks::Now();
++  pending_timestamp_ = now;
 +  DeliverLatest();
 +}
 +
++void ReachVideoOutputDevice::ReleaseSlotForTesting(uint32_t slot,
++                                                   uint64_t sequence) {
++  Released(slot, sequence);
++}
++
++size_t ReachVideoOutputDevice::Outstanding() const {
++  size_t outstanding = 0;
++  for (const auto& slot : slots_) {
++    if (slot.sequence)
++      ++outstanding;
++  }
++  return outstanding;
++}
++
++std::optional<uint32_t> ReachVideoOutputDevice::FreeSlot() const {
++  for (size_t i = 0; i < slots_.size(); ++i) {
++    if (!slots_[i].sequence)
++      return static_cast<uint32_t>(i);
++  }
++  return std::nullopt;
++}
++
++base::TimeDelta ReachVideoOutputDevice::IntervalFor(size_t outstanding) const {
++  if (!outstanding)
++    return base::TimeDelta();
++  return capture_interval_ * static_cast<int>(outstanding);
++}
++
 +void ReachVideoOutputDevice::DeliverLatest() {
-+  if (failed_ || in_flight_ || !pending_)
++  if (failed_ || !pending_)
 +    return;
-+  const auto now = base::TimeTicks::Now();
-+  if (now < next_capture_) {
-+    if (!capture_timer_.IsRunning()) {
-+      capture_timer_.Start(
-+          FROM_HERE, next_capture_ - now,
-+          base::BindOnce(&ReachVideoOutputDevice::DeliverLatest,
-+                         weak_factory_.GetWeakPtr()));
-+    }
++  const size_t outstanding = Outstanding();
++  const std::optional<uint32_t> index = FreeSlot();
++  if (!index) {
++    // Every slot is leased: keep coalescing until the consumer releases one.
++    capture_timer_.Stop();
 +    return;
 +  }
++  const auto now = base::TimeTicks::Now();
++  const auto due = last_delivery_ + IntervalFor(outstanding);
++  if (outstanding && now < due) {
++    capture_timer_.Start(FROM_HERE, due - now,
++                         base::BindOnce(&ReachVideoOutputDevice::DeliverLatest,
++                                        weak_factory_.GetWeakPtr()));
++    return;
++  }
++  capture_timer_.Stop();
++  TRACE_EVENT2("viz", "ReachVideoOutputDevice::DeliverLatest", "slot", *index,
++               "outstanding", outstanding);
++  Slot& slot = slots_[*index];
 +  const uint32_t stride = viewport_pixel_size_.width() * 4;
-+  const size_t bytes = static_cast<size_t>(stride) * viewport_pixel_size_.height();
-+  if (!snapshot_.mapping.IsValid() || snapshot_.mapping.size() != bytes)
-+    snapshot_ = base::ReadOnlySharedMemoryRegion::Create(bytes);
-+  if (!snapshot_.IsValid()) {
++  const size_t bytes =
++      static_cast<size_t>(stride) * viewport_pixel_size_.height();
++  if (!slot.memory.IsValid() || slot.memory.mapping.size() != bytes) {
++    // Free first so a resize never holds both allocations of this slot.
++    slot.memory = {};
++    slot.memory = base::ReadOnlySharedMemoryRegion::Create(bytes);
++  }
++  if (!slot.memory.IsValid()) {
 +    Fail("Reach video snapshot allocation failed");
 +    return;
 +  }
++  auto timing = mojom::ReachVideoFrameTiming::New();
++  timing->first_paint = first_paint_;
++  timing->read_start = base::TimeTicks::Now();
 +  const auto info = SkImageInfo::Make(
 +      viewport_pixel_size_.width(), viewport_pixel_size_.height(),
 +      kBGRA_8888_SkColorType, kOpaque_SkAlphaType, SkColorSpace::MakeSRGB());
-+  if (!surface_->readPixels(info, snapshot_.mapping.memory(), stride, 0, 0)) {
++  if (!surface_->readPixels(info, slot.memory.mapping.memory(), stride, 0,
++                            0)) {
 +    Fail("Reach video raster snapshot failed");
 +    return;
 +  }
-+  auto region = snapshot_.region.Duplicate();
++  timing->read_end = base::TimeTicks::Now();
++  auto region = slot.memory.region.Duplicate();
 +  if (!region.IsValid()) {
 +    Fail("Reach video snapshot duplication failed");
 +    return;
 +  }
++  const gfx::Rect damage = delivered_generation_ == generation_
++                               ? pending_damage_
++                               : gfx::Rect(viewport_pixel_size_);
++  slot.generation = generation_;
++  slot.sequence = ++sequence_;
++  delivered_generation_ = generation_;
 +  pending_ = false;
-+  in_flight_ = true;
-+  next_capture_ = base::TimeTicks::Now() + capture_interval_;
++  pending_damage_ = gfx::Rect();
++  last_delivery_ = base::TimeTicks::Now();
++  timing->sent = last_delivery_;
 +  sink_->FrameReady(
-+      std::move(region), viewport_pixel_size_, stride, generation_, ++sequence_,
-+      pending_timestamp_,
++      *index, std::move(region), viewport_pixel_size_, stride, generation_,
++      slot.sequence, pending_timestamp_, damage,
++      static_cast<uint32_t>(outstanding + 1), std::move(timing),
 +      base::BindOnce(&ReachVideoOutputDevice::Released,
-+                     weak_factory_.GetWeakPtr()));
++                     weak_factory_.GetWeakPtr(), *index, slot.sequence));
 +}
 +
-+void ReachVideoOutputDevice::Released() {
-+  CHECK(in_flight_);
-+  in_flight_ = false;
++void ReachVideoOutputDevice::Released(uint32_t index, uint64_t sequence) {
++  if (failed_)
++    return;
++  if (index >= slots_.size() || !sequence ||
++      slots_[index].sequence != sequence) {
++    Fail("Reach video release does not match a leased snapshot slot");
++    return;
++  }
++  Slot& slot = slots_[index];
++  slot.sequence = 0;
++  if (slot.generation != generation_)
++    slot.memory = {};
 +  DeliverLatest();
 +}
 +
@@ -173,6 +268,7 @@ new file mode 100644
 +  if (failed_)
 +    return;
 +  failed_ = true;
++  capture_timer_.Stop();
 +  LOG(ERROR) << message;
 +  if (sink_.is_connected())
 +    sink_->Error(message);
@@ -183,9 +279,16 @@ diff --git components/viz/service/display_embedder/reach_video_output_device.h c
 new file mode 100644
 --- /dev/null
 +++ components/viz/service/display_embedder/reach_video_output_device.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,82 @@
 +#ifndef COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_REACH_VIDEO_OUTPUT_DEVICE_H_
 +#define COMPONENTS_VIZ_SERVICE_DISPLAY_EMBEDDER_REACH_VIDEO_OUTPUT_DEVICE_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include <optional>
++#include <string>
++#include <vector>
 +
 +#include "base/memory/read_only_shared_memory_region.h"
 +#include "base/memory/weak_ptr.h"
@@ -195,36 +298,64 @@ new file mode 100644
 +#include "components/viz/service/viz_service_export.h"
 +#include "mojo/public/cpp/bindings/remote.h"
 +#include "services/viz/privileged/mojom/compositing/display_private.mojom.h"
++#include "ui/gfx/geometry/rect.h"
 +
 +namespace viz {
 +
-+// A presentation-free software raster destination. The encoder consumer owns
-+// each immutable snapshot until its reply; intervening paints are coalesced.
++// A presentation-free software raster destination with a ring of reusable,
++// immutable snapshot slots. The consumer leases each delivered slot until its
++// reply, so several frames may be in flight. Delivery throttles progressively
++// with the number of outstanding slots: none delivers on damage immediately,
++// one waits for the base interval, more scale that interval, and a full ring
++// stops and coalesces later paints into the latest frame and its damage union.
 +class VIZ_SERVICE_EXPORT ReachVideoOutputDevice : public SoftwareOutputDevice {
 + public:
-+  explicit ReachVideoOutputDevice(
-+      mojo::PendingRemote<mojom::ReachVideoSink> sink,
-+      base::TimeDelta capture_interval);
++  static constexpr size_t kDefaultSlots = 3;
++  static constexpr size_t kMaxSlots = 8;
++
++  ReachVideoOutputDevice(mojo::PendingRemote<mojom::ReachVideoSink> sink,
++                         base::TimeDelta capture_interval,
++                         size_t slots);
 +  ~ReachVideoOutputDevice() override;
 +
 +  void Resize(const gfx::Size& size, float scale_factor) override;
 +  void EndPaint() override;
 +
++  // Releases |slot| as a consumer reply would. Mismatches fail the stream.
++  void ReleaseSlotForTesting(uint32_t slot, uint64_t sequence);
++
 + private:
++  struct Slot {
++    Slot();
++    Slot(Slot&&);
++    Slot& operator=(Slot&&);
++    ~Slot();
++
++    base::MappedReadOnlyRegion memory;
++    uint64_t generation = 0;
++    // Non-zero while leased to the consumer.
++    uint64_t sequence = 0;
++  };
++
 +  void DeliverLatest();
-+  void Released();
++  void Released(uint32_t slot, uint64_t sequence);
 +  void Fail(const std::string& message);
++  size_t Outstanding() const;
++  std::optional<uint32_t> FreeSlot() const;
++  base::TimeDelta IntervalFor(size_t outstanding) const;
 +
 +  mojo::Remote<mojom::ReachVideoSink> sink_;
-+  base::MappedReadOnlyRegion snapshot_;
++  std::vector<Slot> slots_;
 +  uint64_t generation_ = 0;
++  uint64_t delivered_generation_ = 0;
 +  uint64_t sequence_ = 0;
 +  bool pending_ = false;
++  gfx::Rect pending_damage_;
++  base::TimeTicks first_paint_;
 +  base::TimeTicks pending_timestamp_;
-+  base::TimeTicks next_capture_;
++  base::TimeTicks last_delivery_;
 +  const base::TimeDelta capture_interval_;
 +  base::OneShotTimer capture_timer_;
-+  bool in_flight_ = false;
 +  bool failed_ = false;
 +  base::WeakPtrFactory<ReachVideoOutputDevice> weak_factory_{this};
 +};
@@ -235,8 +366,12 @@ diff --git components/viz/service/display_embedder/reach_video_output_device_uni
 new file mode 100644
 --- /dev/null
 +++ components/viz/service/display_embedder/reach_video_output_device_unittest.cc
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,321 @@
 +#include "components/viz/service/display_embedder/reach_video_output_device.h"
++
++#include <memory>
++#include <string>
++#include <vector>
 +
 +#include "base/memory/read_only_shared_memory_region.h"
 +#include "base/test/task_environment.h"
@@ -249,177 +384,306 @@ new file mode 100644
 +
 +constexpr auto kCaptureInterval = base::Milliseconds(31);
 +
++struct Delivery {
++  uint32_t FirstPixel() const {
++    return static_cast<const uint32_t*>(mapping.memory())[0];
++  }
++
++  uint32_t slot = 0;
++  base::ReadOnlySharedMemoryMapping mapping;
++  gfx::Size size;
++  uint32_t stride = 0;
++  uint64_t generation = 0;
++  uint64_t sequence = 0;
++  base::TimeTicks timestamp;
++  gfx::Rect damage;
++  uint32_t outstanding = 0;
++  mojom::ReachVideoFrameTimingPtr timing;
++  mojom::ReachVideoSink::FrameReadyCallback released;
++};
++
 +class Consumer : public mojom::ReachVideoSink {
 + public:
 +  ~Consumer() override {
 +    receiver_.reset();
-+    released_.Reset();
++    deliveries_.clear();
 +  }
 +  void Started(const std::string& stream) override { stream_ = stream; }
-+  void FrameReady(base::ReadOnlySharedMemoryRegion pixels,
++  void FrameReady(uint32_t slot,
++                  base::ReadOnlySharedMemoryRegion pixels,
 +                  const gfx::Size& size,
 +                  uint32_t stride,
 +                  uint64_t generation,
 +                  uint64_t sequence,
 +                  base::TimeTicks timestamp,
++                  const gfx::Rect& damage,
++                  uint32_t outstanding,
++                  mojom::ReachVideoFrameTimingPtr timing,
 +                  FrameReadyCallback released) override {
-+    mapping_ = pixels.Map();
-+    size_ = size;
-+    stride_ = stride;
-+    generation_ = generation;
-+    sequence_ = sequence;
-+    timestamp_ = timestamp;
-+    released_ = std::move(released);
-+    ++deliveries_;
++    Delivery delivery;
++    delivery.slot = slot;
++    delivery.mapping = pixels.Map();
++    delivery.size = size;
++    delivery.stride = stride;
++    delivery.generation = generation;
++    delivery.sequence = sequence;
++    delivery.timestamp = timestamp;
++    delivery.damage = damage;
++    delivery.outstanding = outstanding;
++    delivery.timing = std::move(timing);
++    delivery.released = std::move(released);
++    deliveries_.push_back(std::move(delivery));
 +  }
 +  void Error(const std::string& message) override { error_ = message; }
 +
++  void Release(size_t index) {
++    deliveries_[index].mapping = {};
++    std::move(deliveries_[index].released).Run();
++  }
++  const Delivery& latest() const { return deliveries_.back(); }
++
 +  mojo::Receiver<mojom::ReachVideoSink> receiver_{this};
-+  base::ReadOnlySharedMemoryMapping mapping_;
-+  gfx::Size size_;
-+  uint32_t stride_ = 0;
-+  uint64_t generation_ = 0;
-+  uint64_t sequence_ = 0;
-+  base::TimeTicks timestamp_;
-+  int deliveries_ = 0;
++  std::vector<Delivery> deliveries_;
 +  std::string stream_;
 +  std::string error_;
-+  FrameReadyCallback released_;
 +};
 +
-+TEST(ReachVideoOutputDeviceTest, OwnsPixelsAndCoalescesSlowConsumerToLatest) {
-+  base::test::SingleThreadTaskEnvironment tasks(
-+      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
-+  Consumer consumer;
-+  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
-+                                kCaptureInterval);
-+  device.Resize(gfx::Size(2, 2), 1.0f);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++void Paint(ReachVideoOutputDevice& device, const gfx::Rect& damage,
++           SkColor color) {
++  device.BeginPaint(damage)->clear(color);
 +  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 1);
-+  ASSERT_TRUE(consumer.mapping_.IsValid());
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
-+  const auto sequence = consumer.sequence_;
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
-+  device.EndPaint();
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorBLUE);
++}
++
++class ReachVideoOutputDeviceTest : public testing::Test {
++ protected:
++  std::unique_ptr<ReachVideoOutputDevice> Create(
++      size_t slots,
++      base::TimeDelta interval = kCaptureInterval) {
++    auto device = std::make_unique<ReachVideoOutputDevice>(
++        consumer_.receiver_.BindNewPipeAndPassRemote(), interval, slots);
++    device->Resize(gfx::Size(2, 2), 1.0f);
++    return device;
++  }
++
++  base::test::SingleThreadTaskEnvironment tasks_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  Consumer consumer_;
++};
++
++TEST_F(ReachVideoOutputDeviceTest, SingleSlotCoalescesSlowConsumerToLatest) {
++  auto device = Create(1);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorRED);
++  tasks_.RunUntilIdle();
++  ASSERT_EQ(consumer_.deliveries_.size(), 1u);
++  ASSERT_TRUE(consumer_.latest().mapping.IsValid());
++  EXPECT_EQ(consumer_.latest().FirstPixel(), SK_ColorRED);
++  EXPECT_EQ(consumer_.latest().outstanding, 1u);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorGREEN);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorBLUE);
 +  const auto latest_paint = base::TimeTicks::Now();
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  EXPECT_EQ(consumer.deliveries_, 1);
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
-+  tasks.FastForwardBy(base::Seconds(2));
-+  consumer.mapping_ = {};
-+  std::move(consumer.released_).Run();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 2);
-+  EXPECT_GT(consumer.sequence_, sequence);
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorBLUE);
-+  EXPECT_EQ(consumer.timestamp_, latest_paint);
++  tasks_.FastForwardBy(base::Seconds(2));
++  EXPECT_EQ(consumer_.deliveries_.size(), 1u);
++  EXPECT_EQ(consumer_.latest().FirstPixel(), SK_ColorRED);
++  consumer_.Release(0);
++  tasks_.RunUntilIdle();
++  ASSERT_EQ(consumer_.deliveries_.size(), 2u);
++  EXPECT_GT(consumer_.latest().sequence, consumer_.deliveries_[0].sequence);
++  EXPECT_EQ(consumer_.latest().slot, consumer_.deliveries_[0].slot);
++  EXPECT_EQ(consumer_.latest().FirstPixel(), SK_ColorBLUE);
++  EXPECT_EQ(consumer_.latest().timestamp, latest_paint);
 +}
 +
-+TEST(ReachVideoOutputDeviceTest, ResizeDoesNotInvalidateAnOutstandingFrame) {
-+  base::test::SingleThreadTaskEnvironment tasks(
-+      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
-+  Consumer consumer;
-+  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
-+                                kCaptureInterval);
-+  device.Resize(gfx::Size(2, 2), 1.0f);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  const auto generation = consumer.generation_;
-+  device.Resize(gfx::Size(3, 2), 1.0f);
-+  device.BeginPaint(gfx::Rect(3, 2))->clear(SK_ColorGREEN);
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  EXPECT_EQ(consumer.size_, gfx::Size(2, 2));
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
-+  consumer.mapping_ = {};
-+  std::move(consumer.released_).Run();
-+  tasks.FastForwardBy(kCaptureInterval);
-+  EXPECT_EQ(consumer.size_, gfx::Size(3, 2));
-+  EXPECT_EQ(consumer.stride_, 12u);
-+  EXPECT_GT(consumer.generation_, generation);
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorGREEN);
++TEST_F(ReachVideoOutputDeviceTest, DeliversImmediatelyWhenNothingIsOutstanding) {
++  auto device = Create(3);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorRED);
++  tasks_.RunUntilIdle();
++  ASSERT_EQ(consumer_.deliveries_.size(), 1u);
++  consumer_.Release(0);
++  tasks_.RunUntilIdle();
++  // No capture-interval wait once the consumer is idle.
++  Paint(*device, gfx::Rect(2, 2), SK_ColorGREEN);
++  tasks_.RunUntilIdle();
++  ASSERT_EQ(consumer_.deliveries_.size(), 2u);
++  EXPECT_EQ(consumer_.latest().FirstPixel(), SK_ColorGREEN);
++  EXPECT_EQ(consumer_.latest().outstanding, 1u);
++  const auto& timing = *consumer_.latest().timing;
++  EXPECT_LE(timing.first_paint, timing.read_start);
++  EXPECT_LE(timing.read_start, timing.read_end);
++  EXPECT_LE(timing.read_end, timing.sent);
 +}
 +
-+TEST(ReachVideoOutputDeviceTest, CoalescesFastPaintsUntilConfiguredInterval) {
-+  base::test::SingleThreadTaskEnvironment tasks(
-+      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
-+  Consumer consumer;
-+  const auto interval = base::Milliseconds(47);
-+  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
-+                                interval);
-+  device.Resize(gfx::Size(2, 2), 1.0f);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 1);
-+  consumer.mapping_ = {};
-+  std::move(consumer.released_).Run();
-+  tasks.RunUntilIdle();
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
-+  device.EndPaint();
-+  tasks.FastForwardBy(base::Milliseconds(46));
-+  EXPECT_EQ(consumer.deliveries_, 1);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorBLUE);
++TEST_F(ReachVideoOutputDeviceTest, ThrottlesProgressivelyWithOutstandingFrames) {
++  auto device = Create(3);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorRED);
++  tasks_.RunUntilIdle();
++  ASSERT_EQ(consumer_.deliveries_.size(), 1u);
++  // One outstanding: the base interval.
++  Paint(*device, gfx::Rect(2, 2), SK_ColorGREEN);
++  tasks_.FastForwardBy(kCaptureInterval - base::Microseconds(1));
++  EXPECT_EQ(consumer_.deliveries_.size(), 1u);
++  tasks_.FastForwardBy(base::Microseconds(1));
++  ASSERT_EQ(consumer_.deliveries_.size(), 2u);
++  EXPECT_EQ(consumer_.latest().outstanding, 2u);
++  // Two outstanding: twice the base interval.
++  Paint(*device, gfx::Rect(2, 2), SK_ColorBLUE);
++  tasks_.FastForwardBy(kCaptureInterval * 2 - base::Microseconds(1));
++  EXPECT_EQ(consumer_.deliveries_.size(), 2u);
++  tasks_.FastForwardBy(base::Microseconds(1));
++  ASSERT_EQ(consumer_.deliveries_.size(), 3u);
++  EXPECT_EQ(consumer_.latest().outstanding, 3u);
++  // Every slot is distinct and none was overwritten.
++  EXPECT_NE(consumer_.deliveries_[0].slot, consumer_.deliveries_[1].slot);
++  EXPECT_NE(consumer_.deliveries_[1].slot, consumer_.deliveries_[2].slot);
++  EXPECT_NE(consumer_.deliveries_[0].slot, consumer_.deliveries_[2].slot);
++  EXPECT_EQ(consumer_.deliveries_[0].FirstPixel(), SK_ColorRED);
++  EXPECT_EQ(consumer_.deliveries_[1].FirstPixel(), SK_ColorGREEN);
++  EXPECT_EQ(consumer_.deliveries_[2].FirstPixel(), SK_ColorBLUE);
++}
++
++TEST_F(ReachVideoOutputDeviceTest, StopsWhenFullAndCoalescesLatestDamageUnion) {
++  auto device = Create(2);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorRED);
++  tasks_.RunUntilIdle();
++  Paint(*device, gfx::Rect(2, 2), SK_ColorGREEN);
++  tasks_.FastForwardBy(kCaptureInterval);
++  ASSERT_EQ(consumer_.deliveries_.size(), 2u);
++  const auto first_paint = base::TimeTicks::Now();
++  Paint(*device, gfx::Rect(0, 0, 1, 1), SK_ColorBLUE);
++  tasks_.FastForwardBy(base::Milliseconds(5));
++  Paint(*device, gfx::Rect(1, 1, 1, 1), SK_ColorYELLOW);
 +  const auto latest_paint = base::TimeTicks::Now();
-+  device.EndPaint();
-+  tasks.FastForwardBy(base::Microseconds(999));
-+  EXPECT_EQ(consumer.deliveries_, 1);
-+  tasks.FastForwardBy(base::Microseconds(1));
-+  ASSERT_EQ(consumer.deliveries_, 2);
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0],
-+            SK_ColorBLUE);
-+  EXPECT_EQ(consumer.timestamp_, latest_paint);
++  tasks_.FastForwardBy(base::Seconds(10));
++  EXPECT_EQ(consumer_.deliveries_.size(), 2u);
++  EXPECT_EQ(consumer_.deliveries_[0].FirstPixel(), SK_ColorRED);
++  EXPECT_EQ(consumer_.deliveries_[1].FirstPixel(), SK_ColorGREEN);
++  const uint32_t freed = consumer_.deliveries_[0].slot;
++  consumer_.Release(0);
++  tasks_.RunUntilIdle();
++  ASSERT_EQ(consumer_.deliveries_.size(), 3u);
++  EXPECT_EQ(consumer_.latest().slot, freed);
++  EXPECT_EQ(consumer_.latest().FirstPixel(), SK_ColorYELLOW);
++  EXPECT_EQ(consumer_.latest().damage, gfx::Rect(0, 0, 2, 2));
++  EXPECT_EQ(consumer_.latest().timestamp, latest_paint);
++  EXPECT_EQ(consumer_.latest().timing->first_paint, first_paint);
++  EXPECT_EQ(consumer_.deliveries_[1].FirstPixel(), SK_ColorGREEN);
 +}
 +
-+TEST(ReachVideoOutputDeviceTest, DoesNotCaptureWithoutNewDamage) {
-+  base::test::SingleThreadTaskEnvironment tasks(
-+      base::test::TaskEnvironment::TimeSource::MOCK_TIME);
-+  Consumer consumer;
-+  ReachVideoOutputDevice device(consumer.receiver_.BindNewPipeAndPassRemote(),
-+                                kCaptureInterval);
-+  device.Resize(gfx::Size(2, 2), 1.0f);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 1);
-+  consumer.mapping_ = {};
-+  std::move(consumer.released_).Run();
-+  tasks.FastForwardBy(base::Seconds(1));
-+  EXPECT_EQ(consumer.deliveries_, 1);
-+  device.BeginPaint(gfx::Rect());
-+  device.EndPaint();
-+  tasks.FastForwardBy(base::Seconds(1));
-+  EXPECT_EQ(consumer.deliveries_, 1);
-+  device.BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorGREEN);
-+  device.EndPaint();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 2);
-+  consumer.mapping_ = {};
-+  std::move(consumer.released_).Run();
-+  tasks.FastForwardBy(base::Seconds(1));
-+  EXPECT_EQ(consumer.deliveries_, 2);
++TEST_F(ReachVideoOutputDeviceTest, OutOfOrderReleaseFreesExactlyThatSlot) {
++  auto device = Create(3);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorRED);
++  tasks_.RunUntilIdle();
++  Paint(*device, gfx::Rect(2, 2), SK_ColorGREEN);
++  tasks_.FastForwardBy(kCaptureInterval);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorBLUE);
++  tasks_.FastForwardBy(kCaptureInterval * 2);
++  ASSERT_EQ(consumer_.deliveries_.size(), 3u);
++  const uint32_t middle = consumer_.deliveries_[1].slot;
++  consumer_.Release(1);
++  tasks_.RunUntilIdle();
++  Paint(*device, gfx::Rect(0, 0, 1, 2), SK_ColorWHITE);
++  // Two remain outstanding: twice the interval after the last delivery.
++  tasks_.FastForwardBy(kCaptureInterval * 2);
++  ASSERT_EQ(consumer_.deliveries_.size(), 4u);
++  EXPECT_EQ(consumer_.latest().slot, middle);
++  EXPECT_EQ(consumer_.latest().outstanding, 3u);
++  EXPECT_EQ(consumer_.latest().damage, gfx::Rect(0, 0, 1, 2));
++  EXPECT_EQ(consumer_.latest().FirstPixel(), SK_ColorWHITE);
++  EXPECT_EQ(consumer_.deliveries_[0].FirstPixel(), SK_ColorRED);
++  EXPECT_EQ(consumer_.deliveries_[2].FirstPixel(), SK_ColorBLUE);
++  EXPECT_TRUE(consumer_.error_.empty());
 +}
 +
-+TEST(ReachVideoOutputDeviceTest, SnapshotAndLateReplySurviveProducerTeardown) {
-+  base::test::SingleThreadTaskEnvironment tasks;
-+  Consumer consumer;
-+  auto device = std::make_unique<ReachVideoOutputDevice>(
-+      consumer.receiver_.BindNewPipeAndPassRemote(), kCaptureInterval);
-+  device->Resize(gfx::Size(2, 2), 1.0f);
-+  device->BeginPaint(gfx::Rect(2, 2))->clear(SK_ColorRED);
++TEST_F(ReachVideoOutputDeviceTest, UnknownOrRepeatedReleaseFailsExplicitly) {
++  auto device = Create(3);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorRED);
++  tasks_.RunUntilIdle();
++  ASSERT_EQ(consumer_.deliveries_.size(), 1u);
++  const auto& delivery = consumer_.deliveries_[0];
++  device->ReleaseSlotForTesting(delivery.slot, delivery.sequence);
++  device->ReleaseSlotForTesting(delivery.slot, delivery.sequence);
++  tasks_.RunUntilIdle();
++  EXPECT_FALSE(consumer_.error_.empty());
++  // A failed stream delivers nothing more.
++  Paint(*device, gfx::Rect(2, 2), SK_ColorGREEN);
++  tasks_.FastForwardBy(base::Seconds(1));
++  EXPECT_EQ(consumer_.deliveries_.size(), 1u);
++}
++
++TEST_F(ReachVideoOutputDeviceTest, UnknownSlotReleaseFailsExplicitly) {
++  auto device = Create(3);
++  device->ReleaseSlotForTesting(ReachVideoOutputDevice::kMaxSlots, 1);
++  tasks_.RunUntilIdle();
++  EXPECT_FALSE(consumer_.error_.empty());
++}
++
++TEST_F(ReachVideoOutputDeviceTest, ResizeDrainsOutstandingOlderGeneration) {
++  auto device = Create(3);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorRED);
++  tasks_.RunUntilIdle();
++  ASSERT_EQ(consumer_.deliveries_.size(), 1u);
++  const auto generation = consumer_.deliveries_[0].generation;
++  device->Resize(gfx::Size(3, 2), 1.0f);
++  Paint(*device, gfx::Rect(1, 1), SK_ColorGREEN);
++  tasks_.FastForwardBy(kCaptureInterval);
++  ASSERT_EQ(consumer_.deliveries_.size(), 2u);
++  // The outstanding old-generation slot keeps its pixels and size.
++  EXPECT_EQ(consumer_.deliveries_[0].size, gfx::Size(2, 2));
++  EXPECT_EQ(consumer_.deliveries_[0].FirstPixel(), SK_ColorRED);
++  EXPECT_NE(consumer_.latest().slot, consumer_.deliveries_[0].slot);
++  EXPECT_EQ(consumer_.latest().size, gfx::Size(3, 2));
++  EXPECT_EQ(consumer_.latest().stride, 12u);
++  EXPECT_GT(consumer_.latest().generation, generation);
++  // A new generation always reports whole-frame damage.
++  EXPECT_EQ(consumer_.latest().damage, gfx::Rect(3, 2));
++  EXPECT_EQ(consumer_.latest().outstanding, 2u);
++  EXPECT_EQ(consumer_.latest().FirstPixel(), SK_ColorGREEN);
++  consumer_.Release(0);
++  consumer_.Release(1);
++  tasks_.RunUntilIdle();
++  // Both released: the next paint is immediate and reuses a 3x2 slot.
++  Paint(*device, gfx::Rect(3, 2), SK_ColorBLUE);
++  tasks_.RunUntilIdle();
++  ASSERT_EQ(consumer_.deliveries_.size(), 3u);
++  EXPECT_EQ(consumer_.latest().outstanding, 1u);
++  EXPECT_EQ(consumer_.latest().size, gfx::Size(3, 2));
++  EXPECT_EQ(consumer_.latest().FirstPixel(), SK_ColorBLUE);
++  EXPECT_TRUE(consumer_.error_.empty());
++}
++
++TEST_F(ReachVideoOutputDeviceTest, DoesNotCaptureWithoutNewDamage) {
++  auto device = Create(3);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorRED);
++  tasks_.RunUntilIdle();
++  ASSERT_EQ(consumer_.deliveries_.size(), 1u);
++  consumer_.Release(0);
++  tasks_.FastForwardBy(base::Seconds(1));
++  EXPECT_EQ(consumer_.deliveries_.size(), 1u);
++  device->BeginPaint(gfx::Rect());
 +  device->EndPaint();
-+  tasks.RunUntilIdle();
-+  ASSERT_EQ(consumer.deliveries_, 1);
++  tasks_.FastForwardBy(base::Seconds(1));
++  EXPECT_EQ(consumer_.deliveries_.size(), 1u);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorGREEN);
++  tasks_.RunUntilIdle();
++  ASSERT_EQ(consumer_.deliveries_.size(), 2u);
++  consumer_.Release(1);
++  tasks_.FastForwardBy(base::Seconds(1));
++  EXPECT_EQ(consumer_.deliveries_.size(), 2u);
++}
++
++TEST_F(ReachVideoOutputDeviceTest, SnapshotsAndLateRepliesSurviveTeardown) {
++  auto device = Create(3);
++  Paint(*device, gfx::Rect(2, 2), SK_ColorRED);
++  tasks_.RunUntilIdle();
++  Paint(*device, gfx::Rect(2, 2), SK_ColorGREEN);
++  tasks_.FastForwardBy(kCaptureInterval);
++  ASSERT_EQ(consumer_.deliveries_.size(), 2u);
 +  device.reset();
-+  EXPECT_EQ(static_cast<const uint32_t*>(consumer.mapping_.memory())[0], SK_ColorRED);
-+  std::move(consumer.released_).Run();
-+  tasks.RunUntilIdle();
-+  EXPECT_EQ(consumer.deliveries_, 1);
++  EXPECT_EQ(consumer_.deliveries_[0].FirstPixel(), SK_ColorRED);
++  EXPECT_EQ(consumer_.deliveries_[1].FirstPixel(), SK_ColorGREEN);
++  consumer_.Release(1);
++  consumer_.Release(0);
++  tasks_.RunUntilIdle();
++  EXPECT_EQ(consumer_.deliveries_.size(), 2u);
 +}
 +
 +}  // namespace
@@ -438,7 +702,7 @@ diff --git components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
  
  #include <algorithm>
  #include <utility>
-@@ -129,10 +133,35 @@
+@@ -131,10 +135,44 @@ RootCompositorFrameSinkImpl::Create(
        std::move(params->display_client));
    auto display_controller = output_surface_provider->CreateGpuDependency(
        params->gpu_compositing, params->widget);
@@ -463,12 +727,21 @@ diff --git components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
 +        &interval_ms));
 +    CHECK_GE(interval_ms, 1);
 +    CHECK_LE(interval_ms, 1000);
++    // The matched agent always supplies its snapshot ring size.
++    int slots = 0;
++    CHECK(base::StringToInt(
++        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++            "reach-video-sink-slots"),
++        &slots));
++    CHECK_GE(slots, 1);
++    CHECK_LE(static_cast<size_t>(slots), ReachVideoOutputDevice::kMaxSlots);
 +    mojo::PendingRemote<mojom::ReachVideoSink> sink;
 +    display_client->CreateReachVideoSink(
 +        sink.InitWithNewPipeAndPassReceiver());
 +    output_surface = std::make_unique<SoftwareOutputSurface>(
 +        std::make_unique<ReachVideoOutputDevice>(
-+            std::move(sink), base::Milliseconds(interval_ms)));
++            std::move(sink), base::Milliseconds(interval_ms),
++            static_cast<size_t>(slots)));
 +  } else {
 +    output_surface = output_surface_provider->CreateOutputSurface(
 +        params->widget, params->gpu_compositing, display_client.get(),
@@ -515,7 +788,7 @@ new file mode 100644
 diff --git services/viz/privileged/mojom/compositing/display_private.mojom services/viz/privileged/mojom/compositing/display_private.mojom
 --- services/viz/privileged/mojom/compositing/display_private.mojom
 +++ services/viz/privileged/mojom/compositing/display_private.mojom
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,7 @@ module viz.mojom;
  import "gpu/ipc/common/context_result.mojom";
  import "gpu/ipc/common/surface_handle.mojom";
  import "mojo/public/mojom/base/time.mojom";
@@ -523,24 +796,41 @@ diff --git services/viz/privileged/mojom/compositing/display_private.mojom servi
  import "ui/display/mojom/display_constants.mojom";
  import "ui/gfx/mojom/ca_layer_params.mojom";
  import "ui/gfx/mojom/delegated_ink_point_renderer.mojom";
-@@ -116,6 +117,16 @@
+@@ -128,6 +129,33 @@ interface DisplayPrivate {
      display.mojom.VariableRefreshRateState vrr_state);
  };
  
-+// The reply releases the immutable snapshot. Consumers must finish reading
-+// before replying; the producer never waits for encoder completion.
++// Producer-side stage times on the same monotonic clock as |timestamp|.
++struct ReachVideoFrameTiming {
++  // EndPaint of the earliest damage coalesced into this frame.
++  mojo_base.mojom.TimeTicks first_paint;
++  mojo_base.mojom.TimeTicks read_start;
++  mojo_base.mojom.TimeTicks read_end;
++  mojo_base.mojom.TimeTicks sent;
++};
++
++// Each frame leases one producer-owned snapshot slot. The reply releases
++// exactly that slot; the producer never overwrites a leased slot. Consumers
++// reply once the snapshot has been consumed downstream, so the number of
++// outstanding replies is the real pipeline depth. The producer throttles as
++// it grows and stops, coalescing the latest damage, when every slot is leased.
 +interface ReachVideoSink {
 +  Started(string stream);
-+  FrameReady(mojo_base.mojom.ReadOnlySharedMemoryRegion pixels,
++  // |damage| is the union of damage since the previous delivered frame, or
++  // the whole frame after a generation change. |outstanding| includes this
++  // frame.
++  FrameReady(uint32 slot, mojo_base.mojom.ReadOnlySharedMemoryRegion pixels,
 +             gfx.mojom.Size size, uint32 stride, uint64 generation,
-+             uint64 sequence, mojo_base.mojom.TimeTicks timestamp) => ();
++             uint64 sequence, mojo_base.mojom.TimeTicks timestamp,
++             gfx.mojom.Rect damage, uint32 outstanding,
++             ReachVideoFrameTiming timing) => ();
 +  Error(string message);
 +};
 +
  // DisplayClient allows privileged clients to receive events from the Display.
  interface DisplayClient {
    // Called when new Core Animation Layer params are received.
-@@ -153,4 +164,6 @@
+@@ -165,4 +193,6 @@ interface DisplayClient {
    // Notifies that there is a new refresh rate preference.
    [EnableIf=can_set_refresh_rate]
    SetPreferredRefreshRate(float refresh_rate);
