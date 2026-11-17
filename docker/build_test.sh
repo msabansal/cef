@@ -36,6 +36,14 @@ python3() {
     if [[ "$1" == tools/gclient_hook.py ]]; then
         printf '%s\n' "${GN_DEFINES:-}" > "$gn_log"
     fi
+    if [[ "$1" == make_distrib.py ]]; then
+        local argument output=
+        for argument in "$@"; do
+            [[ "$argument" != --output-dir=* ]] || output=${argument#*=}
+        done
+        mkdir -p "$output/cef_binary_fixture_linux64"
+        printf 'fresh\n' > "$output/cef_binary_fixture_linux64/current"
+    fi
     return "${python_status:-0}"
 }
 autoninja() { printf 'autoninja %s\n' "$*" >> "$log"; }
@@ -73,13 +81,30 @@ fi
 mkdir -p "$src/out/Release_GN_x64"
 touch "$src/out/Release_GN_x64/libcef.so"
 package
-grep -q -- "--output-dir=$artifacts .*--no-archive" "$log" ||
+grep -q -- "--output-dir=$artifacts/.release-staging.*--no-archive" "$log" ||
     fail "Packaging did not disable compression"
+grep -q -- '--no-format' "$log" || fail "Release packaging reformatted generated SDK sources"
+printf 'stale\n' > "$artifacts/cef_binary_fixture_linux64/stale"
+package
+grep -q -- "--reuse-from=$artifacts/cef_binary_fixture_linux64" "$log" ||
+    fail "Repeated packaging did not reuse the previous runtime"
+[[ ! -e "$artifacts/cef_binary_fixture_linux64/stale" ]] ||
+    fail "Packaging retained a stale distribution file"
+if (python_status=1; package) 2>"$test_root/error"; then
+    fail "Failed packaging was accepted"
+fi
+[[ "$(< "$artifacts/cef_binary_fixture_linux64/current")" == fresh ]] ||
+    fail "Failed packaging replaced the last successful distribution"
+if (parse_args package --skip-package) 2>"$test_root/error"; then
+    fail "A packaging-only invocation was allowed to skip packaging"
+fi
+(parse_args all --skip-package; [[ $skip_package -eq 1 ]]) ||
+    fail "Compile-before-test invocation was rejected"
 [[ "$(< "$gn_log")" == "$release_gn_defines" &&
    "$release_gn_defines" == 'use_sysroot=true is_component_build=false symbol_level=1 is_cfi=false use_thin_lto=false use_remoteexec=false enable_remoting=false proprietary_codecs=true ffmpeg_branding="Chrome"' ]] ||
     fail "Default release GN arguments changed"
 ! grep -q 'update_pgo_profiles' "$log" || fail "Release build touched PGO profiles"
-[[ -z $(find "$artifacts" -mindepth 1 -print -quit 2>/dev/null) ]] ||
+[[ -z $(find "$artifacts" -mindepth 1 -maxdepth 1 -name '.*staging*' -print -quit 2>/dev/null) ]] ||
     fail "Release packaging created extra artifacts or staging directories"
 (profile=release; unset CEF_BUILD_SERVICE_PROFILE; check_service_profile) ||
     fail "Release profile was rejected by the release service"

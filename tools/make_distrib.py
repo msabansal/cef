@@ -8,6 +8,7 @@ from bazel_util import bazel_substitute, bazel_last_error, bazel_set_quiet
 from cef_version import VersionFormatter
 from clang_util import clang_format_inplace
 from date_util import *
+from distrib_copy import copy_runtime_path
 from exec_util import exec_cmd
 from file_util import *
 import fuse_gtest_files
@@ -569,8 +570,15 @@ def copy_files_list(build_dir, dst_dir, paths):
       target_path = os.path.join(dst_dir, entry['out_path']
                                  if 'out_path' in entry else entry['path'])
       make_dir(os.path.dirname(target_path), options.quiet)
-      if os.path.isdir(source_path):
+      if options.reusefrom:
+        previous_path = os.path.join(
+            options.reusefrom, os.path.relpath(target_path, output_dir))
+        copy_runtime_path(source_path, target_path, previous_path, options.quiet)
+      elif os.path.isdir(source_path):
         copy_dir(source_path, target_path, options.quiet)
+      else:
+        copy_file(source_path, target_path, options.quiet)
+      if os.path.isdir(source_path):
         if 'delete' in entry:
           for delete_path in get_files(
               os.path.join(target_path, entry['delete'])):
@@ -578,8 +586,6 @@ def copy_files_list(build_dir, dst_dir, paths):
               remove_file(delete_path, options.quiet)
             else:
               raise Exception('Refusing to delete directory: %s' % delete_path)
-      else:
-        copy_file(source_path, target_path, options.quiet)
     else:
       if 'conditional' in entry and entry['conditional']:
         sys.stdout.write('Missing conditional path: %s.\n' % source_path)
@@ -612,6 +618,11 @@ This utility builds the CEF Binary Distribution.
       dest='outputdir',
       metavar='DIR',
       help='output directory [required]')
+  parser.add_option(
+      '--reuse-from',
+      dest='reusefrom',
+      metavar='DIR',
+      help='reuse identical runtime files from an immutable Linux distribution')
   parser.add_option(
       '--distrib-subdir',
       dest='distribsubdir',
@@ -753,6 +764,13 @@ def get_platform(sys_platform):
 def validate_options(options, platform):
   if options.outputdir is None:
     return '--output-dir is required.'
+  if options.reusefrom and platform != 'linux':
+    return '--reuse-from is only supported on Linux.'
+  if options.reusefrom and not os.path.isdir(options.reusefrom):
+    return '--reuse-from must name an existing distribution directory.'
+  if options.reusefrom and get_distribution_mode(options) not in (
+      'standard', 'minimal', 'client'):
+    return '--reuse-from requires a standard, minimal or client distribution.'
   if options.minimal and options.client:
     return 'Cannot specify both --minimal and --client.'
   if options.x64build + options.armbuild + options.arm64build > 1:
@@ -899,6 +917,13 @@ def main(argv=None):
   mode = get_distribution_mode(options)
   output_dir_base, output_dir_name = get_output_name(
       cef_ver, platform, platform_arch, mode, options)
+
+  if options.reusefrom:
+    destination = os.path.realpath(os.path.join(options.outputdir, output_dir_name))
+    previous = os.path.realpath(options.reusefrom)
+    if os.path.commonpath((destination, previous)) == destination:
+      print_error('--reuse-from must be outside the distribution being replaced.')
+      return 1
 
   if not mode.endswith('symbols'):
     output_dir = create_output_dir(output_dir_name, options.outputdir)

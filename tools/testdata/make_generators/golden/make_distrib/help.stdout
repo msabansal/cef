@@ -5,6 +5,8 @@ Usage: make_distrib.py [options]
 Options:
   -h, --help            show this help message and exit
   --output-dir=DIR      output directory [required]
+  --reuse-from=DIR      reuse identical runtime files from an immutable Linux
+                        distribution
   --distrib-subdir=DISTRIBSUBDIR
                         name of the subdirectory for the distribution
   --distrib-subdir-suffix=DISTRIBSUBDIRSUFFIX

@@ -7,7 +7,7 @@ die() {
 }
 
 usage() {
-    echo "Usage: build.sh [all|sync|build|package] [--config release|debug|both] [--jobs N] [--profile release|official]"
+    echo "Usage: build.sh [all|sync|build|package] [--config release|debug|both] [--jobs N] [--profile release|official] [--skip-package]"
 }
 
 release_gn_defines='use_sysroot=true is_component_build=false symbol_level=1 is_cfi=false use_thin_lto=false use_remoteexec=false enable_remoting=false proprietary_codecs=true ffmpeg_branding="Chrome"'
@@ -22,6 +22,7 @@ parse_args() {
     config=release
     profile=release
     jobs=
+    skip_package=0
     if [[ $# -gt 0 && $1 != -* ]]; then
         command=$1
         shift
@@ -32,6 +33,10 @@ parse_args() {
     esac
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --skip-package)
+                skip_package=1
+                shift
+                ;;
             --config)
                 [[ $# -ge 2 ]] || die "--config requires a value"
                 config=$2
@@ -64,6 +69,8 @@ parse_args() {
             ;;
         *) die "Invalid profile: $profile" ;;
     esac
+    [[ $skip_package -eq 0 || "$command" == all ]] ||
+        die "--skip-package is only supported with all"
 }
 
 # Each Compose service owns exactly one profile. The official service sets
@@ -262,9 +269,43 @@ package() {
         [[ -f "$binary" ]] || die "Build first: missing $binary"
     done
     mkdir -p "$artifacts"
-    (cd "$src/cef/tools" &&
-        python3 make_distrib.py "--output-dir=$artifacts" --ninja-build \
-            --x64-build --allow-partial --no-docs --no-archive)
+    local staging previous=
+    staging=$(mktemp -d -- "$artifacts/.release-staging.XXXXXX")
+    local item
+    for item in "$artifacts"/cef_binary_*_linux64; do
+        [[ -d "$item" ]] || continue
+        if [[ -z "$previous" || "$item" -nt "$previous" ]]; then
+            previous=$item
+        fi
+    done
+    (
+        trap 'rm -rf -- "$staging"' EXIT
+        local -a reuse=()
+        [[ -z "$previous" ]] || reuse=("--reuse-from=$previous")
+        (cd "$src/cef/tools" &&
+            python3 make_distrib.py "--output-dir=$staging" --ninja-build \
+                --x64-build --allow-partial --no-docs --no-archive \
+                --no-format "${reuse[@]}") || die "make_distrib.py failed"
+        shopt -s nullglob
+        local -a dists=("$staging"/cef_binary_*_linux64)
+        [[ ${#dists[@]} -eq 1 && -d "${dists[0]}" ]] ||
+            die "Expected one cef_binary_*_linux64 distribution in $staging"
+        local dist=${dists[0]} name
+        name=${dist##*/}
+        if [[ -e "$artifacts/$name" ]]; then
+            mv -- "$artifacts/$name" "$staging/.previous" ||
+                die "Cannot retain the previous $name"
+        fi
+        if ! mv -- "$dist" "$artifacts/$name"; then
+            if [[ -e "$staging/.previous" ]] &&
+                ! mv -- "$staging/.previous" "$artifacts/$name"; then
+                trap - EXIT
+                die "Cannot restore $name; previous output retained in $staging/.previous"
+            fi
+            die "Cannot publish $name"
+        fi
+        echo "Published $artifacts/$name"
+    )
 }
 
 json_string() {
@@ -464,7 +505,8 @@ main() {
             compile
         fi
     fi
-    if [[ "$command" == all || "$command" == package ]]; then
+    if [[ "$command" == package ||
+          ( "$command" == all && "${skip_package:-0}" -eq 0 ) ]]; then
         package
     fi
 }

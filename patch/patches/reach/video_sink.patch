@@ -1,7 +1,7 @@
 diff --git components/viz/BUILD.gn components/viz/BUILD.gn
 --- components/viz/BUILD.gn
 +++ components/viz/BUILD.gn
-@@ -5,6 +5,24 @@
+@@ -5,6 +5,25 @@
  import("//build/config/ui.gni")
  import("//components/viz/viz.gni")
  import("//testing/test.gni")
@@ -21,6 +21,7 @@ diff --git components/viz/BUILD.gn components/viz/BUILD.gn
 +    "//services/viz/privileged/mojom/compositing",
 +    "//skia",
 +    "//testing/gtest",
++    "//ui/gfx:test_support",
 +    "//ui/gfx/geometry",
 +  ]
 +}

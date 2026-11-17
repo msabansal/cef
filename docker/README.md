@@ -52,7 +52,13 @@ The stock Ubuntu account is removed so the builder can retain UID/GID 1000.
 `artifacts` receives a versioned `cef_binary_*_linux64` SDK directory containing
 `Release/libcef.so`, resources, locales, headers, the wrapper source and CMake
 files. Distributions are uncompressed and API documentation is omitted to avoid
-extra work. This is a development Release build, not an official CEF release.
+extra work. Release packaging also skips reformatting generated SDK sources.
+It stages a fresh distribution and reuses byte-identical runtime files from the
+previous distribution through hard links; changed binaries are copied and
+removed files are not retained. Reuse verifies bytes, modification time and
+permissions, and falls back to copying across filesystems. Published runtime
+files must remain immutable; SDK headers and generated metadata are recreated.
+This is a development Release build, not an official CEF release.
 No GUI application is launched.
 
 ## Migrating an existing Azure Linux workspace
@@ -92,6 +98,8 @@ python3 compose.py run --rm builder package
 Or use `all` to compile and package in one invocation. Once initialized, `all`
 does not sync dependencies again unless `CHROMIUM_BUILD_COMPATIBILITY.txt`
 changes. `build` refuses to compile against a mismatched Chromium revision.
+The Reach release runner uses `all --skip-package`, runs native capture tests,
+then invokes `package`, so a failing capture gate does not recreate the SDK.
 
 To build both configurations:
 
