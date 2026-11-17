@@ -31,7 +31,10 @@ def main():
         header = (args.fixture / name).read_text()
     (output / "reach_canvas_video.h").write_text(header + "\n")
     def method_body(text, signature, result_type="void"):
-        start = text.index(result_type + " " + signature + "(")
+        match = re.search(re.escape(result_type) + r"\s+" +
+                          re.escape(signature) + r"\(", text)
+        assert match, signature
+        start = match.start()
         body = text.index("{", start)
         end, depth = body + 1, 1
         while depth:
@@ -101,12 +104,24 @@ def main():
             "\n".join(lifecycle))
         sources.append("reach_canvas_video_lifecycle_test")
         mode = (args.fixture / "third_party" / "blink" / "renderer"
-                / "platform" / "graphics" / "canvas_2d_bitmap_provider.cc")
+                / "platform" / "graphics" / "canvas_2d_resource_provider.cc")
         mode = mode.read_text()
         names = ["IsReachCommandMode", "IsReachCanvasVideoMode"]
         (output / "reach_canvas_video_mode.inc").write_text("\n".join(
-            method_body(mode, "Canvas2DBitmapProvider::" + name, "bool")
+            method_body(mode, "Canvas2DResourceProvider::" + name, "bool")
             for name in names))
+        canvas2d = (args.fixture / "third_party" / "blink" / "renderer"
+                    / "modules" / "canvas" / "canvas2d")
+        snapshot = []
+        for filename, context in [
+                ("base_rendering_context_2d.cc", "BaseRenderingContext2D"),
+                ("canvas_rendering_context_2d.cc", "CanvasRenderingContext2D")]:
+            snapshot.append(method_body(
+                (canvas2d / filename).read_text(),
+                context + "::PaintRenderingResultsToSnapshot",
+                "scoped_refptr<StaticBitmapImage>"))
+        (output / "reach_canvas_video_snapshot.inc").write_text(
+            "\n".join(snapshot))
         sources.append("reach_canvas_video_mode_test")
     for name in sources:
         source = root / "tests" / (name + ".cc")

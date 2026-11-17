@@ -104,7 +104,7 @@
 #include "third_party/blink/renderer/modules/encryptedmedia/html_media_element_encrypted_media.h"
 #include "third_party/blink/renderer/platform/bindings/script_forbidden_scope.h"
 #include "third_party/blink/renderer/platform/bindings/v8_binding.h"
-#include "third_party/blink/renderer/platform/graphics/canvas_2d_bitmap_provider.h"
+#include "third_party/blink/renderer/platform/graphics/canvas_2d_resource_provider.h"
 #include "third_party/blink/renderer/platform/graphics/compositing/paint_chunks_to_cc_layer.h"
 #include "third_party/blink/renderer/platform/graphics/paint/cull_rect.h"
 #include "third_party/blink/renderer/platform/graphics/paint/paint_artifact.h"
@@ -372,7 +372,7 @@ void ObserveMediaState(blink::LocalDOMWindow* window) {
 
 void SetDrawingFrameRequestCallback(
     std::function<void(blink::WebLocalFrame*)> callback) {
-  if (!blink::Canvas2DBitmapProvider::IsReachCommandMode()) return;
+  if (!blink::Canvas2DResourceProvider::IsReachCommandMode()) return;
   FrameRequestCallback() = std::move(callback);
   blink::SetReachFrameRequestHook(&OnFrameRequested);
   // MediaSource operations are journaled for client replay, and each one
@@ -388,7 +388,7 @@ void SetDrawingFrameRequestCallback(
 
 void SetDrawingAnimationCallback(
     std::function<void(blink::WebLocalFrame*)> callback) {
-  if (!blink::Canvas2DBitmapProvider::IsReachCommandMode())
+  if (!blink::Canvas2DResourceProvider::IsReachCommandMode())
     return;
   AnimationCallback() = std::move(callback);
 }
@@ -398,7 +398,7 @@ std::string DrawingAnimationRequest(
     std::vector<uint8_t>* output) {
   auto* frame = blink::To<blink::WebLocalFrameImpl>(web_frame)->GetFrame();
   if (!frame || !frame->IsAttached() || !frame->GetDocument() ||
-      !blink::Canvas2DBitmapProvider::IsReachCommandMode())
+      !blink::Canvas2DResourceProvider::IsReachCommandMode())
     return "Animation request frame is detached or disabled";
   if ((tick || !document.empty()) &&
       frame->GetDocument()->Token().ToString() != document)
@@ -1908,7 +1908,7 @@ std::string ApplyDrawingWheel(blink::WebLocalFrame* web_frame,
       return "Wheel scroll chain exceeds budget";
     }
     if (const auto* box = area.GetLayoutBox();
-        box && !box->StyleRef().GetScrollSnapType().is_none) {
+        box && !box->Style().GetScrollSnapType().is_none) {
       return "Scroll snapping requires command support";
     }
   }
@@ -1947,7 +1947,7 @@ std::string ApplyDrawingWheel(blink::WebLocalFrame* web_frame,
   for (auto& area : blink::ScrollableAreaTraversal(target)) {
     if (++areas > 64) return "Wheel scroll chain exceeds budget";
     if (const auto* box = area.GetLayoutBox();
-        box && !box->StyleRef().GetScrollSnapType().is_none) {
+        box && !box->Style().GetScrollSnapType().is_none) {
       return "Scroll snapping requires command support";
     }
   }
@@ -1964,7 +1964,7 @@ std::string ApplyDrawingWheel(blink::WebLocalFrame* web_frame,
     remaining = blink::ScrollOffset(consumed.unused_scroll_delta_x,
                                     consumed.unused_scroll_delta_y);
     if (const auto* box = area.GetLayoutBox()) {
-      const auto& style = box->StyleRef();
+      const auto& style = box->Style();
       if (style.OverscrollBehaviorX() != blink::EOverscrollBehavior::kAuto)
         remaining.set_x(0);
       if (style.OverscrollBehaviorY() != blink::EOverscrollBehavior::kAuto)
@@ -2068,7 +2068,7 @@ CefDrawingCommands GetDrawingFrameInfo(blink::WebLocalFrame* web_frame,
     return result;
   }
   std::optional<blink::LocalFrameView::ReachCommandCaptureScope> capture_scope;
-  if (!raster && blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
+  if (!raster && blink::Canvas2DResourceProvider::IsReachCommandMode()) {
     capture_scope.emplace(*frame->View());
   }
   frame->View()->UpdateAllLifecyclePhasesExceptPaint(
@@ -3338,7 +3338,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   }
   blink::Persistent<blink::Page> page = frame->GetPage();
   std::optional<blink::LocalFrameView::ReachCommandCaptureScope> capture_scope;
-  if (blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
+  if (blink::Canvas2DResourceProvider::IsReachCommandMode()) {
     capture_scope.emplace(*frame->View());
   }
   // Visual update requests made from here on (including by this capture's own
@@ -3442,7 +3442,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
           continue;
         auto* child = owner ? owner->ContentFrame() : nullptr;
         if (!child || DrawingFrameIdentity(child).empty() ||
-            !blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
+            !blink::Canvas2DResourceProvider::IsReachCommandMode()) {
           result.error = "Embedded plugin or unready frame requires support";
           return result;
         }
@@ -3473,7 +3473,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
   }
   std::map<uint32_t, CapturedMediaState> media_states;
   const bool canvas_video =
-      blink::Canvas2DBitmapProvider::IsReachCanvasVideoMode();
+      blink::Canvas2DResourceProvider::IsReachCanvasVideoMode();
   if (canvas_video)
     result.canvas_video.emplace();
   blink::ReachCanvasVideo::Inventory canvas_inventory;
@@ -3830,7 +3830,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
 void CompleteDrawingCapture(blink::WebLocalFrame* web_frame,
                             const std::string& expected_document,
                             const CefDrawingCommands& result) {
-  if (!blink::Canvas2DBitmapProvider::IsReachCommandMode() ||
+  if (!blink::Canvas2DResourceProvider::IsReachCommandMode() ||
       !result.error.empty() || result.picture.empty()) {
     return;
   }
@@ -3885,7 +3885,7 @@ CefDrawingCommands CaptureRasterFallback(
     blink::WebLocalFrame* web_frame, const std::string& expected_document,
     const std::map<std::string, std::vector<uint8_t>>& children) {
   CefDrawingCommands result;
-  if (!blink::Canvas2DBitmapProvider::IsReachCommandMode()) {
+  if (!blink::Canvas2DResourceProvider::IsReachCommandMode()) {
     result.error = "Raster fallback requires a command-only runtime";
     return result;
   }

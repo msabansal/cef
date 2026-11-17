@@ -110,7 +110,7 @@ template <typename T>
 T* To(WebLocalFrame* value) {
   return static_cast<T*>(value);
 }
-struct Canvas2DBitmapProvider {
+struct Canvas2DResourceProvider {
   static bool IsReachCommandMode() { return enabled; }
   static inline bool enabled = true;
 };
@@ -249,9 +249,9 @@ int main() {
     assert(DrawingAnimationRequest(&web, true, "", &output) ==
            "Animation request document identity is stale");
     assert(scripts == before);
-    blink::Canvas2DBitmapProvider::enabled = false;
+    blink::Canvas2DResourceProvider::enabled = false;
     assert(DrawingAnimationRequest(&web, false, "", &output) ==
            "Animation request frame is detached or disabled");
-    blink::Canvas2DBitmapProvider::enabled = true;
+    blink::Canvas2DResourceProvider::enabled = true;
   }
 }

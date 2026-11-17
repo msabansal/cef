@@ -117,19 +117,26 @@ Reach's integration notes now live in `docs/rbi/native-cursor.md`,
 The upstream merge advances `CHROMIUM_BUILD_COMPATIBILITY.txt` to Chromium
 `158.0.8127.0` (`a0263a621f06c736bb09a3b9eb2d093341d9266c`), whose DEPS pin
 Skia to `597c159c5d1540499f39af6231cdfa514070bce8`. This is an unqualified
-integration candidate, not a publishable native revision. The canvas and media
-journal regression manifests still describe Chromium `156.0.8078.0`.
+integration candidate, not a publishable native revision.
 
-A bounded, ordered source-applicability probe against the new immutable inputs
-found failures in `root_scrollbars`, `canvas_frames`, `canvas_video`,
-`display_lock_unlock`, and `async_find_display_locks`. In particular, the
-upstream graphics directory no longer contains `canvas_2d_bitmap_provider.cc`
-or its header. Port the affected patches without removing their behavior,
-refresh the reviewed regression inputs, and validate the complete configured
-stack before the designated native build and sandboxed runtime qualification.
-Successful application of other individual patches is not full-stack or
-ABI/runtime proof. Do not publish this merge or reuse an older native image
-under its source identity.
+The configured patch stack applies in registration order to the immutable
+Chromium inputs and their pinned dependencies. The canvas and media journal
+regression manifests now describe Chromium `158.0.8127.0`. Canvas mode helpers
+live on `Canvas2DResourceProvider`, replacing the removed bitmap provider.
+Ordinary pixel/readback paths remain upstream code; the command-mode blank
+canvas snapshot initialization delegates to the new `BaseRenderingContext2D`
+implementation. Root scrollbar and CEF glue accessors use upstream `Style()`.
+
+The display-lock unlock patch preserves Reach's unconditional ancestor repair
+and simplified-layout handling. Chromium now supplies the async-find forced
+display-lock scope itself; its registered Reach patch retains the regression
+test without duplicating production code. Frozen client source snapshots below
+remain unchanged and independently pinned.
+
+Source applicability and extracted tests are not native compilation or
+ABI/runtime proof. Rebuild on the designated VM and complete matched-client
+gates and sandboxed runtime qualification before publication. Do not reuse an
+older native image under this source identity.
 
 ## Frozen source and matched-client snapshots
 
