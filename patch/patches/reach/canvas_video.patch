@@ -417,7 +417,7 @@ index db920580029bf4d7a2944bf7392557cd59fef46e..c703baaf2987b3f03bcac1ff9ef9630a
  class LayoutVideo;
  struct PaintInfo;
 diff --git third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
-index 3e07fa0d7e03a7058ee8063d3972a603e65cfa66..763526894e7812f1ffccaf4c565074d2339d2335 100644
+index 3e07fa0d7e03a7058ee8063d3972a603e65cfa66..05881cca50b48d7ab7beccae58feedb3a72a6f2e 100644
 --- third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
 +++ third_party/blink/renderer/modules/canvas/canvas2d/canvas_rendering_context_2d.cc
 @@ -221,6 +221,7 @@ V8RenderingContext* CanvasRenderingContext2D::AsV8RenderingContext() {
@@ -428,7 +428,15 @@ index 3e07fa0d7e03a7058ee8063d3972a603e65cfa66..763526894e7812f1ffccaf4c565074d2
    if (IsHibernating()) {
      CanvasHibernationHandler::ReportHibernationEvent(
          CanvasHibernationHandler::HibernationEvent::kHibernationEndedOnReset);
-@@ -1141,6 +1142,16 @@ bool CanvasRenderingContext2D::HasBacking() const {
+@@ -1028,6 +1029,7 @@ UniqueFontSelector* CanvasRenderingContext2D::GetFontSelector() const {
+ }
+ 
+ void CanvasRenderingContext2D::Reshape(gfx::Size old_size, gfx::Size new_size) {
++  ReachCanvasVideoChanged(true);
+   if (IsHibernating()) {
+     CanvasHibernationHandler::ReportHibernationEvent(
+         CanvasHibernationHandler::HibernationEvent::kHibernationEndedOnReset);
+@@ -1141,6 +1143,16 @@ bool CanvasRenderingContext2D::HasBacking() const {
    return BaseRenderingContext2D::HasBacking();
  }
  
