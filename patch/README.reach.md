@@ -45,6 +45,7 @@ Chromium's original path. This patch targets Chromium `156.0.8078.0`.
 | `scrollbar_input.patch` | Native scrollbar input for command capture without compositor commits. |
 | `device_pixel_content_box.patch` | Keep `ResizeObserver` device-pixel boxes coherent with target-local emulated DPR in both capture modes. Apply the inspector density override before snapping size and paint offset; preserve native/page/CSS zoom, CSS boxes and ordinary non-Reach rendering. |
 | `canvas_frames.patch` | Ordinary paint-record/image drawing and bounded local/out-of-process child-frame composition; no Canvas2D retention. |
+| `command_background_animations.patch` | Keep background-color animations on Chromium's ordinary main-thread painting path during command capture; do not emit deferred compositor paint worklets. Other capture modes retain upstream compositing. |
 | `video_commands.patch` | Video paint-order markers without embedding source-decoded frames. |
 | `paint_chunks.patch` | Incremental drawing-command paint chunks. |
 | `frame_requests.patch` | On-demand command-capture visual update notifications, also waking document-scoped animation demand in Blink glue before any WebGL context exists. |
