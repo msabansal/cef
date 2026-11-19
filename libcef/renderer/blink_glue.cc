@@ -3659,9 +3659,10 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       if ((blank || (url.IsEmpty() && !journal)) &&
           !media->IsHTMLVideoElement())
         continue;
-      if (!std::isfinite(media->currentTime()) ||
-          !std::isfinite(media->playbackRate()) ||
-          media->playbackRate() < 0.25 || media->playbackRate() > 4) {
+      const double rate = media->playbackRate();
+      // Players can hold the clock at zero without giving up playback intent.
+      if (!std::isfinite(media->currentTime()) || !std::isfinite(rate) ||
+          (rate != 0 && (rate < 0.25 || rate > 4))) {
         result.error = "Media playback state is invalid";
         return result;
       }
@@ -3692,7 +3693,7 @@ CefDrawingCommands CaptureDrawingCommandsImpl(
       state.Set("time", media->currentTime());
       state.Set("paused", media->paused());
       state.Set("ended", media->ended());
-      state.Set("rate", media->playbackRate());
+      state.Set("rate", rate);
       state.Set("volume", media->volume());
       state.Set("muted", media->muted());
       state.Set("loop", media->Loop());
