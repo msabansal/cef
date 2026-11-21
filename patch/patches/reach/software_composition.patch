@@ -29,7 +29,7 @@ index 524d48f..bf7b3c7 100644
  }
  
 diff --git components/viz/service/display/software_renderer.cc components/viz/service/display/software_renderer.cc
-index 5ff25da..999fa7a 100644
+index 5ff25da..19ae5a0 100644
 --- components/viz/service/display/software_renderer.cc
 +++ components/viz/service/display/software_renderer.cc
 @@ -314,6 +314,7 @@ void SoftwareRenderer::BeginDrawingRenderPass(
@@ -101,7 +101,7 @@ index 5ff25da..999fa7a 100644
 +
 +  TRACE_EVENT2("viz", "SoftwareRenderer::ApplyRenderPassFilter",
 +               "filters", quad->filters.ToString(),
-+               "quad_rect", quad->rect.ToString());
++               "raster_rect", gfx::SkIRectToRect(needed_rect).ToString());
 +  auto image = ApplyImageFilter(filter, quad, source,
 +                               /*offset_expanded_bounds=*/true, result_rect);
 +  constexpr size_t kMaxCacheBytes = 64 * 1024 * 1024;
@@ -251,10 +251,10 @@ index 34b97b6..a1c1420 100644
    bool is_scissor_enabled_ = false;
    bool is_render_pass_transparent_ = false;
 diff --git components/viz/service/display/software_renderer_unittest.cc components/viz/service/display/software_renderer_unittest.cc
-index d0b4858..cb8811b 100644
+index d0b4858..bb2c716 100644
 --- components/viz/service/display/software_renderer_unittest.cc
 +++ components/viz/service/display/software_renderer_unittest.cc
-@@ -401,6 +401,147 @@ TEST_F(SoftwareRendererTestShouldClearRootRenderPass,
+@@ -401,6 +401,148 @@ TEST_F(SoftwareRendererTestShouldClearRootRenderPass,
        cc::ExactPixelComparator()));
  }
  
@@ -343,6 +343,7 @@ index d0b4858..cb8811b 100644
 +TEST_F(SoftwareRendererFilterCacheTest, EnlargedClipRerasterizesCachedFilter) {
 +  const gfx::Rect bounds(-20, -20, 160, 160);
 +  auto draw = [&](int size, bool damaged) {
++    device_viewport_size_ = gfx::Size(size, size);
 +    AggregatedRenderPassList list;
 +    auto* child = cc::AddRenderPass(
 +        &list, AggregatedRenderPassId{2}, bounds, gfx::Transform());
