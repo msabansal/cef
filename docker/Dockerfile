@@ -12,7 +12,7 @@ RUN --mount=type=cache,id=cef-ubuntu-apt,target=/var/cache/apt,sharing=locked \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         bash ca-certificates g++ git python3 rsync \
         tar gzip bzip2 xz-utils unzip zip curl file findutils diffutils patch \
-        procps util-linux passwd pkg-config libatomic1 \
+        procps util-linux passwd pkg-config libatomic1 qemu-user \
         libglib2.0-0t64 libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 \
         libcups2t64 libdbus-1-3 libexpat1 \
         libx11-6 libx11-xcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 \

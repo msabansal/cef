@@ -7,6 +7,7 @@ if [[ ! -f "$script_dir/build.sh" ]]; then
     exit 1
 fi
 source "$script_dir/build.sh"
+parse_args
 
 test_root=${CEF_TEST_DIRECTORY:-/work/.artifacts}/build-test-$BASHPID-$RANDOM
 mkdir -p "$test_root"
@@ -41,8 +42,8 @@ python3() {
         for argument in "$@"; do
             [[ "$argument" != --output-dir=* ]] || output=${argument#*=}
         done
-        mkdir -p "$output/cef_binary_fixture_linux64"
-        printf 'fresh\n' > "$output/cef_binary_fixture_linux64/current"
+        mkdir -p "$output/cef_binary_fixture_$distribution_platform"
+        printf 'fresh\n' > "$output/cef_binary_fixture_$distribution_platform/current"
     fi
     return "${python_status:-0}"
 }
@@ -66,6 +67,36 @@ grep -q -F 'proprietary_codecs=true' "$gn_log" ||
     fail "Build did not enable proprietary codecs"
 grep -q -F 'ffmpeg_branding="Chrome"' "$gn_log" ||
     fail "Build did not select Chrome FFmpeg codecs"
+
+(
+    parse_args build --arch arm64 --jobs 5
+    artifacts=$test_root/arm-artifacts
+    : > "$log"
+    unset GN_DEFINES
+    compile
+    [[ "$CEF_INSTALL_SYSROOT" == amd64,arm64 ]] ||
+        fail "Cross-build did not install both host and ARM64 sysroots"
+    grep -q 'gclient_hook.py Release_GN_arm64' "$log" ||
+        fail "ARM64 configuration was not generated"
+    grep -q 'autoninja -C out/Release_GN_arm64 -j 5 cefsimple chrome_sandbox' "$log" ||
+        fail "Cross-build did not target the ARM64 output"
+    mkdir -p "$src/out/Release_GN_arm64"
+    touch "$src/out/Release_GN_arm64/libcef.so"
+    package
+    grep -q -- '--arm64-build' "$log" ||
+        fail "ARM64 distribution used the x64 packaging flag"
+    [[ -f "$artifacts/cef_binary_fixture_linuxarm64/current" ]] ||
+        fail "ARM64 distribution was not published"
+)
+if (parse_args build --arch x86) 2>"$test_root/error"; then
+    fail "Unsupported target architecture was accepted"
+fi
+(
+    CEF_TARGET_ARCH=arm64 parse_args build
+    [[ "$target_arch" == arm64 ]] || fail "Compose target architecture was ignored"
+    CEF_TARGET_ARCH=arm64 parse_args build --arch x64
+    [[ "$target_arch" == x64 ]] || fail "Explicit architecture did not override Compose"
+)
 
 printf 'changed\n' > "$cef/CHROMIUM_BUILD_COMPATIBILITY.txt"
 if (compile) 2>"$test_root/error"; then

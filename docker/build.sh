@@ -7,7 +7,7 @@ die() {
 }
 
 usage() {
-    echo "Usage: build.sh [all|sync|build|package] [--config release|debug|both] [--jobs N] [--profile release|official] [--skip-package]"
+    echo "Usage: build.sh [all|sync|build|package] [--arch x64|arm64] [--config release|debug|both] [--jobs N] [--profile release|official] [--skip-package]"
 }
 
 release_gn_defines='use_sysroot=true is_component_build=false symbol_level=1 is_cfi=false use_thin_lto=false use_remoteexec=false enable_remoting=false proprietary_codecs=true ffmpeg_branding="Chrome"'
@@ -17,12 +17,28 @@ release_gn_defines='use_sysroot=true is_component_build=false symbol_level=1 is_
 official_gn_defines='use_sysroot=true is_component_build=false is_official_build=true symbol_level=1 use_debug_fission=false is_cfi=false use_remoteexec=false enable_remoting=false proprietary_codecs=true ffmpeg_branding="Chrome"'
 pgo_gs_url_base=chromium-optimization-profiles/pgo_profiles
 
+select_architecture() {
+    case "$target_arch" in
+        x64)
+            sysroot_arch=amd64
+            distribution_platform=linux64
+            ;;
+        arm64)
+            sysroot_arch=amd64,arm64
+            distribution_platform=linuxarm64
+            ;;
+        *) die "Invalid target architecture: $target_arch" ;;
+    esac
+    architecture_args=("--$target_arch-build")
+}
+
 parse_args() {
     command=all
     config=release
     profile=release
     jobs=
     skip_package=0
+    target_arch=${CEF_TARGET_ARCH:-x64}
     if [[ $# -gt 0 && $1 != -* ]]; then
         command=$1
         shift
@@ -33,6 +49,11 @@ parse_args() {
     esac
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --arch)
+                [[ $# -ge 2 ]] || die "--arch requires a value"
+                target_arch=$2
+                shift 2
+                ;;
             --skip-package)
                 skip_package=1
                 shift
@@ -71,6 +92,7 @@ parse_args() {
     esac
     [[ $skip_package -eq 0 || "$command" == all ]] ||
         die "--skip-package is only supported with all"
+    select_architecture
 }
 
 # Each Compose service owns exactly one profile. The official service sets
@@ -145,7 +167,7 @@ check_pgo_profile() {
             "--profile official to download it, or opt out by setting" \
             "OFFICIAL_GN_DEFINES with chrome_pgo_phase=0."
     v8_builtins_profile_required || return 0
-    [[ -s "$src/v8/tools/builtins-pgo/profiles/x64.profile" ]] ||
+    [[ -s "$src/v8/tools/builtins-pgo/profiles/$target_arch.profile" ]] ||
         die "The V8 builtins PGO profile is missing. Run 'all' or 'sync' with" \
             "--profile official to download it, or opt out by setting" \
             "OFFICIAL_GN_DEFINES with v8_builtins_profiling_log_file=\"\"."
@@ -212,7 +234,7 @@ sync_dependencies() {
     "$work/depot_tools/ensure_bootstrap" || return $?
     python3 "$cef/tools/automate/automate-git.py" \
         "--download-dir=$work" --no-cef-update --no-build --no-distrib \
-        --x64-build --no-chromium-history --no-depot-tools-update || return $?
+        "${architecture_args[@]}" --no-chromium-history --no-depot-tools-update || return $?
     cp "$cef/CHROMIUM_BUILD_COMPATIBILITY.txt" "$stamp"
 }
 
@@ -237,11 +259,11 @@ compile() {
             die "--profile official requires is_official_build=true in GN_DEFINES."
         check_pgo_profile
     fi
-    export CEF_INSTALL_SYSROOT=amd64
+    export CEF_INSTALL_SYSROOT=$sysroot_arch
     local name
     local -a output_configs=() ninja_args=()
     for name in "${configs[@]}"; do
-        output_configs+=("${name}_GN_x64")
+        output_configs+=("${name}_GN_$target_arch")
     done
     GN_OUT_CONFIGS=$(IFS=,; echo "${output_configs[*]}")
     export GN_OUT_CONFIGS
@@ -253,7 +275,7 @@ compile() {
     ninja_args=(-j "${jobs:-$(nproc)}")
     for name in "${configs[@]}"; do
         (cd "$src" &&
-            autoninja -C "out/${name}_GN_x64" "${ninja_args[@]}" cefsimple chrome_sandbox)
+            autoninja -C "out/${name}_GN_$target_arch" "${ninja_args[@]}" cefsimple chrome_sandbox)
     done
 }
 
@@ -265,14 +287,14 @@ package() {
     configurations
     local name binary
     for name in "${configs[@]}"; do
-        binary=$src/out/${name}_GN_x64/libcef.so
+        binary=$src/out/${name}_GN_$target_arch/libcef.so
         [[ -f "$binary" ]] || die "Build first: missing $binary"
     done
     mkdir -p "$artifacts"
     local staging previous=
     staging=$(mktemp -d -- "$artifacts/.release-staging.XXXXXX")
     local item
-    for item in "$artifacts"/cef_binary_*_linux64; do
+    for item in "$artifacts"/cef_binary_*_"$distribution_platform"; do
         [[ -d "$item" ]] || continue
         if [[ -z "$previous" || "$item" -nt "$previous" ]]; then
             previous=$item
@@ -284,12 +306,12 @@ package() {
         [[ -z "$previous" ]] || reuse=("--reuse-from=$previous")
         (cd "$src/cef/tools" &&
             python3 make_distrib.py "--output-dir=$staging" --ninja-build \
-                --x64-build --allow-partial --no-docs --no-archive \
+                "${architecture_args[@]}" --allow-partial --no-docs --no-archive \
                 --no-format "${reuse[@]}") || die "make_distrib.py failed"
         shopt -s nullglob
-        local -a dists=("$staging"/cef_binary_*_linux64)
+        local -a dists=("$staging"/cef_binary_*_"$distribution_platform")
         [[ ${#dists[@]} -eq 1 && -d "${dists[0]}" ]] ||
-            die "Expected one cef_binary_*_linux64 distribution in $staging"
+            die "Expected one cef_binary_*_$distribution_platform distribution in $staging"
         local dist=${dists[0]} name
         name=${dist##*/}
         if [[ -e "$artifacts/$name" ]]; then
@@ -419,7 +441,7 @@ write_official_manifest() {
 # Packages into a staging directory beside the published outputs, splits and
 # verifies symbols there, and only then renames the results into place.
 package_official() {
-    local out=$src/out/Release_GN_x64
+    local out=$src/out/Release_GN_$target_arch
     local llvm_bin=$src/third_party/llvm-build/Release+Asserts/bin
     [[ -f "$out/libcef.so" ]] || die "Build first: missing $out/libcef.so"
     objcopy=$llvm_bin/llvm-objcopy
@@ -427,7 +449,7 @@ package_official() {
     [[ -x "$objcopy" && -x "$readelf" ]] ||
         die "Chromium's llvm-objcopy/llvm-readelf are missing from $llvm_bin"
     [[ -f "$out/args.gn" ]] || die "Missing $out/args.gn"
-    gn_effective=$(cd "$src" && gn args out/Release_GN_x64 --list --short) ||
+    gn_effective=$(cd "$src" && gn args "out/Release_GN_$target_arch" --list --short) ||
         die "gn args failed for $out"
     [[ "$(gn_effective_value is_official_build)" == true ]] ||
         die "$out is not an is_official_build=true build"
@@ -444,12 +466,12 @@ package_official() {
         trap 'rm -rf -- "$staging"' EXIT
         (cd "$src/cef/tools" &&
             python3 make_distrib.py "--output-dir=$staging" --ninja-build \
-                --x64-build --allow-partial --no-docs --no-archive) ||
+                "${architecture_args[@]}" --allow-partial --no-docs --no-archive) ||
             die "make_distrib.py failed"
         shopt -s nullglob
-        local -a dists=("$staging"/cef_binary_*_linux64)
+        local -a dists=("$staging"/cef_binary_*_"$distribution_platform")
         [[ ${#dists[@]} -eq 1 && -d "${dists[0]}" ]] ||
-            die "Expected one cef_binary_*_linux64 distribution in $staging"
+            die "Expected one cef_binary_*_$distribution_platform distribution in $staging"
         local dist=${dists[0]} name symbols lib
         name=${dist##*/}
         symbols=$staging/${name}_release_symbols

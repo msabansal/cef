@@ -17,6 +17,9 @@ SERVICES = ('builder', OFFICIAL_SERVICE)
 
 def main(argv=None, source=None):
     source = Path(source or Path(__file__).resolve().parents[1]).resolve()
+    architecture = os.environ.get('CEF_TARGET_ARCH', 'x64')
+    if architecture not in ('x64', 'arm64'):
+        raise ValueError('CEF_TARGET_ARCH must be x64 or arm64')
     metadata = subprocess.run(['git', '-C', str(source), 'rev-parse', '--path-format=absolute',
          '--git-dir', '--git-common-dir'],
                               check=True,
@@ -35,17 +38,37 @@ def main(argv=None, source=None):
             })
     directory = source / '.artifacts'
     directory.mkdir(exist_ok=True)
-    (source / 'artifacts').mkdir(exist_ok=True)
+    artifacts = source / 'artifacts'
+    if architecture == 'arm64':
+        artifacts = artifacts / 'arm64'
+    artifacts.mkdir(parents=True, exist_ok=True)
     args = sys.argv[1:] if argv is None else argv
     if OFFICIAL_SERVICE in args:
-        (source / 'artifacts' / 'official').mkdir(exist_ok=True)
+        (artifacts / 'official').mkdir(exist_ok=True)
     override = directory / ('compose-metadata-' + uuid.uuid4().hex + '.json')
     env = os.environ.copy()
     env['CEF_SOURCE_DIRECTORY'] = str(source)
     try:
         with override.open('x', encoding='utf-8') as output:
-            json.dump({'services': {service: {'volumes': mounts} for service in SERVICES}},
-                      output)
+            services = {
+                service: {
+                    'volumes': list(mounts)
+                } for service in SERVICES
+            }
+            if architecture == 'arm64':
+                for service in SERVICES:
+                    destination = artifacts
+                    if service == OFFICIAL_SERVICE:
+                        destination = artifacts / 'official'
+                    services[service]['volumes'].append({
+                        'type': 'bind',
+                        'source': str(destination),
+                        'target': '/artifacts',
+                        'bind': {
+                            'create_host_path': False
+                        }
+                    })
+            json.dump({'services': services}, output)
         return subprocess.run(['docker', 'compose', '-f', str(source / 'docker' / 'compose.yaml'),
              '-f', str(override), *args],
                               env=env).returncode

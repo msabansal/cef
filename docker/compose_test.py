@@ -120,6 +120,47 @@ class ComposeTest(unittest.TestCase):
                                    '--profile', 'official'], self.native))
         self.assertTrue((self.native / 'artifacts' / 'official').is_dir())
 
+    def test_arm64_target_keeps_amd64_builder_and_separate_artifacts(self):
+        original_run = subprocess.run
+        observed = []
+
+        def run(command, **kwargs):
+            if command[0] != 'docker':
+                return original_run(command, **kwargs)
+            configs = [
+                Path(command[i + 1])
+                for i, arg in enumerate(command)
+                if arg == '-f'
+            ]
+            observed.append(json.loads(configs[-1].read_text()))
+            return subprocess.CompletedProcess(command, 0)
+
+        with mock.patch.dict(os.environ, {'CEF_TARGET_ARCH': 'arm64'}):
+            with mock.patch.object(self.compose.subprocess,
+                                   'run',
+                                   side_effect=run):
+                self.assertEqual(0, self.compose.main(['config'], self.native))
+        for service in self.compose.SERVICES:
+            mounts = observed[0]['services'][service]['volumes']
+            self.assertEqual(1, len(mounts))
+            expected = self.native / 'artifacts' / 'arm64'
+            if service == self.compose.OFFICIAL_SERVICE:
+                expected = expected / 'official'
+            self.assertEqual(str(expected), mounts[0]['source'])
+            self.assertEqual('/artifacts', mounts[0]['target'])
+            self.assertFalse(mounts[0]['bind']['create_host_path'])
+            self.assertIn('platform: linux/amd64', self.service_block(service))
+        self.assertTrue((self.native / 'artifacts' / 'arm64').is_dir())
+        self.assertFalse((self.native / 'artifacts' / 'official').exists())
+
+    def test_invalid_target_does_not_launch_docker_or_create_artifacts(self):
+        with mock.patch.dict(os.environ, {'CEF_TARGET_ARCH': 'x86'}):
+            with mock.patch.object(self.compose.subprocess, 'run') as run:
+                with self.assertRaisesRegex(ValueError, 'x64 or arm64'):
+                    self.compose.main(['config'], self.native)
+                run.assert_not_called()
+        self.assertFalse((self.native / 'artifacts').exists())
+
     def service_block(self, name):
         text = (self.root / 'docker' / 'compose.yaml').read_text()
         start = text.index('\n  ' + name + ':\n')

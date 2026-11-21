@@ -3,7 +3,7 @@
 The builder uses `ubuntu:26.10`, the latest stable Ubuntu release as of
 October 29, 2026. The version is explicit because `ubuntu:latest` tracks the
 latest LTS release rather than the newest interim release.
-It builds Linux x64 binaries, not Windows binaries. No database, Docker-in-Docker,
+It builds Linux x64 or cross-compiled Linux ARM64 binaries, not Windows binaries. No database, Docker-in-Docker,
 or additional service containers are needed.
 The custom entrypoint is Bash (`docker/build.sh`). Python is installed only
 because CEF and Chromium's upstream build tools require it.
@@ -112,6 +112,28 @@ Release outputs in the volume, so it may include an older, previously built
 configuration; use `--config both` to refresh both before distributing them.
 Without `--jobs`, the builder uses `nproc` to run one parallel job per available
 container CPU. Use `--jobs N` to lower concurrency if Docker runs out of memory.
+
+## ARM64 cross-compilation
+
+The builder remains `linux/amd64`; only the Chromium target changes. Set
+`CEF_TARGET_ARCH=arm64` on the host before invoking `compose.py`:
+
+```sh
+CEF_TARGET_ARCH=arm64 python3 compose.py run --rm builder all
+```
+
+This installs the amd64 host and arm64 target sysroots, generates
+`Release_GN_arm64` and packages `cef_binary_*_linuxarm64` beneath
+`artifacts/arm64`. Existing x64 outputs and distributions are retained.
+`build.sh --arch arm64` selects the target explicitly, but use the host
+environment variable with Compose so its artifact mount also selects ARM64.
+The shared source/toolchain workspace stays locked during either build.
+
+The image includes user-mode QEMU for ARM64 unit tests on the x64 build VM.
+Compilation uses native x64 Clang, not emulation. Emulated unit tests are not
+browser or sandbox qualification; run browser checks on a native ARM64 host.
+Reach currently publishes ARM64 only as release candidates, not official or
+Azure-deployable artifacts.
 
 ## What is retained
 
