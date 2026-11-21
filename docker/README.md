@@ -129,7 +129,11 @@ This installs the amd64 host and arm64 target sysroots, generates
 environment variable with Compose so its artifact mount also selects ARM64.
 The shared source/toolchain workspace stays locked during either build.
 
-The image includes user-mode QEMU for ARM64 unit tests on the x64 build VM.
+The image includes user-mode QEMU and a pinned ARM64 Bookworm runtime at
+`/opt/reach-arm64-unit-runtime` for unit tests on the x64 build VM.
+Chromium's sysroot remains compile-only. Run target unit tests with
+`--single-process-tests` because ARM64 child executables cannot launch natively
+on that host.
 Compilation uses native x64 Clang, not emulation. Emulated unit tests are not
 browser or sandbox qualification; run browser checks on a native ARM64 host.
 Reach currently publishes ARM64 only as release candidates, not official or

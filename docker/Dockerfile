@@ -1,6 +1,12 @@
 # syntax=docker/dockerfile:1
 ARG BASE_IMAGE=ubuntu:26.10
+# Copy a runnable target userspace; no ARM64 build step executes under emulation.
+ARG ARM64_UNIT_RUNTIME_IMAGE=buildpack-deps:bookworm@sha256:f719cedddb6ca673716cb4564b9298bbaa7fea8b4ae8a78e4ead2b2299ed6c62
+FROM --platform=linux/arm64 ${ARM64_UNIT_RUNTIME_IMAGE} AS arm64-unit-runtime
+
 FROM ${BASE_IMAGE} AS builder
+COPY --from=arm64-unit-runtime /lib/aarch64-linux-gnu/ /opt/reach-arm64-unit-runtime/lib/aarch64-linux-gnu/
+COPY --from=arm64-unit-runtime /lib/ld-linux-aarch64.so.1 /opt/reach-arm64-unit-runtime/lib/
 
 # Chromium supplies the target sysroot and Clang. These packages also support
 # executing host tools that are built against that sysroot. Standalone Skia's
