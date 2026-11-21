@@ -2,10 +2,12 @@
 ARG BASE_IMAGE=ubuntu:26.10
 # Copy a runnable target userspace; no ARM64 build step executes under emulation.
 ARG ARM64_UNIT_RUNTIME_IMAGE=buildpack-deps:bookworm@sha256:f719cedddb6ca673716cb4564b9298bbaa7fea8b4ae8a78e4ead2b2299ed6c62
+ARG UNIT_PACKAGE_BUILDER_IMAGE=buildpack-deps:bookworm@sha256:cba7fa3c133e3110d747518182a10a8f969691e6788abea5f454ce7f83de1542
 FROM --platform=linux/arm64 ${ARM64_UNIT_RUNTIME_IMAGE} AS arm64-unit-runtime
 
-FROM --platform=linux/amd64 ${ARM64_UNIT_RUNTIME_IMAGE} AS arm64-unit-packages
-RUN mkdir -p /packages/partial /runtime \
+FROM --platform=linux/amd64 ${UNIT_PACKAGE_BUILDER_IMAGE} AS arm64-unit-packages
+RUN test "$(dpkg --print-architecture)" = amd64 \
+    && mkdir -p /packages/partial /runtime \
     && dpkg --add-architecture arm64 \
     && apt-get update \
     && apt-get install --download-only -y --no-install-recommends \
