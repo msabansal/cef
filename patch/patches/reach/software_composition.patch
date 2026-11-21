@@ -1,0 +1,307 @@
+diff --git components/viz/common/display/renderer_settings.h components/viz/common/display/renderer_settings.h
+index aa97b3d..0ac0dc0 100644
+--- components/viz/common/display/renderer_settings.h
++++ components/viz/common/display/renderer_settings.h
+@@ -28,6 +28,8 @@ class VIZ_COMMON_EXPORT RendererSettings {
+   bool force_antialiasing = false;
+   bool force_blending_with_shaders = false;
+   bool partial_swap_enabled = false;
++  // Set locally by the Reach VIDEO sink, not transported in renderer settings.
++  bool cache_render_pass_filters = false;
+   bool should_clear_root_render_pass = true;
+   bool release_overlay_resources_after_gpu_query = false;
+   bool dont_round_texture_sizes_for_pixel_tests = false;
+diff --git components/viz/service/display/direct_renderer.cc components/viz/service/display/direct_renderer.cc
+index 524d48f..bf7b3c7 100644
+--- components/viz/service/display/direct_renderer.cc
++++ components/viz/service/display/direct_renderer.cc
+@@ -93,8 +93,10 @@ DirectRenderer::DirectRenderer(const RendererSettings* settings,
+       output_surface_(output_surface),
+       resource_provider_(resource_provider),
+       overlay_processor_(overlay_processor),
+-      allow_undamaged_nonroot_render_pass_to_skip_(base::FeatureList::IsEnabled(
+-          features::kAllowUndamagedNonrootRenderPassToSkip)) {
++      allow_undamaged_nonroot_render_pass_to_skip_(
++          settings->cache_render_pass_filters ||
++          base::FeatureList::IsEnabled(
++              features::kAllowUndamagedNonrootRenderPassToSkip)) {
+   DCHECK(output_surface_);
+ }
+ 
+diff --git components/viz/service/display/software_renderer.cc components/viz/service/display/software_renderer.cc
+index 5ff25da..e0da92b 100644
+--- components/viz/service/display/software_renderer.cc
++++ components/viz/service/display/software_renderer.cc
+@@ -314,6 +314,7 @@ void SoftwareRenderer::BeginDrawingRenderPass(
+   } else {
+     auto it = render_pass_bitmaps_.find(render_pass->id);
+     CHECK(it != render_pass_bitmaps_.end());
++    InvalidateRenderPassFilter(it->second);
+     SkBitmap& bitmap = it->second.bitmap;
+ 
+     current_framebuffer_canvas_ = std::make_unique<SkCanvas>(
+@@ -644,9 +645,9 @@ void SoftwareRenderer::DrawRenderPassQuad(
+       SkIRect result_rect;
+       // TODO(ajuma): Apply the filter in the same pass as the content where
+       // possible (e.g. when there's no origin offset). See crbug.com/308201.
+-      filter_image = ApplyImageFilter(
++      filter_image = ApplyRenderPassFilter(
+           image_filter.get(), quad, source_bitmap ? *source_bitmap : SkBitmap(),
+-          /*offset_expanded_bounds=*/true, &result_rect);
++          &result_rect);
+       if (result_rect.isEmpty()) {
+         return;
+       }
+@@ -930,6 +931,66 @@ bool SoftwareRenderer::ShouldApplyBackdropFilters(
+   return true;
+ }
+ 
++void SoftwareRenderer::InvalidateRenderPassFilter(
++    RenderPassBitmapBacking& backing) {
++  if (!backing.filtered) {
++    return;
++  }
++  render_pass_filter_cache_bytes_ -=
++      backing.filtered->image->imageInfo().computeMinByteSize();
++  --render_pass_filter_cache_entries_;
++  backing.filtered.reset();
++}
++
++sk_sp<SkImage> SoftwareRenderer::ApplyRenderPassFilter(
++    SkImageFilter* filter,
++    const AggregatedRenderPassDrawQuad* quad,
++    const SkBitmap& source,
++    SkIRect* result_rect) {
++  auto it = render_pass_bitmaps_.find(quad->render_pass_id);
++  // Reference filters can retain arbitrary external resources. Cache only
++  // self-contained operations and owned render-pass backings.
++  const bool can_cache = settings_->cache_render_pass_filters &&
++                         !quad->filters.HasReferenceFilter() &&
++                         it != render_pass_bitmaps_.end();
++  if (can_cache) {
++    const auto& cached = it->second.filtered;
++    if (cached && cached->filters == quad->filters &&
++        cached->rect == quad->rect &&
++        cached->origin == quad->filters_origin &&
++        cached->scale == quad->filters_scale) {
++      TRACE_EVENT0("viz", "SoftwareRenderer::RenderPassFilterCacheHit");
++      ++render_pass_filter_cache_hits_;
++      *result_rect = cached->result_rect;
++      return cached->image;
++    }
++    InvalidateRenderPassFilter(it->second);
++  }
++
++  TRACE_EVENT0("viz", "SoftwareRenderer::ApplyRenderPassFilter");
++  auto image = ApplyImageFilter(filter, quad, source,
++                               /*offset_expanded_bounds=*/true, result_rect);
++  constexpr size_t kMaxCacheBytes = 64 * 1024 * 1024;
++  constexpr size_t kMaxCacheEntries = 32;
++  if (!can_cache || !image ||
++      image->imageInfo().computeMinByteSize() > kMaxCacheBytes) {
++    return image;
++  }
++  const size_t bytes = image->imageInfo().computeMinByteSize();
++  if (render_pass_filter_cache_bytes_ > kMaxCacheBytes - bytes ||
++      render_pass_filter_cache_entries_ == kMaxCacheEntries) {
++    for (auto& [id, backing] : render_pass_bitmaps_) {
++      InvalidateRenderPassFilter(backing);
++    }
++  }
++  it->second.filtered = std::make_unique<FilteredRenderPass>(
++      quad->filters, quad->rect, quad->filters_origin, quad->filters_scale,
++      *result_rect, image);
++  render_pass_filter_cache_bytes_ += bytes;
++  ++render_pass_filter_cache_entries_;
++  return image;
++}
++
+ // Applies |filter| to |to_filter| bitmap. |result_rect| will be filled with the
+ // automatically-computed destination bounds. If |offset_expanded_bounds| is
+ // true, the bitmap will be offset for any pixel-moving filters. This function
+@@ -1195,8 +1256,10 @@ void SoftwareRenderer::UpdateRenderPassTextures(
+ 
+   // Delete RenderPass bitmaps from the previous frame that will not be used
+   // again.
+-  for (const AggregatedRenderPassId& id : passes_to_delete)
++  for (const AggregatedRenderPassId& id : passes_to_delete) {
++    InvalidateRenderPassFilter(render_pass_bitmaps_.at(id));
+     render_pass_bitmaps_.erase(id);
++  }
+ }
+ 
+ void SoftwareRenderer::AllocateRenderPassResourceIfNeeded(
+diff --git components/viz/service/display/software_renderer.h components/viz/service/display/software_renderer.h
+index 34b97b6..002c5e7 100644
+--- components/viz/service/display/software_renderer.h
++++ components/viz/service/display/software_renderer.h
+@@ -9,11 +9,14 @@
+ 
+ #include "base/memory/raw_ptr.h"
+ #include "build/build_config.h"
++#include "cc/paint/filter_operations.h"
+ #include "components/viz/common/quads/aggregated_render_pass.h"
+ #include "components/viz/service/display/direct_renderer.h"
+ #include "components/viz/service/display/display_resource_provider_software.h"
+ #include "components/viz/service/viz_service_export.h"
++#include "ui/gfx/geometry/point_f.h"
+ #include "ui/gfx/geometry/rect.h"
++#include "ui/gfx/geometry/vector2d_f.h"
+ #include "ui/latency/latency_info.h"
+ 
+ namespace viz {
+@@ -41,6 +44,10 @@ class VIZ_SERVICE_EXPORT SoftwareRenderer : public DirectRenderer {
+ 
+   void SwapBuffers(SwapFrameData swap_frame_data) override;
+ 
++  size_t GetRenderPassFilterCacheHitsForTesting() const {
++    return render_pass_filter_cache_hits_;
++  }
++
+  protected:
+   bool CanPartialSwap() override;
+   void UpdateRenderPassTextures(
+@@ -76,10 +83,26 @@ class VIZ_SERVICE_EXPORT SoftwareRenderer : public DirectRenderer {
+       const AggregatedRenderPassId& render_pass_id) const override;
+ 
+  private:
++  struct FilteredRenderPass {
++    cc::FilterOperations filters;
++    gfx::Rect rect;
++    gfx::PointF origin;
++    gfx::Vector2dF scale;
++    SkIRect result_rect;
++    sk_sp<SkImage> image;
++  };
++
+   struct RenderPassBitmapBacking {
+     SkBitmap bitmap;
+     gfx::Rect drawn_rect;
++    std::unique_ptr<FilteredRenderPass> filtered;
+   };
++  void InvalidateRenderPassFilter(RenderPassBitmapBacking& backing);
++  sk_sp<SkImage> ApplyRenderPassFilter(
++      SkImageFilter* filter,
++      const AggregatedRenderPassDrawQuad* quad,
++      const SkBitmap& source,
++      SkIRect* result_rect);
+   void ClearCanvas(SkColor color);
+   void ClearFramebuffer();
+   void SetClipRect(const gfx::Rect& rect);
+@@ -133,6 +156,9 @@ class VIZ_SERVICE_EXPORT SoftwareRenderer : public DirectRenderer {
+   // A map from RenderPass id to the bitmap used to draw the RenderPass from.
+   base::flat_map<AggregatedRenderPassId, RenderPassBitmapBacking>
+       render_pass_bitmaps_;
++  size_t render_pass_filter_cache_bytes_ = 0;
++  size_t render_pass_filter_cache_entries_ = 0;
++  size_t render_pass_filter_cache_hits_ = 0;
+ 
+   bool is_scissor_enabled_ = false;
+   bool is_render_pass_transparent_ = false;
+diff --git components/viz/service/display/software_renderer_unittest.cc components/viz/service/display/software_renderer_unittest.cc
+index d0b4858..f38c98d 100644
+--- components/viz/service/display/software_renderer_unittest.cc
++++ components/viz/service/display/software_renderer_unittest.cc
+@@ -401,6 +401,90 @@ TEST_F(SoftwareRendererTestShouldClearRootRenderPass,
+       cc::ExactPixelComparator()));
+ }
+ 
++class SoftwareRendererFilterCacheTest : public SoftwareRendererTest {
++ public:
++  void SetUp() override {
++    renderer_settings_.cache_render_pass_filters = true;
++    renderer_settings_.partial_swap_enabled = true;
++    renderer_settings_.disable_render_pass_bypassing = true;
++    SoftwareRendererTest::SetUp();
++  }
++
++  void DrawFiltered(const gfx::Rect& damage,
++                    SkColor4f source,
++                    float brightness,
++                    std::vector<ExpectedImageRect> expected) {
++    AggregatedRenderPassList list;
++    const gfx::Rect bounds(20, 20, 60, 60);
++    auto* child = cc::AddRenderPass(
++        &list, AggregatedRenderPassId{2}, bounds, gfx::Transform());
++    child->damage_rect = damage;
++    child->has_damage_from_contributing_content = !damage.IsEmpty();
++    cc::AddQuad(child, bounds, source);
++    auto* root = cc::AddRenderPass(&list, AggregatedRenderPassId{1},
++                                  gfx::Rect(100, 100), gfx::Transform());
++    cc::AddRenderPassQuad(root, child);
++    auto* quad = root->quad_list.front()
++                     ->DynamicCast<AggregatedRenderPassDrawQuad>();
++    quad->filters.Append(
++        cc::FilterOperation::CreateBrightnessFilter(brightness));
++    cc::AddQuad(root, gfx::Rect(100, 100), SkColors::kGreen);
++    expected.insert(expected.begin(),
++                    {.rect = gfx::Rect(100, 100), .color = SkColors::kGreen});
++    ASSERT_TRUE(RunPixelTest(
++        &list, GenerateExpectedImage(gfx::Size(100, 100), std::move(expected)),
++        cc::ExactPixelComparator()));
++  }
++};
++
++TEST_F(SoftwareRendererFilterCacheTest,
++       ReusesUnchangedSourceAndInvalidatesDamageAndFilterChanges) {
++  const gfx::Rect bounds(20, 20, 60, 60);
++  const gfx::Rect damage(20, 20, 1, 1);
++  DrawFiltered(bounds, SkColors::kRed, 0.5f,
++               {{.rect = bounds, .color = {0.5f, 0.f, 0.f, 1.f}}});
++  EXPECT_EQ(software_renderer_->GetRenderPassFilterCacheHitsForTesting(), 0u);
++  DrawFiltered(gfx::Rect(), SkColors::kRed, 0.5f,
++               {{.rect = bounds, .color = {0.5f, 0.f, 0.f, 1.f}}});
++  EXPECT_EQ(software_renderer_->GetRenderPassFilterCacheHitsForTesting(), 1u);
++
++  DrawFiltered(damage, SkColors::kBlue, 0.5f,
++               {{.rect = bounds, .color = {0.5f, 0.f, 0.f, 1.f}},
++                {.rect = damage, .color = {0.f, 0.f, 0.5f, 1.f}}});
++  EXPECT_EQ(software_renderer_->GetRenderPassFilterCacheHitsForTesting(), 1u);
++  DrawFiltered(gfx::Rect(), SkColors::kBlue, 0.25f,
++               {{.rect = bounds, .color = {0.25f, 0.f, 0.f, 1.f}},
++                {.rect = damage, .color = {0.f, 0.f, 0.25f, 1.f}}});
++  EXPECT_EQ(software_renderer_->GetRenderPassFilterCacheHitsForTesting(), 1u);
++  DrawFiltered(gfx::Rect(), SkColors::kBlue, 0.25f,
++               {{.rect = bounds, .color = {0.25f, 0.f, 0.f, 1.f}},
++                {.rect = damage, .color = {0.f, 0.f, 0.25f, 1.f}}});
++  EXPECT_EQ(software_renderer_->GetRenderPassFilterCacheHitsForTesting(), 2u);
++}
++
++TEST_F(SoftwareRendererFilterCacheTest, DropsCachedResultsWithRemovedBackings) {
++  const gfx::Rect bounds(20, 20, 60, 60);
++  DrawFiltered(bounds, SkColors::kRed, 0.5f,
++               {{.rect = bounds, .color = {0.5f, 0.f, 0.f, 1.f}}});
++  DrawFiltered(gfx::Rect(), SkColors::kRed, 0.5f,
++               {{.rect = bounds, .color = {0.5f, 0.f, 0.f, 1.f}}});
++
++  AggregatedRenderPassList list;
++  auto* root = cc::AddRenderPass(&list, AggregatedRenderPassId{1},
++                                gfx::Rect(100, 100), gfx::Transform());
++  cc::AddQuad(root, gfx::Rect(100, 100), SkColors::kGreen);
++  ASSERT_TRUE(RunPixelTest(
++      &list,
++      GenerateExpectedImage(
++          gfx::Size(100, 100),
++          {{.rect = gfx::Rect(100, 100), .color = SkColors::kGreen}}),
++      cc::ExactPixelComparator()));
++
++  DrawFiltered(bounds, SkColors::kBlue, 0.5f,
++               {{.rect = bounds, .color = {0.f, 0.f, 0.5f, 1.f}}});
++  EXPECT_EQ(software_renderer_->GetRenderPassFilterCacheHitsForTesting(), 1u);
++}
++
+ TEST_F(SoftwareRendererTest, RenderPassVisibleRect) {
+   gfx::Size viewport_size(100, 100);
+ 
+diff --git components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
+index 141c7e0..dc90324 100644
+--- components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
++++ components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
+@@ -145,6 +145,7 @@ RootCompositorFrameSinkImpl::Create(
+     // GPU output requires a qualified shared-image encoder import backend.
+     // Do not quietly use display presentation if the requested mode differs.
+     CHECK(!params->gpu_compositing);
++    params->renderer_settings.cache_render_pass_filters = true;
+     int interval_ms = 0;
+     CHECK(base::StringToInt(
+         base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
