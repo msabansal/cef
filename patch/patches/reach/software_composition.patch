@@ -292,105 +292,14 @@ index d0b4858..7b0672d 100644
    gfx::Size viewport_size(100, 100);
  
 diff --git components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
-index 141c7e0..a76bce6 100644
+index 141c7e0..dc90324 100644
 --- components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
 +++ components/viz/service/frame_sinks/root_compositor_frame_sink_impl.cc
-@@ -3,10 +3,10 @@
- // found in the LICENSE file.
- 
- #include "components/viz/service/frame_sinks/root_compositor_frame_sink_impl.h"
--#include "base/command_line.h"
--#include "base/strings/string_number_conversions.h"
--#include "components/viz/service/display_embedder/reach_video_output_device.h"
--#include "components/viz/service/display_embedder/software_output_surface.h"
-+#include "base/command_line.h"
-+#include "base/strings/string_number_conversions.h"
-+#include "components/viz/service/display_embedder/reach_video_output_device.h"
-+#include "components/viz/service/display_embedder/software_output_surface.h"
- 
- #include <algorithm>
- #include <utility>
-@@ -135,44 +135,45 @@ RootCompositorFrameSinkImpl::Create(
-       std::move(params->display_client));
-   auto display_controller = output_surface_provider->CreateGpuDependency(
-       params->gpu_compositing, params->widget);
--  std::unique_ptr<OutputSurface> output_surface;
--  const bool reach_video =
--      base::CommandLine::ForCurrentProcess()->HasSwitch("reach-video-sink") &&
--      params->use_proxy_output_device;
--  if (reach_video) {
--    CHECK(!base::CommandLine::ForCurrentProcess()->HasSwitch(
--        "reach-drawing-commands"));
--    // GPU output requires a qualified shared-image encoder import backend.
--    // Do not quietly use display presentation if the requested mode differs.
--    CHECK(!params->gpu_compositing);
--    int interval_ms = 0;
--    CHECK(base::StringToInt(
--        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
--            "reach-video-capture-interval-ms"),
--        &interval_ms));
--    CHECK_GE(interval_ms, 1);
--    CHECK_LE(interval_ms, 1000);
--    // The matched agent always supplies its snapshot ring size.
--    int slots = 0;
--    CHECK(base::StringToInt(
--        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
--            "reach-video-sink-slots"),
--        &slots));
--    CHECK_GE(slots, 1);
--    CHECK_LE(static_cast<size_t>(slots), ReachVideoOutputDevice::kMaxSlots);
--    mojo::PendingRemote<mojom::ReachVideoSink> sink;
--    display_client->CreateReachVideoSink(
--        sink.InitWithNewPipeAndPassReceiver());
--    output_surface = std::make_unique<SoftwareOutputSurface>(
--        std::make_unique<ReachVideoOutputDevice>(
--            std::move(sink), base::Milliseconds(interval_ms),
--            static_cast<size_t>(slots)));
--  } else {
--    output_surface = output_surface_provider->CreateOutputSurface(
--        params->widget, params->gpu_compositing, display_client.get(),
--        display_controller.get(), params->renderer_settings, debug_settings,
--        params->use_proxy_output_device);
--  }
-+  std::unique_ptr<OutputSurface> output_surface;
-+  const bool reach_video =
-+      base::CommandLine::ForCurrentProcess()->HasSwitch("reach-video-sink") &&
-+      params->use_proxy_output_device;
-+  if (reach_video) {
-+    CHECK(!base::CommandLine::ForCurrentProcess()->HasSwitch(
-+        "reach-drawing-commands"));
-+    // GPU output requires a qualified shared-image encoder import backend.
-+    // Do not quietly use display presentation if the requested mode differs.
-+    CHECK(!params->gpu_compositing);
+@@ -145,6 +145,7 @@ RootCompositorFrameSinkImpl::Create(
+     // GPU output requires a qualified shared-image encoder import backend.
+     // Do not quietly use display presentation if the requested mode differs.
+     CHECK(!params->gpu_compositing);
 +    params->renderer_settings.cache_render_pass_filters = true;
-+    int interval_ms = 0;
-+    CHECK(base::StringToInt(
-+        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
-+            "reach-video-capture-interval-ms"),
-+        &interval_ms));
-+    CHECK_GE(interval_ms, 1);
-+    CHECK_LE(interval_ms, 1000);
-+    // The matched agent always supplies its snapshot ring size.
-+    int slots = 0;
-+    CHECK(base::StringToInt(
-+        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
-+            "reach-video-sink-slots"),
-+        &slots));
-+    CHECK_GE(slots, 1);
-+    CHECK_LE(static_cast<size_t>(slots), ReachVideoOutputDevice::kMaxSlots);
-+    mojo::PendingRemote<mojom::ReachVideoSink> sink;
-+    display_client->CreateReachVideoSink(
-+        sink.InitWithNewPipeAndPassReceiver());
-+    output_surface = std::make_unique<SoftwareOutputSurface>(
-+        std::make_unique<ReachVideoOutputDevice>(
-+            std::move(sink), base::Milliseconds(interval_ms),
-+            static_cast<size_t>(slots)));
-+  } else {
-+    output_surface = output_surface_provider->CreateOutputSurface(
-+        params->widget, params->gpu_compositing, display_client.get(),
-+        display_controller.get(), params->renderer_settings, debug_settings,
-+        params->use_proxy_output_device);
-+  }
- 
-   // Creating output surface failed. The host can send a new request, possibly
-   // with a different compositing mode.
+     int interval_ms = 0;
+     CHECK(base::StringToInt(
+         base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
