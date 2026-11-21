@@ -4,9 +4,31 @@ ARG BASE_IMAGE=ubuntu:26.10
 ARG ARM64_UNIT_RUNTIME_IMAGE=buildpack-deps:bookworm@sha256:f719cedddb6ca673716cb4564b9298bbaa7fea8b4ae8a78e4ead2b2299ed6c62
 FROM --platform=linux/arm64 ${ARM64_UNIT_RUNTIME_IMAGE} AS arm64-unit-runtime
 
+FROM --platform=linux/amd64 ${ARM64_UNIT_RUNTIME_IMAGE} AS arm64-unit-packages
+RUN mkdir -p /packages/partial /runtime \
+    && dpkg --add-architecture arm64 \
+    && apt-get update \
+    && apt-get install --download-only -y --no-install-recommends \
+        -o Dir::Cache::archives=/packages \
+        libasound2:arm64 libatk-bridge2.0-0:arm64 libatk1.0-0:arm64 \
+        libcairo2:arm64 libcups2:arm64 libdbus-1-3:arm64 libexpat1:arm64 \
+        libgbm1:arm64 libglib2.0-0:arm64 libgtk-3-0:arm64 \
+        libnspr4:arm64 libnss3:arm64 libpango-1.0-0:arm64 \
+        libpangocairo-1.0-0:arm64 libudev1:arm64 \
+        libx11-6:arm64 libx11-xcb1:arm64 libxcb1:arm64 \
+        libxcomposite1:arm64 libxdamage1:arm64 libxext6:arm64 \
+        libxfixes3:arm64 libxkbcommon0:arm64 libxrandr2:arm64 \
+    && for package in /packages/*.deb; do \
+        architecture=$(dpkg-deb --field "$package" Architecture); \
+        case "$architecture" in \
+            arm64|all) dpkg-deb --extract "$package" /runtime ;; \
+        esac; \
+    done
+
 FROM ${BASE_IMAGE} AS builder
 COPY --from=arm64-unit-runtime /lib/aarch64-linux-gnu/ /opt/reach-arm64-unit-runtime/lib/aarch64-linux-gnu/
 COPY --from=arm64-unit-runtime /lib/ld-linux-aarch64.so.1 /opt/reach-arm64-unit-runtime/lib/
+COPY --from=arm64-unit-packages /runtime/ /opt/reach-arm64-unit-runtime/
 
 # Chromium supplies the target sysroot and Clang. These packages also support
 # executing host tools that are built against that sysroot. Standalone Skia's

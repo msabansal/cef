@@ -131,6 +131,8 @@ The shared source/toolchain workspace stays locked during either build.
 
 The image includes user-mode QEMU and a pinned ARM64 Bookworm runtime at
 `/opt/reach-arm64-unit-runtime` for unit tests on the x64 build VM.
+Native x64 tools download and unpack its ARM64 Chromium library dependencies;
+no ARM64 package installation or build step runs under emulation.
 Chromium's sysroot remains compile-only. Run target unit tests with
 `--single-process-tests` because ARM64 child executables cannot launch natively
 on that host.
