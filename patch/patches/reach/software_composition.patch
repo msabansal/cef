@@ -29,7 +29,7 @@ index 524d48f..bf7b3c7 100644
  }
  
 diff --git components/viz/service/display/software_renderer.cc components/viz/service/display/software_renderer.cc
-index 5ff25da..19ae5a0 100644
+index 5ff25da..288cfd4 100644
 --- components/viz/service/display/software_renderer.cc
 +++ components/viz/service/display/software_renderer.cc
 @@ -314,6 +314,7 @@ void SoftwareRenderer::BeginDrawingRenderPass(
@@ -52,7 +52,7 @@ index 5ff25da..19ae5a0 100644
        if (result_rect.isEmpty()) {
          return;
        }
-@@ -930,6 +931,98 @@ bool SoftwareRenderer::ShouldApplyBackdropFilters(
+@@ -930,6 +931,99 @@ bool SoftwareRenderer::ShouldApplyBackdropFilters(
    return true;
  }
  
@@ -135,7 +135,8 @@ index 5ff25da..19ae5a0 100644
 +  SkIRect bounds = filter->filterBounds(gfx::RectToSkIRect(quad->rect),
 +                                      local_matrix,
 +                                      SkImageFilter::kForward_MapDirection);
-+  if (clip_to_current_canvas &&
++  // Masks map their texture over the complete filtered output bounds.
++  if (clip_to_current_canvas && !quad->mask_resource_id() &&
 +      !current_canvas_->getTotalMatrix().hasPerspective()) {
 +    // SkCanvas conservatively maps the device clip, including its AA fringe.
 +    // Keep the complete source; Skia expands input bounds for the filter halo.
@@ -151,7 +152,7 @@ index 5ff25da..19ae5a0 100644
  // Applies |filter| to |to_filter| bitmap. |result_rect| will be filled with the
  // automatically-computed destination bounds. If |offset_expanded_bounds| is
  // true, the bitmap will be offset for any pixel-moving filters. This function
-@@ -952,9 +1045,12 @@ sk_sp<SkImage> SoftwareRenderer::ApplyImageFilter(
+@@ -952,9 +1046,12 @@ sk_sp<SkImage> SoftwareRenderer::ApplyImageFilter(
    SkMatrix local_matrix;
    local_matrix.setTranslate(quad->filters_origin.x(), quad->filters_origin.y());
    local_matrix.postScale(quad->filters_scale.x(), quad->filters_scale.y());
@@ -167,7 +168,7 @@ index 5ff25da..19ae5a0 100644
    gfx::Point canvas_offset =
        offset_expanded_bounds ? gfx::Point(result_rect->x(), result_rect->y())
                               : quad->rect.origin();
-@@ -1195,8 +1291,10 @@ void SoftwareRenderer::UpdateRenderPassTextures(
+@@ -1195,8 +1292,10 @@ void SoftwareRenderer::UpdateRenderPassTextures(
  
    // Delete RenderPass bitmaps from the previous frame that will not be used
    // again.
@@ -251,10 +252,10 @@ index 34b97b6..a1c1420 100644
    bool is_scissor_enabled_ = false;
    bool is_render_pass_transparent_ = false;
 diff --git components/viz/service/display/software_renderer_unittest.cc components/viz/service/display/software_renderer_unittest.cc
-index d0b4858..bb2c716 100644
+index d0b4858..02af3a8 100644
 --- components/viz/service/display/software_renderer_unittest.cc
 +++ components/viz/service/display/software_renderer_unittest.cc
-@@ -401,6 +401,148 @@ TEST_F(SoftwareRendererTestShouldClearRootRenderPass,
+@@ -401,6 +401,188 @@ TEST_F(SoftwareRendererTestShouldClearRootRenderPass,
        cc::ExactPixelComparator()));
  }
  
@@ -398,6 +399,46 @@ index d0b4858..bb2c716 100644
 +  renderer_settings_.cache_render_pass_filters = true;
 +  auto clipped = make_passes();
 +  ASSERT_TRUE(RunPixelTest(&clipped, reference, cc::ExactPixelComparator()));
++}
++
++TEST_F(SoftwareRendererFilterCacheTest, PreservesFullFilteredMaskCoordinates) {
++  const gfx::Size mask_size(200, 200);
++  SkBitmap mask = GenerateExpectedImage(
++      mask_size, {{.rect = gfx::Rect(50, 200), .color = SkColors::kWhite}});
++  ResourceId resource = AllocateAndFillSoftwareResource(mask_size, mask);
++  auto resource_map = cc::SendResourceAndGetChildToParentMap(
++      {resource}, resource_provider(), child_resource_provider(),
++      child_context_provider_->SharedImageInterface());
++  auto make_passes = [&] {
++    AggregatedRenderPassList list;
++    const gfx::Rect bounds(-100, -40, 300, 240);
++    auto* child = cc::AddRenderPass(
++        &list, AggregatedRenderPassId{2}, bounds, gfx::Transform());
++    cc::AddQuad(child, bounds, SkColors::kRed);
++    auto* root = cc::AddRenderPass(&list, AggregatedRenderPassId{1},
++                                  gfx::Rect(100, 100), gfx::Transform());
++    auto* quad = cc::AddRenderPassQuad(root, child);
++    quad->SetNew(quad->shared_quad_state, bounds, bounds, child->id,
++                 resource_map.at(resource), gfx::RectF(0.f, 0.f, 1.f, 1.f),
++                 mask_size, false);
++    quad->filters.Append(cc::FilterOperation::CreateBlurFilter(12.f));
++    cc::AddQuad(root, gfx::Rect(100, 100), SkColors::kBlue);
++    return list;
++  };
++  renderer_settings_.cache_render_pass_filters = false;
++  auto baseline = make_passes();
++  ASSERT_TRUE(RunPixelTest(
++      &baseline,
++      GenerateExpectedImage(
++          gfx::Size(100, 100),
++          {{.rect = gfx::Rect(100, 100), .color = SkColors::kBlue}}),
++      cc::ExactPixelComparator()));
++  ASSERT_TRUE(result_bitmap_);
++  SkBitmap reference = *result_bitmap_;
++
++  renderer_settings_.cache_render_pass_filters = true;
++  auto optimized = make_passes();
++  ASSERT_TRUE(RunPixelTest(&optimized, reference, cc::ExactPixelComparator()));
 +}
 +
  TEST_F(SoftwareRendererTest, RenderPassVisibleRect) {
