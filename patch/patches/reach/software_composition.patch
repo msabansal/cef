@@ -29,7 +29,7 @@ index 524d48f..bf7b3c7 100644
  }
  
 diff --git components/viz/service/display/software_renderer.cc components/viz/service/display/software_renderer.cc
-index 5ff25da..e0da92b 100644
+index 5ff25da..04b062a 100644
 --- components/viz/service/display/software_renderer.cc
 +++ components/viz/service/display/software_renderer.cc
 @@ -314,6 +314,7 @@ void SoftwareRenderer::BeginDrawingRenderPass(
@@ -52,7 +52,7 @@ index 5ff25da..e0da92b 100644
        if (result_rect.isEmpty()) {
          return;
        }
-@@ -930,6 +931,66 @@ bool SoftwareRenderer::ShouldApplyBackdropFilters(
+@@ -930,6 +931,68 @@ bool SoftwareRenderer::ShouldApplyBackdropFilters(
    return true;
  }
  
@@ -92,7 +92,9 @@ index 5ff25da..e0da92b 100644
 +    InvalidateRenderPassFilter(it->second);
 +  }
 +
-+  TRACE_EVENT0("viz", "SoftwareRenderer::ApplyRenderPassFilter");
++  TRACE_EVENT2("viz", "SoftwareRenderer::ApplyRenderPassFilter",
++               "filters", quad->filters.ToString(),
++               "quad_rect", quad->rect.ToString());
 +  auto image = ApplyImageFilter(filter, quad, source,
 +                               /*offset_expanded_bounds=*/true, result_rect);
 +  constexpr size_t kMaxCacheBytes = 64 * 1024 * 1024;
@@ -119,7 +121,7 @@ index 5ff25da..e0da92b 100644
  // Applies |filter| to |to_filter| bitmap. |result_rect| will be filled with the
  // automatically-computed destination bounds. If |offset_expanded_bounds| is
  // true, the bitmap will be offset for any pixel-moving filters. This function
-@@ -1195,8 +1256,10 @@ void SoftwareRenderer::UpdateRenderPassTextures(
+@@ -1195,8 +1258,10 @@ void SoftwareRenderer::UpdateRenderPassTextures(
  
    // Delete RenderPass bitmaps from the previous frame that will not be used
    // again.
