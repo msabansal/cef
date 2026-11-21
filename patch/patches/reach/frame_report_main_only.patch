@@ -1,0 +1,149 @@
+diff --git cc/metrics/compositor_frame_reporter.cc cc/metrics/compositor_frame_reporter.cc
+index 5158817..dfb40ba 100644
+--- cc/metrics/compositor_frame_reporter.cc
++++ cc/metrics/compositor_frame_reporter.cc
+@@ -2066,9 +2066,13 @@ FrameInfo CompositorFrameReporter::GenerateFrameInfo() const {
+     if (info.smooth_thread == SmoothThread::kSmoothMain) {
+       info.final_state_v4 = FrameFinalState::kNoUpdateDesired;
+     }
+-  } else if (partial_update_dependents_.size() > 0) {
+-    // Only a frame containing a response from the main-thread can have
+-    // dependent reporters.
++  } else if (partial_update_dependents_.size() > 0 ||
++             (!stage_history_.empty() &&
++              stage_history_.front().stage_type ==
++                  StageType::kSendBeginMainFrameToCommit)) {
++    // Dependent reporters and main-only reporters account for the main-thread
++    // outcome. A main-only reporter can be replaced before Blink starts, but
++    // its dropped main update must not be classified as a compositor response.
+     info.main_thread_response = FrameInfo::MainThreadResponse::kIncluded;
+   } else if (begin_main_frame_start_.is_null() ||
+              (frame_skip_reason_.has_value() &&
+diff --git components/viz/BUILD.gn components/viz/BUILD.gn
+index b066fd6..3705f31 100644
+--- components/viz/BUILD.gn
++++ components/viz/BUILD.gn
+@@ -14,6 +14,7 @@ viz_test("reach_video_output_device_unittests") {
+   deps = [
+     "//base",
+     "//base/test:test_support",
++    "//cc",
+     "//components/viz/service",
+     "//mojo/core/embedder",
+     "//mojo/public/cpp/bindings",
+diff --git components/viz/service/display_embedder/reach_video_output_device_unittest.cc components/viz/service/display_embedder/reach_video_output_device_unittest.cc
+index ab6493e..98afbe3 100644
+--- components/viz/service/display_embedder/reach_video_output_device_unittest.cc
++++ components/viz/service/display_embedder/reach_video_output_device_unittest.cc
+@@ -1,11 +1,16 @@
+ #include "components/viz/service/display_embedder/reach_video_output_device.h"
+ 
++#include <array>
+ #include <memory>
+ #include <string>
+ #include <vector>
+ 
+ #include "base/memory/read_only_shared_memory_region.h"
++#include "base/test/simple_test_tick_clock.h"
+ #include "base/test/task_environment.h"
++#include "cc/metrics/compositor_frame_reporter.h"
++#include "cc/metrics/frame_sorter.h"
++#include "components/viz/common/frame_sinks/begin_frame_args.h"
+ #include "mojo/public/cpp/bindings/receiver.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ #include "third_party/skia/include/core/SkCanvas.h"
+@@ -317,5 +322,94 @@ TEST_F(ReachVideoOutputDeviceTest, SnapshotsAndLateRepliesSurviveTeardown) {
+   EXPECT_EQ(consumer_.deliveries_.size(), 2u);
+ }
+ 
++class SortedFrameCollector : public cc::FrameSorterObserver {
++ public:
++  void AddSortedFrame(const BeginFrameArgs&,
++                      const cc::FrameInfo& frame_info) override {
++    frames.push_back(frame_info);
++  }
++
++  std::vector<cc::FrameInfo> frames;
++};
++
++TEST_F(ReachVideoOutputDeviceTest, MainOnlyDroppedBeforeBlinkStarts) {
++  using Reporter = cc::CompositorFrameReporter;
++  constexpr std::array kImplStatuses = {
++      Reporter::FrameTerminationStatus::kPresentedFrame,
++      Reporter::FrameTerminationStatus::kDidNotPresentFrame};
++  constexpr std::array kMainFirst = {false, true};
++
++  for (auto impl_status : kImplStatuses) {
++    for (bool main_first : kMainFirst) {
++      SCOPED_TRACE(testing::Message()
++                   << "impl_status=" << static_cast<int>(impl_status)
++                   << " main_first=" << main_first);
++      base::SimpleTestTickClock clock;
++      clock.SetNowTicks(base::TimeTicks::Now());
++      SortedFrameCollector collector;
++      cc::FrameSorter sorter;
++      sorter.AddObserver(&collector);
++      sorter.OnFirstContentfulPaintReceived();
++      const auto args = BeginFrameArgs::Create(
++          BEGINFRAME_FROM_HERE, 1, 1, clock.NowTicks(),
++          clock.NowTicks() + base::Milliseconds(16), base::Milliseconds(16),
++          BeginFrameArgs::NORMAL);
++      auto make_reporter = [&]() {
++        auto reporter = std::make_unique<Reporter>(
++            cc::ActiveTrackers(), args, /*should_report_histograms=*/false,
++            /*report_event_latency_to_custom_metrics_recorder=*/false,
++            Reporter::SmoothThread::kSmoothBoth,
++            cc::FrameInfo::SmoothEffectDrivingThread::kUnknown,
++            /*layer_tree_host_id=*/1, &sorter);
++        reporter->set_tick_clock(&clock);
++        return reporter;
++      };
++      auto impl_reporter = make_reporter();
++      impl_reporter->StartStage(
++          Reporter::StageType::kBeginImplFrameToSendBeginMainFrame,
++          clock.NowTicks());
++      clock.Advance(base::Microseconds(1));
++      impl_reporter->StartStage(
++          Reporter::StageType::kEndActivateToSubmitCompositorFrame,
++          clock.NowTicks());
++      clock.Advance(base::Microseconds(1));
++      impl_reporter->StartStage(
++          Reporter::StageType::kSubmitCompositorFrameToPresentationCompositorFrame,
++          clock.NowTicks());
++      auto main_reporter = make_reporter();
++      main_reporter->StartStage(
++          Reporter::StageType::kSendBeginMainFrameToCommit, clock.NowTicks());
++      clock.Advance(base::Microseconds(1));
++      auto finish_main = [&]() {
++        main_reporter->TerminateFrame(
++            Reporter::FrameTerminationStatus::kReplacedByNewReporter,
++            clock.NowTicks());
++        main_reporter.reset();
++      };
++      auto finish_impl = [&]() {
++        impl_reporter->TerminateFrame(impl_status, clock.NowTicks());
++        impl_reporter.reset();
++      };
++      if (main_first) {
++        finish_main();
++        finish_impl();
++      } else {
++        finish_impl();
++        finish_main();
++      }
++      ASSERT_EQ(1u, collector.frames.size());
++      EXPECT_EQ(cc::FrameInfo::FrameFinalState::kDropped,
++                collector.frames.front().GetFinalStateForThread(
++                    cc::FrameInfo::SmoothEffectDrivingThread::kMain));
++      EXPECT_EQ(
++          impl_status == Reporter::FrameTerminationStatus::kPresentedFrame
++              ? cc::FrameInfo::FrameFinalState::kPresentedAll
++              : cc::FrameInfo::FrameFinalState::kDropped,
++          collector.frames.front().GetFinalStateForThread(
++              cc::FrameInfo::SmoothEffectDrivingThread::kCompositor));
++    }
++  }
++}
++
+ }  // namespace
+ }  // namespace viz
