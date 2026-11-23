@@ -3164,7 +3164,7 @@ CefDrawingCommands CaptureIncrementalPicture(
     chunks.push_back({key, std::move(recording),
                       SkRect::MakeWH(bounds.width(), bounds.height())});
     cc::PaintOpBuffer marker;
-    marker.push<cc::CustomDataOp>(0);
+    marker.push<cc::CustomDataOp>(uint32_t{0});
     skeleton_record = marker.ReleaseAsRecord();
     state = PaintSerialization();
     state.sink = sink;
