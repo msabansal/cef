@@ -557,6 +557,7 @@ struct PaintSerialization {
   std::string error;
   std::string unsupported_error;
   bool uninspectable_filter = false;
+  bool filter_resources = false;
   bool raster = false;
   bool budget_only = false;
   bool uninspectable_originals = false;
@@ -1362,6 +1363,7 @@ bool CheckPaintFilter(PaintSerialization* state,
                               record_depth);
     }
     case cc::PaintFilter::Type::kImage: {
+      state->filter_resources = true;
       const auto* image = static_cast<const cc::ImagePaintFilter*>(filter);
       if (!image->src_rect().isFinite() || !image->dst_rect().isFinite()) {
         state->error = "Image-filter image bounds are invalid";
@@ -1370,6 +1372,7 @@ bool CheckPaintFilter(PaintSerialization* state,
       return CheckPaintImage(state, image->image());
     }
     case cc::PaintFilter::Type::kPaintRecord: {
+      state->filter_resources = true;
       const auto* record = static_cast<const cc::RecordPaintFilter*>(filter);
       if (!record->record_bounds().isFinite() ||
           !std::isfinite(record->raster_scale().width()) ||
@@ -1380,6 +1383,7 @@ bool CheckPaintFilter(PaintSerialization* state,
       return CheckPaintRecord(state, record->record(), record_depth + 1);
     }
     case cc::PaintFilter::Type::kShader: {
+      state->filter_resources = true;
       const auto* shader = static_cast<const cc::ShaderPaintFilter*>(filter);
       if (!std::isfinite(shader->alpha())) {
         state->error = "Image-filter shader alpha is invalid";
@@ -3146,6 +3150,31 @@ CefDrawingCommands CaptureIncrementalPicture(
     result.error = state.error;
     return result;
   }
+  const bool property_resources = state.filter_resources;
+  if (property_resources) {
+    // Property filters can own originals too. Keep their complete effect scope
+    // in one independently decoded command chunk, never in the resource-free
+    // skeleton. Coarse chunks do not advertise speculative scroll segments.
+    auto recording = ConvertCommandPaint(frame, cull, {});
+    ChunkKey key;
+    const auto digest = crypto::hash::Sha256("Reach.PropertyResources.v1");
+    std::copy_n(digest.begin(), key.size(), key.begin());
+    chunks.clear();
+    chunk_index.clear();
+    chunks.push_back({key, std::move(recording),
+                      SkRect::MakeWH(bounds.width(), bounds.height())});
+    cc::PaintOpBuffer marker;
+    marker.push<cc::CustomDataOp>(0);
+    skeleton_record = marker.ReleaseAsRecord();
+    state = PaintSerialization();
+    state.sink = sink;
+    state.known_originals = known_originals;
+    state.collect_paint_ids = true;
+    if (!CheckPaintRecord(&state, skeleton_record, 0)) {
+      result.error = state.error;
+      return result;
+    }
+  }
   const auto skeleton_image_states = std::move(state.image_states);
   for (const auto id : state.media_ids) {
     if (id >= chunks.size()) {
@@ -3266,8 +3295,10 @@ CefDrawingCommands CaptureIncrementalPicture(
     result.error = "Skia produced an empty skeleton";
     return result;
   }
-  result.scroll = CaptureScrollLayout(frame, bounds, cull, chunk_index,
-                                      skeleton_callbacks, procs);
+  if (!property_resources) {
+    result.scroll = CaptureScrollLayout(frame, bounds, cull, chunk_index,
+                                        skeleton_callbacks, procs);
+  }
   CaptureTimer::Get().Mark("scroll");
   // Chunk pictures compose child frames and media markers like the full
   // picture, including complete child/media content in prefetched chunks.
