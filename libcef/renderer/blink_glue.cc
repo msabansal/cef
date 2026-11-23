@@ -556,7 +556,6 @@ using ImageStates = std::map<sk_reach::Hash, std::pair<size_t, bool>>;
 struct PaintSerialization {
   std::string error;
   std::string unsupported_error;
-  std::string filter_requires_raster;
   bool uninspectable_filter = false;
   bool raster = false;
   bool budget_only = false;
@@ -1132,17 +1131,44 @@ bool CheckPaintFilter(PaintSerialization* state,
   const auto sigma_ok = [](float sigma) {
     return std::isfinite(sigma) && sigma >= 0;
   };
-  const auto unsupported = [&]() {
-    DeferUnsupportedPaint(
-        state, (state->raster ? "Raster fallback Image-filter " : "Image-filter ") +
-                   cc::PaintFilter::TypeToString(filter->type()) +
-                   (state->raster ? " is not resource-safe"
-                                  : " requires command support"));
+  const auto color_ok = [](const SkColor4f& color) {
+    return std::isfinite(color.fR) && std::isfinite(color.fG) &&
+           std::isfinite(color.fB) && std::isfinite(color.fA);
+  };
+  const auto point_ok = [](const SkPoint3& point) {
+    return std::isfinite(point.fX) && std::isfinite(point.fY) &&
+           std::isfinite(point.fZ);
+  };
+  const auto lighting_ok = [&](const auto& light) {
+    return (light.lighting_type() == cc::PaintFilter::LightingType::kDiffuse ||
+            light.lighting_type() ==
+                cc::PaintFilter::LightingType::kSpecular) &&
+           color_ok(light.light_color()) &&
+           std::isfinite(light.surface_scale()) &&
+           std::isfinite(light.kconstant()) && std::isfinite(light.shininess());
+  };
+  const auto check_input = [&]() {
+    return CheckPaintFilter(
+        state,
+        static_cast<const cc::OneInputPaintFilter*>(filter)->input().get(),
+        depth + 1, record_depth);
+  };
+  const auto charge_bytes = [&](size_t bytes) {
+    if (bytes > MaxDrawingPaintBytes() - state->record_bytes) {
+      state->error = "Paint record byte budget exceeded";
+      return false;
+    }
+    state->record_bytes += bytes;
+    return true;
   };
   if (const auto* crop = filter->GetCropRect(); crop && !crop->isFinite()) {
     state->error = "Image-filter crop is invalid";
     return false;
   }
+  // Capture and replay use matched Skia builds. Keep this switch exhaustive so
+  // an upstream filter addition requires an explicit validation decision.
+  static_assert(cc::PaintFilter::Type::kMaxValue ==
+                cc::PaintFilter::Type::kLightingSpot);
   switch (filter->type()) {
     case cc::PaintFilter::Type::kBlur: {
       const auto* blur = static_cast<const cc::BlurPaintFilter*>(filter);
@@ -1150,17 +1176,18 @@ bool CheckPaintFilter(PaintSerialization* state,
         state->error = "Image-filter blur is invalid";
         return false;
       }
-      break;
+      return check_input();
     }
     case cc::PaintFilter::Type::kDropShadow: {
       const auto* shadow =
           static_cast<const cc::DropShadowPaintFilter*>(filter);
       if (!sigma_ok(shadow->sigma_x()) || !sigma_ok(shadow->sigma_y()) ||
-          !std::isfinite(shadow->dx()) || !std::isfinite(shadow->dy())) {
+          !std::isfinite(shadow->dx()) || !std::isfinite(shadow->dy()) ||
+          !color_ok(shadow->color())) {
         state->error = "Image-filter shadow is invalid";
         return false;
       }
-      break;
+      return check_input();
     }
     case cc::PaintFilter::Type::kOffset: {
       const auto* offset = static_cast<const cc::OffsetPaintFilter*>(filter);
@@ -1168,7 +1195,7 @@ bool CheckPaintFilter(PaintSerialization* state,
         state->error = "Image-filter offset is invalid";
         return false;
       }
-      break;
+      return check_input();
     }
     case cc::PaintFilter::Type::kMorphology: {
       const auto* morphology =
@@ -1182,16 +1209,10 @@ bool CheckPaintFilter(PaintSerialization* state,
         state->error = "Image-filter morphology is invalid";
         return false;
       }
-      // Native raster is bounded here. Do not expose an unqualified serialized
-      // filter to the frozen client, or stop validation before its descendants.
-      if (!state->raster) {
-        state->filter_requires_raster =
-            "Image-filter kMorphology requires command support";
-      }
-      break;
+      return check_input();
     }
     case cc::PaintFilter::Type::kColorFilter:
-      break;
+      return check_input();
     case cc::PaintFilter::Type::kMerge: {
       const auto* merge = static_cast<const cc::MergePaintFilter*>(filter);
       // Charge null inputs too; they do not recurse into a visit.
@@ -1209,79 +1230,186 @@ bool CheckPaintFilter(PaintSerialization* state,
       return true;
     }
     case cc::PaintFilter::Type::kXfermode: {
-      const auto* blend =
-          static_cast<const cc::XfermodePaintFilter*>(filter);
+      const auto* blend = static_cast<const cc::XfermodePaintFilter*>(filter);
       return CheckPaintFilter(state, blend->background().get(), depth + 1,
                               record_depth) &&
              CheckPaintFilter(state, blend->foreground().get(), depth + 1,
                               record_depth);
     }
     case cc::PaintFilter::Type::kCompose: {
-      const auto* compose =
-          static_cast<const cc::ComposePaintFilter*>(filter);
+      const auto* compose = static_cast<const cc::ComposePaintFilter*>(filter);
       return CheckPaintFilter(state, compose->outer().get(), depth + 1,
                               record_depth) &&
              CheckPaintFilter(state, compose->inner().get(), depth + 1,
                               record_depth);
     }
-    // Inspect only the original cc inputs declared by these exact classes;
-    // traversal does not grant command or raster support for their effects.
-    case cc::PaintFilter::Type::kMagnifier:
-    case cc::PaintFilter::Type::kAlphaThreshold:
-    case cc::PaintFilter::Type::kMatrixConvolution:
-    case cc::PaintFilter::Type::kTile:
-    case cc::PaintFilter::Type::kMatrix:
-    case cc::PaintFilter::Type::kLightingDistant:
-    case cc::PaintFilter::Type::kLightingPoint:
-    case cc::PaintFilter::Type::kLightingSpot:
-      unsupported();
-      break;
+    case cc::PaintFilter::Type::kMagnifier: {
+      const auto* magnifier =
+          static_cast<const cc::MagnifierPaintFilter*>(filter);
+      if (!magnifier->lens_bounds().isFinite() ||
+          !std::isfinite(magnifier->zoom_amount()) ||
+          !std::isfinite(magnifier->inset())) {
+        state->error = "Image-filter magnifier is invalid";
+        return false;
+      }
+      return check_input();
+    }
+    case cc::PaintFilter::Type::kAlphaThreshold: {
+      const auto* threshold =
+          static_cast<const cc::AlphaThresholdPaintFilter*>(filter);
+      return charge_bytes(threshold->region().writeToMemory(nullptr)) &&
+             check_input();
+    }
+    case cc::PaintFilter::Type::kMatrixConvolution: {
+      const auto* convolution =
+          static_cast<const cc::MatrixConvolutionPaintFilter*>(filter);
+      const auto size = convolution->kernel_size();
+      if (size.width() <= 0 || size.height() <= 0 ||
+          !std::isfinite(convolution->gain()) ||
+          !std::isfinite(convolution->bias())) {
+        state->error = "Image-filter convolution is invalid";
+        return false;
+      }
+      const uint64_t count =
+          uint64_t{static_cast<uint32_t>(size.width())} * size.height();
+      if (count >
+          (MaxDrawingPaintBytes() - state->record_bytes) / sizeof(SkScalar)) {
+        state->error = "Image-filter convolution byte budget exceeded";
+        return false;
+      }
+      if (!charge_bytes(static_cast<size_t>(count) * sizeof(SkScalar))) {
+        return false;
+      }
+      for (size_t i = 0; i < count; ++i) {
+        if (!std::isfinite(convolution->kernel_at(i))) {
+          state->error = "Image-filter convolution kernel is invalid";
+          return false;
+        }
+      }
+      return check_input();
+    }
+    case cc::PaintFilter::Type::kTile: {
+      const auto* tile = static_cast<const cc::TilePaintFilter*>(filter);
+      if (!tile->src().isFinite() || !tile->dst().isFinite()) {
+        state->error = "Image-filter tile is invalid";
+        return false;
+      }
+      return check_input();
+    }
+    case cc::PaintFilter::Type::kMatrix: {
+      const auto* matrix = static_cast<const cc::MatrixPaintFilter*>(filter);
+      if (!matrix->matrix().isFinite()) {
+        state->error = "Image-filter matrix is invalid";
+        return false;
+      }
+      return check_input();
+    }
+    case cc::PaintFilter::Type::kLightingDistant: {
+      const auto* light =
+          static_cast<const cc::LightingDistantPaintFilter*>(filter);
+      if (!lighting_ok(*light) || !point_ok(light->direction())) {
+        state->error = "Image-filter distant lighting is invalid";
+        return false;
+      }
+      return check_input();
+    }
+    case cc::PaintFilter::Type::kLightingPoint: {
+      const auto* light =
+          static_cast<const cc::LightingPointPaintFilter*>(filter);
+      if (!lighting_ok(*light) || !point_ok(light->location())) {
+        state->error = "Image-filter point lighting is invalid";
+        return false;
+      }
+      return check_input();
+    }
+    case cc::PaintFilter::Type::kLightingSpot: {
+      const auto* light =
+          static_cast<const cc::LightingSpotPaintFilter*>(filter);
+      if (!lighting_ok(*light) || !point_ok(light->location()) ||
+          !point_ok(light->target()) ||
+          !std::isfinite(light->specular_exponent()) ||
+          !std::isfinite(light->cutoff_angle())) {
+        state->error = "Image-filter spot lighting is invalid";
+        return false;
+      }
+      return check_input();
+    }
     case cc::PaintFilter::Type::kArithmetic: {
-      unsupported();
       const auto* arithmetic =
           static_cast<const cc::ArithmeticPaintFilter*>(filter);
+      if (!std::isfinite(arithmetic->k1()) ||
+          !std::isfinite(arithmetic->k2()) ||
+          !std::isfinite(arithmetic->k3()) ||
+          !std::isfinite(arithmetic->k4())) {
+        state->error = "Image-filter arithmetic is invalid";
+        return false;
+      }
       return CheckPaintFilter(state, arithmetic->background().get(), depth + 1,
                               record_depth) &&
              CheckPaintFilter(state, arithmetic->foreground().get(), depth + 1,
                               record_depth);
     }
     case cc::PaintFilter::Type::kDisplacementMapEffect: {
-      unsupported();
       const auto* displacement =
           static_cast<const cc::DisplacementMapEffectPaintFilter*>(filter);
+      if (!std::isfinite(displacement->scale())) {
+        state->error = "Image-filter displacement is invalid";
+        return false;
+      }
       return CheckPaintFilter(state, displacement->displacement().get(),
                               depth + 1, record_depth) &&
              CheckPaintFilter(state, displacement->color().get(), depth + 1,
                               record_depth);
     }
-    case cc::PaintFilter::Type::kImage:
-      unsupported();
-      return CheckPaintImage(
-          state, static_cast<const cc::ImagePaintFilter*>(filter)->image());
-    case cc::PaintFilter::Type::kPaintRecord:
-      unsupported();
-      return CheckPaintRecord(
-          state, static_cast<const cc::RecordPaintFilter*>(filter)->record(),
-          record_depth + 1);
-    case cc::PaintFilter::Type::kShader:
-      unsupported();
-      return CheckPaintShader(
-          state, static_cast<const cc::ShaderPaintFilter*>(filter)->shader(),
-          record_depth);
-    case cc::PaintFilter::Type::kTurbulence:
-      unsupported();
+    case cc::PaintFilter::Type::kImage: {
+      const auto* image = static_cast<const cc::ImagePaintFilter*>(filter);
+      if (!image->src_rect().isFinite() || !image->dst_rect().isFinite()) {
+        state->error = "Image-filter image bounds are invalid";
+        return false;
+      }
+      return CheckPaintImage(state, image->image());
+    }
+    case cc::PaintFilter::Type::kPaintRecord: {
+      const auto* record = static_cast<const cc::RecordPaintFilter*>(filter);
+      if (!record->record_bounds().isFinite() ||
+          !std::isfinite(record->raster_scale().width()) ||
+          !std::isfinite(record->raster_scale().height())) {
+        state->error = "Image-filter record bounds are invalid";
+        return false;
+      }
+      return CheckPaintRecord(state, record->record(), record_depth + 1);
+    }
+    case cc::PaintFilter::Type::kShader: {
+      const auto* shader = static_cast<const cc::ShaderPaintFilter*>(filter);
+      if (!std::isfinite(shader->alpha())) {
+        state->error = "Image-filter shader alpha is invalid";
+        return false;
+      }
+      return CheckPaintShader(state, shader->shader(), record_depth);
+    }
+    case cc::PaintFilter::Type::kTurbulence: {
+      const auto* turbulence =
+          static_cast<const cc::TurbulencePaintFilter*>(filter);
+      if (!sigma_ok(turbulence->base_frequency_x()) ||
+          !sigma_ok(turbulence->base_frequency_y()) ||
+          turbulence->num_octaves() < 0 || !std::isfinite(turbulence->seed()) ||
+          (turbulence->turbulence_type() !=
+               cc::TurbulencePaintFilter::TurbulenceType::kTurbulence &&
+           turbulence->turbulence_type() !=
+               cc::TurbulencePaintFilter::TurbulenceType::kFractalNoise)) {
+        state->error = "Image-filter turbulence is invalid";
+        return false;
+      }
       return true;
-    default:
-      // Unknown/non-null kNullFilter objects have no verified input API.
-      // Fail closed without a capability-only fallback error or guessed cast.
+    }
+    case cc::PaintFilter::Type::kNullFilter:
       state->uninspectable_filter = true;
       return true;
   }
-  return CheckPaintFilter(
-      state, static_cast<const cc::OneInputPaintFilter*>(filter)->input().get(),
-      depth + 1, record_depth);
+  // An invalid enum must not reach a guessed input cast or a raster fallback.
+  state->uninspectable_filter = true;
+  return true;
 }
-
 const cc::PaintOp* CheckPaintOperation(PaintSerialization* state,
                                       const cc::PaintOp& operation,
                                       size_t depth) {
@@ -1384,8 +1512,7 @@ bool CheckPaintRecord(PaintSerialization* state,
       return true;
     }
     if (!state->raster &&
-        (state->uninspectable_filter || !state->unsupported_error.empty() ||
-         !state->filter_requires_raster.empty())) {
+        (state->uninspectable_filter || !state->unsupported_error.empty())) {
       // Capability errors cannot hide budgets normally enforced during
       // serialization. Inspect originals without recording/rendering rejected
       // effects, emitting resources, or counting them in the export state.
@@ -1404,10 +1531,6 @@ bool CheckPaintRecord(PaintSerialization* state,
     }
     if (!state->unsupported_error.empty()) {
       state->error = state->unsupported_error;
-      return false;
-    }
-    if (!state->filter_requires_raster.empty()) {
-      state->error = state->filter_requires_raster;
       return false;
     }
   }
