@@ -3155,7 +3155,9 @@ CefDrawingCommands CaptureIncrementalPicture(
     // Property filters can own originals too. Keep their complete effect scope
     // in one independently decoded command chunk, never in the resource-free
     // skeleton. Coarse chunks do not advertise speculative scroll segments.
-    auto recording = ConvertCommandPaint(frame, cull, {});
+    auto recording = ConvertCommandPaint(
+        frame, cull,
+        [](const blink::PaintChunk&, cc::PaintRecord items) { return items; });
     ChunkKey key;
     const auto digest = crypto::hash::Sha256("Reach.PropertyResources.v1");
     std::copy_n(digest.begin(), key.size(), key.begin());
